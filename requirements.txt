@@ -1,0 +1,6 @@
+pandas
+numpy
+matplotlib
+requests
+curl_cffi
+mcp
