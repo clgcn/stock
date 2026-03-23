@@ -4,8 +4,9 @@ Stock Screener — Two-Stage A-Share Market Scanner
 Scans all ~5000 A-share stocks to find the most promising candidates.
 
 Stage 1 (Fast Filter):
-  Fetches the entire market from Eastmoney in a single API call,
-  then applies basic metric filters (market cap, PE, PB, volume, etc.)
+  Reads the local SQLite market snapshot built from stocks + stock_history
+  + stock_fundamentals, then applies basic metric filters (market cap, PE,
+  PB, volume, etc.)
   to narrow down to ~50-100 candidates.
 
 Stage 2 (Deep Scan):
@@ -20,204 +21,236 @@ Built-in screening strategies:
 """
 
 import logging
-import time
 
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
-from stock_tool import _get, get_kline
+from stock_tool import get_kline
 import quant_engine as qe
 
 logger = logging.getLogger(__name__)
 
-
-# =====================================================
-# 1. Fetch Full Market Data from Eastmoney
-# =====================================================
-
-_EM_FIELDS = (
-    "f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,"
-    "f12,f14,f15,f16,f17,f18,f20,f21,f23,"
-    "f24,f25,f34"
-)
-
-_EM_URL = "https://82.push2.eastmoney.com/api/qt/clist/get"
+_HISTORY_PROFILE_CACHE: Dict[tuple, pd.DataFrame] = {}
 
 
-def _build_fs(market: str) -> str:
-    """Return Eastmoney 'fs' filter string for the requested market scope."""
-    if market == "sh":
-        return "m:1+t:2"
-    elif market == "sz":
-        return "m:0+t:6"
-    return "m:1+t:2,m:0+t:6"
+def _decision_rank(result: Dict) -> tuple:
+    """Sort buyable candidates ahead of hold/sell, then by quality."""
+    decision = result.get("decision", {}) or {}
+    action = decision.get("action", "hold")
+    strength = decision.get("strength", "weak")
+    action_order = {"buy": 3, "hold": 2, "sell": 1}
+    strength_order = {"strong": 3, "medium": 2, "weak": 1}
+    return (
+        action_order.get(action, 0),
+        strength_order.get(strength, 0),
+        result.get("entry_quality_score", -999),
+        result.get("total_score", -999),
+        result.get("prob_up", -999) or -999,
+    )
 
 
-def _parse_records(records: list) -> list:
-    """Parse raw Eastmoney records into row dicts, keeping main-board only."""
+def _historical_rank(result: Dict) -> tuple:
+    """Sort Stage 1 candidates by historical composite first, then strategy fit."""
+    return (
+        result.get("stage1_score", -999),
+        result.get("history_score", -999),
+        result.get("fast_score", -999),
+    )
+
+
+def _calc_return(closes: pd.Series, window: int) -> float:
+    if len(closes) <= window:
+        return float("nan")
+    base = closes.iloc[-window - 1]
+    last = closes.iloc[-1]
+    if pd.isna(base) or pd.isna(last) or base == 0:
+        return float("nan")
+    return (last / base - 1.0) * 100.0
+
+
+def _calc_max_drawdown(closes: pd.Series) -> float:
+    if closes.empty:
+        return float("nan")
+    running_max = closes.cummax()
+    drawdown = closes / running_max - 1.0
+    return abs(float(drawdown.min())) * 100.0
+
+
+def _score_label(score: float) -> str:
+    if pd.isna(score):
+        return "unknown"
+    if score >= 35:
+        return "strong"
+    if score >= 10:
+        return "good"
+    if score <= -35:
+        return "weak"
+    if score <= -10:
+        return "fragile"
+    return "neutral"
+
+
+def build_historical_profiles(lookback_days: int = 240,
+                              min_history_days: int = 90) -> pd.DataFrame:
+    """
+    Build a cross-sectional historical profile for all stocks from stock_history.
+
+    This is the true Stage 0 of screening:
+      1) read historical OHLCV for all stocks from local DB
+      2) compute medium/long-term trend, consistency, volatility, drawdown
+      3) convert these into a single history_score for Stage 1 ranking
+    """
+    cache_key = (lookback_days, min_history_days)
+    cached = _HISTORY_PROFILE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    try:
+        from slow_fetcher import load_all_history
+        history = load_all_history()
+    except Exception as e:
+        logger.warning("Historical profile build failed: %s", e)
+        return pd.DataFrame()
+
+    if history.empty:
+        return pd.DataFrame()
+
+    history = history.sort_values(["code", "date"]).copy()
+    grouped = history.groupby("code", sort=False)
     rows = []
-    for r in records:
-        if r.get("f2") is None or r.get("f2") == "-":
+
+    for code, g in grouped:
+        g = g.tail(lookback_days).copy()
+        if len(g) < max(30, min_history_days // 2):
             continue
-        try:
-            row = {
-                "code": str(r.get("f12", "")),
-                "name": r.get("f14", ""),
-                "current": _safe_float(r.get("f2")),
-                "change": _safe_float(r.get("f4")),
-                "pct_chg": _safe_float(r.get("f3")),
-                "volume": _safe_float(r.get("f5")),
-                "amount": _safe_float(r.get("f6")),
-                "amplitude": _safe_float(r.get("f7")),
-                "high": _safe_float(r.get("f15")),
-                "low": _safe_float(r.get("f16")),
-                "open": _safe_float(r.get("f17")),
-                "prev_close": _safe_float(r.get("f18")),
-                "volume_ratio": _safe_float(r.get("f10")),
-                "turnover_rate": _safe_float(r.get("f8")),
-                "pe_ttm": _safe_float(r.get("f9")),
-                "pb": _safe_float(r.get("f23")),
-                "total_mv": _safe_float(r.get("f20")),
-                "float_mv": _safe_float(r.get("f21")),
-                "chg_60d": _safe_float(r.get("f24")),
-                "chg_ytd": _safe_float(r.get("f25")),
-            }
-            code = row["code"]
-            sh_main = code[:3] in ("600", "601", "603", "605")
-            sz_main = code[:3] in ("000", "001", "002", "003")
-            if row["current"] > 0 and code and (sh_main or sz_main):
-                rows.append(row)
-        except (ValueError, TypeError):
+
+        closes = pd.to_numeric(g["close"], errors="coerce").dropna()
+        if len(closes) < max(30, min_history_days // 2):
             continue
-    return rows
+
+        pct = pd.to_numeric(g.get("pct_chg"), errors="coerce")
+        if pct.isna().all():
+            pct = closes.pct_change() * 100.0
+        pct = pct.replace([np.inf, -np.inf], np.nan)
+
+        volume = pd.to_numeric(g.get("volume"), errors="coerce")
+
+        ma20 = closes.tail(20).mean() if len(closes) >= 20 else np.nan
+        ma60 = closes.tail(60).mean() if len(closes) >= 60 else np.nan
+        ma120 = closes.tail(120).mean() if len(closes) >= 120 else np.nan
+        last_close = closes.iloc[-1]
+
+        ret_20 = _calc_return(closes, 20)
+        ret_60 = _calc_return(closes, 60)
+        ret_120 = _calc_return(closes, 120)
+        positive_ratio = float((pct > 0).mean()) if len(pct.dropna()) else np.nan
+        volatility_20 = float(pct.tail(20).std()) if len(pct.tail(20).dropna()) >= 10 else np.nan
+        volatility_60 = float(pct.tail(60).std()) if len(pct.tail(60).dropna()) >= 20 else np.nan
+        max_drawdown = _calc_max_drawdown(closes)
+        price_vs_ma60 = ((last_close / ma60) - 1.0) * 100.0 if pd.notna(ma60) and ma60 else np.nan
+        trend_alignment = 0.0
+        if pd.notna(ma20) and pd.notna(ma60):
+            trend_alignment += 0.5 if ma20 > ma60 else -0.5
+        if pd.notna(ma60) and pd.notna(ma120):
+            trend_alignment += 0.5 if ma60 > ma120 else -0.5
+        volume_trend = np.nan
+        if len(volume.dropna()) >= 60:
+            vol20 = volume.tail(20).mean()
+            vol60 = volume.tail(60).mean()
+            if pd.notna(vol20) and pd.notna(vol60) and vol60 > 0:
+                volume_trend = (vol20 / vol60 - 1.0) * 100.0
+
+        rows.append({
+            "code": code,
+            "history_days": int(len(closes)),
+            "hist_ret_20": ret_20,
+            "hist_ret_60": ret_60,
+            "hist_ret_120": ret_120,
+            "hist_positive_ratio": positive_ratio * 100.0 if pd.notna(positive_ratio) else np.nan,
+            "hist_volatility_20": volatility_20,
+            "hist_volatility_60": volatility_60,
+            "hist_max_drawdown": max_drawdown,
+            "hist_price_vs_ma60": price_vs_ma60,
+            "hist_trend_alignment": trend_alignment,
+            "hist_volume_trend": volume_trend,
+        })
+
+    profile = pd.DataFrame(rows)
+    if profile.empty:
+        return profile
+
+    def _rank(series: pd.Series, reverse: bool = False) -> pd.Series:
+        rank = series.rank(pct=True)
+        if reverse:
+            rank = 1.0 - rank
+        return rank.fillna(0.5)
+
+    score = (
+        (_rank(profile["hist_ret_20"]) - 0.5) * 2 * 8
+        + (_rank(profile["hist_ret_60"]) - 0.5) * 2 * 18
+        + (_rank(profile["hist_ret_120"]) - 0.5) * 2 * 18
+        + (_rank(profile["hist_positive_ratio"]) - 0.5) * 2 * 12
+        + (_rank(profile["hist_price_vs_ma60"]) - 0.5) * 2 * 12
+        + (_rank(profile["hist_trend_alignment"]) - 0.5) * 2 * 12
+        + (_rank(profile["hist_volume_trend"]) - 0.5) * 2 * 8
+        + (_rank(profile["hist_volatility_20"], reverse=True) - 0.5) * 2 * 5
+        + (_rank(profile["hist_volatility_60"], reverse=True) - 0.5) * 2 * 5
+        + (_rank(profile["hist_max_drawdown"], reverse=True) - 0.5) * 2 * 10
+    )
+
+    history_eligibility = np.where(profile["history_days"] >= min_history_days, 0.0, -15.0)
+    profile["history_score"] = np.clip(score + history_eligibility, -100, 100).round(1)
+    profile["history_label"] = profile["history_score"].apply(_score_label)
+    profile["history_ready"] = profile["history_days"] >= min_history_days
+
+    _HISTORY_PROFILE_CACHE[cache_key] = profile.copy()
+    return profile
 
 
-def _fetch_one_page(fs: str, page: int = 1, page_size: int = 6000,
-                    timeout: int = 30) -> dict:
-    """Fetch a single page from Eastmoney clist API."""
-    params = {
-        "pn": page,
-        "pz": page_size,
-        "po": 1,
-        "np": 1,
-        "ut": "bd1d9ddb04089700cf9c27f6f7426281",
-        "fltt": 2,
-        "invt": 2,
-        "fid": "f3",
-        "fs": fs,
-        "fields": _EM_FIELDS,
-    }
-    resp = _get(_EM_URL, params=params, timeout=timeout)
-    return resp.json()
-
-
-def _to_dataframe(rows: list) -> pd.DataFrame:
-    """Convert parsed rows to final DataFrame with unit conversions."""
-    df = pd.DataFrame(rows)
+def attach_historical_profiles(df: pd.DataFrame,
+                               lookback_days: int = 240,
+                               min_history_days: int = 90) -> pd.DataFrame:
+    """Merge Stage 0 historical profiles into the market snapshot."""
     if df.empty:
         return df
-    for col in ["total_mv", "float_mv"]:
-        if col in df.columns:
-            df[col] = df[col] / 1e8
-    if "amount" in df.columns:
-        df["amount"] = df["amount"] / 1e4
-    return df
-
+    profile = build_historical_profiles(
+        lookback_days=lookback_days,
+        min_history_days=min_history_days,
+    )
+    if profile.empty:
+        enriched = df.copy()
+        enriched["history_score"] = np.nan
+        enriched["history_label"] = "unknown"
+        enriched["history_days"] = 0
+        enriched["history_ready"] = False
+        return enriched
+    return df.merge(profile, on="code", how="left")
 
 def fetch_all_stocks(market: str = "all",
                      max_retries: int = 3) -> pd.DataFrame:
     """
-    Fetch all A-share main-board stocks with multi-source fallback:
-
-      0) Local SQLite DB (from slow_fetcher.py — always works, no API needed)
-      1) Bulk Eastmoney request (pz=6000)
-      2) Paginated Eastmoney fallback (1000/page)
-      3) Azure proxy pool
+    Fetch all A-share main-board stocks from the local SQLite snapshot.
 
     Parameters:
         market       "all" / "sh" / "sz"
-        max_retries  Retry count for each request attempt
+        max_retries  Unused, retained for backward compatibility
 
     Returns:
         DataFrame (see column list in _parse_records)
     """
-    # ── Attempt 0: Local database (slow_fetcher) — instant, no network ──
     try:
         from slow_fetcher import load_stocks_from_db
         df = load_stocks_from_db()
-        if len(df) >= 2000:
-            logger.info("Loaded %d stocks from local DB", len(df))
+        if df.empty:
+            logger.warning("Local DB snapshot is empty; please import stocks first.")
             return df
-        else:
-            logger.info("Local DB has only %d stocks, trying online sources...",
-                       len(df))
+        logger.info("Loaded %d stocks from local DB", len(df))
+        return df
     except (ImportError, FileNotFoundError) as e:
-        logger.info("Local DB not available (%s), trying online sources...", e)
-
-    fs = _build_fs(market)
-
-    # ── Attempt 1: single bulk request with retries ──
-    for attempt in range(1, max_retries + 1):
-        try:
-            data = _fetch_one_page(fs, page=1, page_size=6000, timeout=30)
-            if data.get("data") and data["data"].get("diff"):
-                rows = _parse_records(data["data"]["diff"])
-                if rows:
-                    logger.info("Bulk fetch OK: %d stocks (attempt %d)",
-                                len(rows), attempt)
-                    return _to_dataframe(rows)
-        except Exception as e:
-            logger.warning("Bulk fetch attempt %d/%d failed: %s",
-                           attempt, max_retries, e)
-            if attempt < max_retries:
-                time.sleep(1.5 * attempt)
-
-    # ── Attempt 2: paginated fallback (smaller requests) ──
-    logger.info("Falling back to paginated fetch (1000/page)")
-    page_size = 1000
-    all_rows = []
-    for page in range(1, 8):          # 7 pages × 1000 = 7000, more than enough
-        for attempt in range(1, max_retries + 1):
-            try:
-                data = _fetch_one_page(fs, page=page, page_size=page_size,
-                                       timeout=20)
-                diff = (data.get("data") or {}).get("diff")
-                if not diff:
-                    # No more pages
-                    logger.info("Paginated fetch done at page %d, "
-                                "total %d stocks", page, len(all_rows))
-                    return _to_dataframe(all_rows)
-                all_rows.extend(_parse_records(diff))
-                time.sleep(0.3)
-                break                   # page succeeded, move to next
-            except Exception as e:
-                logger.warning("Page %d attempt %d/%d failed: %s",
-                               page, attempt, max_retries, e)
-                if attempt < max_retries:
-                    time.sleep(1.5 * attempt)
-        else:
-            # All retries exhausted for this page — return what we have
-            logger.error("Page %d failed after %d retries, returning "
-                         "partial data (%d stocks)", page, max_retries,
-                         len(all_rows))
-            break
-
-    if all_rows:
-        return _to_dataframe(all_rows)
-
-    return pd.DataFrame()
-
-
-def _safe_float(val) -> float:
-    """Safely convert to float, return NaN for invalid values."""
-    if val is None or val == "-" or val == "":
-        return float("nan")
-    try:
-        return float(val)
-    except (ValueError, TypeError):
-        return float("nan")
+        logger.warning("Local DB not available: %s", e)
+        return pd.DataFrame()
 
 
 # =====================================================
@@ -529,8 +562,11 @@ def deep_scan(candidates: pd.DataFrame,
         code, name, current, pct_chg, total_score, signal, confidence,
         trend, momentum, risk_level, prob_up, fast_score, and key metrics.
     """
+    from slow_fetcher import assess_market_regime, assess_event_risk, _build_trade_decision
+
     results = []
-    scan_list = candidates.head(top_n)
+    scan_list = candidates
+    market_regime = assess_market_regime()
 
     for i, (_, row) in enumerate(scan_list.iterrows()):
         code = row["code"]
@@ -548,11 +584,30 @@ def deep_scan(candidates: pd.DataFrame,
             mc = diag.get("monte_carlo") or {}
             trend_detail = diag.get("trend_detail", {})
             vol_detail = diag.get("volatility_detail", {})
+            decision = _build_trade_decision(
+                df,
+                diag,
+                float(df.iloc[-1]["close"]),
+                market_regime,
+            )
+            entry_quality_score = (
+                diag["total_score"] * 0.35
+                + row.get("stage1_score", row.get("fast_score", 0)) * 0.18
+                + row.get("history_score", 0) * 0.12
+                + (mc.get("prob_up", 0) - 50) * 0.6
+                + (mc.get("expected_return", 0) or 0) * 1.8
+                + (decision.get("risk_reward", 0) or 0) * 8
+                + (decision.get("market_regime_score", 0) or 0) * 0.15
+            )
+            if decision.get("action") == "buy":
+                entry_quality_score += 12
+            elif decision.get("action") == "sell":
+                entry_quality_score -= 20
 
             results.append({
                 "code": code,
                 "name": row.get("name", ""),
-                "current": row.get("current", 0),
+                "current": float(df.iloc[-1]["close"]),
                 "pct_chg": row.get("pct_chg", 0),
                 "pe_ttm": row.get("pe_ttm"),
                 "pb": row.get("pb"),
@@ -567,12 +622,63 @@ def deep_scan(candidates: pd.DataFrame,
                 "prob_down": mc.get("prob_down", None),
                 "expected_return": mc.get("expected_return", None),
                 "fast_score": row.get("fast_score", 0),
+                "stage1_score": row.get("stage1_score", row.get("fast_score", 0)),
+                "history_score": row.get("history_score"),
+                "history_label": row.get("history_label"),
+                "history_days": row.get("history_days"),
+                "decision": decision,
+                "decision_action": decision.get("action"),
+                "decision_text": decision.get("conclusion"),
+                "entry_low": decision.get("entry_low"),
+                "entry_high": decision.get("entry_high"),
+                "stop_loss": decision.get("stop_loss"),
+                "take_profit": decision.get("take_profit"),
+                "risk_reward": decision.get("risk_reward"),
+                "market_regime_score": decision.get("market_regime_score"),
+                "entry_quality_score": round(entry_quality_score, 1),
+                "_diag": diag,
+                "_df": df,
             })
         except Exception:
             continue
 
-    results.sort(key=lambda x: x["total_score"], reverse=True)
-    return results
+    results.sort(key=_decision_rank, reverse=True)
+
+    # Event-risk recheck only for top candidates to keep screener responsive.
+    review_limit = min(max(top_n * 2, 6), len(results), 12)
+    for item in results[:review_limit]:
+        try:
+            event_risk = assess_event_risk(item["code"])
+            decision = _build_trade_decision(
+                item["_df"],
+                item["_diag"],
+                item["current"],
+                market_regime,
+                event_risk,
+            )
+            item["event_risk"] = event_risk
+            item["decision"] = decision
+            item["decision_action"] = decision.get("action")
+            item["decision_text"] = decision.get("conclusion")
+            item["entry_low"] = decision.get("entry_low")
+            item["entry_high"] = decision.get("entry_high")
+            item["stop_loss"] = decision.get("stop_loss")
+            item["take_profit"] = decision.get("take_profit")
+            item["risk_reward"] = decision.get("risk_reward")
+            item["event_score"] = decision.get("event_score")
+            item["entry_quality_score"] = round(
+                item.get("entry_quality_score", 0) + (decision.get("event_score", 0) or 0) * 0.6,
+                1,
+            )
+        except Exception:
+            continue
+
+    for item in results:
+        item.pop("_diag", None)
+        item.pop("_df", None)
+
+    results.sort(key=_decision_rank, reverse=True)
+    return results[:top_n]
 
 
 # =====================================================
@@ -594,6 +700,8 @@ def screen_stocks(
     deep_scan_enabled: bool = True,
     stage1_limit: int = 80,
     analysis_days: int = 120,
+    history_lookback_days: int = 240,
+    history_min_days: int = 90,
     **filter_kwargs,
 ) -> Dict:
     """
@@ -605,6 +713,8 @@ def screen_stocks(
         deep_scan_enabled Whether to run Stage 2 deep analysis
         stage1_limit      Max candidates to pass from Stage 1 to Stage 2
         analysis_days     Days of history for deep scan
+        history_lookback_days Days of history used for Stage 0 profile
+        history_min_days  Minimum history days to treat profile as reliable
         **filter_kwargs   Additional parameters passed to the filter function
 
     Returns:
@@ -617,6 +727,12 @@ def screen_stocks(
             "summary": str
         }
     """
+    try:
+        from slow_fetcher import assess_market_regime
+        market_regime = assess_market_regime()
+    except Exception:
+        market_regime = None
+
     # -- Fetch full market --
     all_stocks = fetch_all_stocks()
     if all_stocks.empty:
@@ -624,20 +740,48 @@ def screen_stocks(
 
     total_market = len(all_stocks)
 
+    # -- Stage 0: Historical cross-sectional scoring --
+    all_stocks = attach_historical_profiles(
+        all_stocks,
+        lookback_days=history_lookback_days,
+        min_history_days=history_min_days,
+    )
+    history_profile_count = int(all_stocks["history_score"].notna().sum()) \
+        if "history_score" in all_stocks.columns else 0
+
     # -- Stage 1: Fast filter --
     filter_func = STRATEGY_MAP.get(strategy)
     if filter_func is None:
         return {"error": f"Unknown strategy: {strategy}. Available: {list(STRATEGY_MAP.keys())}"}
 
     candidates = filter_func(all_stocks, **filter_kwargs)
+    if not candidates.empty:
+        history_component = candidates.get("history_score", pd.Series(0, index=candidates.index)).fillna(0)
+        fast_component = candidates.get("fast_score", pd.Series(0, index=candidates.index)).fillna(0)
+        readiness_penalty = np.where(
+            candidates.get("history_ready", pd.Series(False, index=candidates.index)).fillna(False),
+            0.0,
+            -8.0,
+        )
+        candidates["stage1_score"] = (
+            fast_component * 0.55
+            + history_component * 0.45
+            + readiness_penalty
+        ).round(1)
+        candidates = candidates.sort_values(
+            by=["stage1_score", "history_score", "fast_score"],
+            ascending=False,
+        )
     stage1_count = len(candidates)
 
     if stage1_count == 0:
         return {
             "strategy": strategy,
             "total_market": total_market,
+            "history_profile_count": history_profile_count,
             "stage1_count": 0,
             "stage2_count": 0,
+            "market_regime": market_regime,
             "results": [],
             "summary": f"No stocks passed the {strategy} filter out of {total_market} total stocks. "
                        f"Try relaxing filter conditions.",
@@ -664,17 +808,24 @@ def screen_stocks(
                 "pb": round(row["pb"], 2) if pd.notna(row.get("pb")) else None,
                 "total_mv": round(row["total_mv"], 1) if pd.notna(row.get("total_mv")) else None,
                 "fast_score": round(row.get("fast_score", 0), 1),
+                "history_score": round(row.get("history_score", 0), 1) if pd.notna(row.get("history_score")) else None,
+                "history_label": row.get("history_label"),
+                "history_days": int(row.get("history_days", 0) or 0),
+                "stage1_score": round(row.get("stage1_score", row.get("fast_score", 0)), 1),
             })
         stage2_count = 0
 
     return {
         "strategy": strategy,
         "total_market": total_market,
+        "history_profile_count": history_profile_count,
         "stage1_count": stage1_count,
         "stage2_count": stage2_count,
+        "market_regime": market_regime,
         "results": results,
         "summary": _format_summary(strategy, total_market, stage1_count,
-                                    stage2_count, results, deep_scan_enabled),
+                                    stage2_count, results, deep_scan_enabled,
+                                    history_profile_count=history_profile_count),
     }
 
 
@@ -683,17 +834,32 @@ def screen_stocks(
 # =====================================================
 
 def _format_summary(strategy, total_market, stage1_count,
-                    stage2_count, results, deep_enabled) -> str:
+                    stage2_count, results, deep_enabled,
+                    history_profile_count: int = 0) -> str:
     """Format screening results into human-readable text."""
+    market_regime = None
+    if deep_enabled:
+        try:
+            from slow_fetcher import assess_market_regime
+            market_regime = assess_market_regime()
+        except Exception:
+            market_regime = None
+
     lines = [
         f"Stock Screener Report",
         f"Strategy: {strategy.upper()}",
         f"Market: {total_market} total A-share stocks scanned",
+        f"Stage 0 (historical profile): {history_profile_count} stocks scored from stock_history",
         f"Stage 1 (fast filter): {stage1_count} candidates passed",
     ]
 
     if deep_enabled:
         lines.append(f"Stage 2 (deep quant scan): {stage2_count} stocks analyzed")
+        if market_regime:
+            lines.append(
+                "Market Regime: "
+                f"{market_regime['score']:+.1f} / {market_regime['label']} / {market_regime['action_bias']}"
+            )
 
     lines.append("=" * 65)
 
@@ -702,23 +868,33 @@ def _format_summary(strategy, total_market, stage1_count,
         return "\n".join(lines)
 
     if deep_enabled and results and "total_score" in results[0]:
+        buy_count = sum(1 for r in results if r.get("decision_action") == "buy")
+        hold_count = sum(1 for r in results if r.get("decision_action") == "hold")
+        sell_count = sum(1 for r in results if r.get("decision_action") == "sell")
+        lines.append(
+            f"Decision Mix: buy {buy_count} / hold {hold_count} / sell {sell_count}"
+        )
+
         # Deep scan results
         lines.append(
             f"  {'#':<3} {'Code':<8} {'Name':<10} {'Price':>7} {'Chg%':>7} "
-            f"{'Score':>6} {'Signal':<12} {'Trend':<12} {'P(up)':>6}"
+            f"{'Hist':>6} {'S1':>6} {'Action':<8} {'EQS':>6} {'Evt':>6} {'P(up)':>6}"
         )
-        lines.append("-" * 75)
+        lines.append("-" * 90)
 
         for i, r in enumerate(results, 1):
             prob_up = f"{r['prob_up']:.0f}%" if r.get("prob_up") is not None else "N/A"
+            evt = f"{r.get('event_score', 0):+.0f}" if r.get("event_score") is not None else "N/A"
+            hist = f"{r.get('history_score', 0):+.0f}" if r.get("history_score") is not None else "N/A"
             lines.append(
                 f"  {i:<3} {r['code']:<8} {r['name']:<10} "
                 f"{r['current']:>7.2f} {r['pct_chg']:>+6.2f}% "
-                f"{r['total_score']:>+6.1f} {r['signal']:<12} "
-                f"{r.get('trend_dir',''):<12} {prob_up:>6}"
+                f"{hist:>6} {r.get('stage1_score', r.get('fast_score', 0)):>+6.1f} "
+                f"{r.get('decision_action','hold'):<8} {r.get('entry_quality_score', 0):>+6.1f} "
+                f"{evt:>6} {prob_up:>6}"
             )
 
-        lines.append("-" * 75)
+        lines.append("-" * 90)
 
         # Top pick summary
         if results:
@@ -726,31 +902,46 @@ def _format_summary(strategy, total_market, stage1_count,
             lines.extend([
                 "",
                 f"Top Pick: {top['name']} ({top['code']})",
-                f"  Price: {top['current']:.2f}   Score: {top['total_score']:+.1f}   Signal: {top['signal']}",
+                f"  Decision: {top.get('decision_text', top.get('signal', 'N/A'))}",
+                f"  Price: {top['current']:.2f}   Hist Score: {top.get('history_score', 0):+.1f} ({top.get('history_label', 'unknown')})",
+                f"  Stage1 Score: {top.get('stage1_score', top.get('fast_score', 0)):+.1f}   EQS: {top.get('entry_quality_score', 0):+.1f}   Quant Score: {top['total_score']:+.1f}",
                 f"  Trend: {top.get('trend_dir', 'N/A')} ({top.get('trend_strength', 'N/A')})",
                 f"  Risk Level: {top.get('risk_level', 'N/A')}",
+                f"  Event Score: {top.get('event_score', 0):+.1f}",
+                f"  Entry Zone: {top.get('entry_low', 'N/A')} ~ {top.get('entry_high', 'N/A')}",
+                f"  Stop / TP: {top.get('stop_loss', 'N/A')} / {top.get('take_profit', 'N/A')}",
             ])
             if top.get("prob_up") is not None:
                 lines.append(
                     f"  Monte Carlo: {top['prob_up']:.0f}% up / {top['prob_down']:.0f}% down   "
                     f"Expected return: {top['expected_return']:+.1f}%"
                 )
+            top_decision = top.get("decision", {}) or {}
+            if top_decision.get("reasons_for"):
+                lines.append("  Why selected:")
+                for item in top_decision["reasons_for"][:3]:
+                    lines.append(f"    + {item}")
+            top_event = top.get("event_risk", {}) or {}
+            for item in top_event.get("negative_flags", [])[:2]:
+                lines.append(f"    - {item}")
     else:
         # Fast filter only results
         lines.append(
             f"  {'#':<3} {'Code':<8} {'Name':<10} {'Price':>7} {'Chg%':>7} "
-            f"{'PE':>7} {'PB':>6} {'MktCap':>8} {'Score':>6}"
+            f"{'Hist':>6} {'S1':>6} {'PE':>7} {'PB':>6} {'MktCap':>8}"
         )
-        lines.append("-" * 70)
+        lines.append("-" * 86)
 
         for i, r in enumerate(results, 1):
             pe_str = f"{r['pe_ttm']:.1f}" if r.get("pe_ttm") is not None else "N/A"
             pb_str = f"{r['pb']:.1f}" if r.get("pb") is not None else "N/A"
             mv_str = f"{r['total_mv']:.0f}" if r.get("total_mv") is not None else "N/A"
+            hist = f"{r.get('history_score', 0):+.0f}" if r.get("history_score") is not None else "N/A"
             lines.append(
                 f"  {i:<3} {r['code']:<8} {r['name']:<10} "
                 f"{r['current']:>7.2f} {r['pct_chg']:>+6.2f}% "
-                f"{pe_str:>7} {pb_str:>6} {mv_str:>8} {r.get('fast_score', 0):>6.1f}"
+                f"{hist:>6} {r.get('stage1_score', r.get('fast_score', 0)):>+6.1f} "
+                f"{pe_str:>7} {pb_str:>6} {mv_str:>8}"
             )
 
     lines.extend([

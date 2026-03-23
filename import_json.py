@@ -7,20 +7,20 @@ import json
 import sqlite3
 import glob
 import os
-from datetime import datetime
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 DB_PATH  = os.path.join(DATA_DIR, "stocks.db")
 
 
-def _safe_float(v):
-    if v is None or v == "-" or v == "":
-        return None
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return None
-
+def ensure_tables(conn: sqlite3.Connection):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stocks (
+            code          TEXT PRIMARY KEY,
+            name          TEXT,
+            suspended     INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
 
 def import_file(conn: sqlite3.Connection, path: str) -> tuple[int, int]:
     """导入单个 JSON 文件，返回 (新增, 跳过) 数量。"""
@@ -32,55 +32,23 @@ def import_file(conn: sqlite3.Connection, path: str) -> tuple[int, int]:
         print(f"  ⚠️  {os.path.basename(path)}: diff 字段为空，跳过")
         return 0, 0
 
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    batch_id = f"manual_{os.path.basename(path)}"
-
     inserted = 0
     skipped  = 0
-
     for r in diff:
         code = r.get("f12", "")
         if not code:
             skipped += 1
             continue
 
-        current  = _safe_float(r.get("f2"))
-        amount   = _safe_float(r.get("f6"))
-        total_mv = _safe_float(r.get("f20"))
-        float_mv = _safe_float(r.get("f21"))
-
-        conn.execute("""
-            INSERT OR REPLACE INTO stocks
-            (code, name, current, pct_chg, change, volume, amount,
-             amplitude, high, low, open, prev_close, volume_ratio,
-             turnover_rate, pe_ttm, pb, total_mv, float_mv,
-             chg_60d, chg_ytd, raw_json, updated_at, batch_id)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            code,
-            r.get("f14", ""),
-            current,
-            _safe_float(r.get("f3")),
-            _safe_float(r.get("f4")),
-            _safe_float(r.get("f5")),
-            amount / 1e4 if amount else None,
-            _safe_float(r.get("f7")),
-            _safe_float(r.get("f15")),
-            _safe_float(r.get("f16")),
-            _safe_float(r.get("f17")),
-            _safe_float(r.get("f18")),
-            _safe_float(r.get("f10")),
-            _safe_float(r.get("f8")),
-            _safe_float(r.get("f9")),
-            _safe_float(r.get("f23")),
-            total_mv / 1e8 if total_mv else None,
-            float_mv / 1e8 if float_mv else None,
-            _safe_float(r.get("f24")),
-            _safe_float(r.get("f25")),
-            json.dumps(r, ensure_ascii=False),
-            now,
-            batch_id,
-        ))
+        conn.execute(
+            """
+            INSERT INTO stocks (code, name, suspended)
+            VALUES (?, ?, 0)
+            ON CONFLICT(code) DO UPDATE SET
+                name = excluded.name
+            """,
+            (code, r.get("f14", "")),
+        )
         inserted += 1
 
     conn.commit()
@@ -101,6 +69,7 @@ def main():
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
+    ensure_tables(conn)
 
     # 导入前总数
     before = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]

@@ -1,215 +1,340 @@
 # A 股量化分析系统
 
-全离线 A 股量化分析工具。通过慢速增量拉取策略绕过东方财富 API 频率限制，将数据存入本地 SQLite，后续分析完全脱离网络依赖。
+本项目是一套以本地 SQLite 为核心的 A 股研究工具。
+
+当前数据流已经固定为：
+
+- `stocks`：只保存股票宇宙元信息，来自本地 JSON 导入
+- `stock_fundamentals`：保存每日估值快照，在线来源为腾讯
+- `stock_history`：保存日 K 历史，在线来源为东方财富
 
 ## 项目结构
 
-```
+```text
 stock/
-├── slow_fetcher.py        # 数据采集 + 存储 + 实时分析 (日常使用入口)
-├── stock_screener.py      # 选股器 (快筛 + 深度量化诊断)
-├── stock_tool.py           # 底层 API 封装 (K线/行情/财务/画图)
-├── quant_engine.py        # 7 维量化分析引擎 (纯数学计算)
-├── backtest_engine.py     # 策略回测引擎
-├── risk_manager.py        # 风险管理 (VaR/凯利公式/止损)
-├── stock_mcp_server.py    # MCP 服务器 (Cursor/Claude Desktop 集成)
-├── setup.sh               # 一键安装脚本
+├── slow_fetcher.py         # 数据更新主入口
+├── import_json.py          # 从本地 JSON 导入 stocks
+├── stock_screener.py       # 选股器
+├── stock_tool.py           # 底层行情/财务/K线工具
+├── quant_engine.py         # 量化诊断引擎
+├── backtest_engine.py      # 回测引擎
+├── risk_manager.py         # 风险评估
+├── news_analyzer.py        # 市场新闻 / 个股新闻
+├── stock_mcp_server.py     # MCP 服务
 ├── data/
-│   └── stocks.db          # SQLite 数据库 (股票列表 + K线历史)
-└── charts/                # 图表输出目录
+│   └── stocks.db           # SQLite 数据库
+└── charts/                 # 图表输出目录
 ```
 
-## 快速开始
+## 安装
 
 ```bash
-# 安装依赖
-bash setup.sh
-
-# 或手动安装
 python3 -m venv .venv
 source .venv/bin/activate
-pip install mcp requests pandas numpy matplotlib curl_cffi
+pip install -r requirements.txt
+pip install mcp matplotlib pandas numpy curl_cffi
 ```
 
----
+## 当前数据库结构
 
-## 定时任务 (Cron)
+### `stocks`
 
-数据需要通过定时任务慢慢积累，以下是需要配置的 cron 任务。
+只保留股票主数据：
 
-### 1. 拉取股票列表 (基本面快照)
+- `code`
+- `name`
+- `suspended`
 
-每小时拉 1 页 (100 只)，约 35 小时拉完全部 ~3500 只主板 A 股。
+### `stock_fundamentals`
+
+只保留腾讯估值快照：
+
+- `code`
+- `trade_date`
+- `pe_ttm`
+- `pb`
+- `total_mv`
+- `float_mv`
+- `updated_at`
+- `source`
+- `batch_id`
+
+### `stock_history`
+
+保存日 K 历史：
+
+- `code`
+- `date`
+- `open`
+- `close`
+- `high`
+- `low`
+- `volume`
+- `amount`
+- `amplitude`
+- `pct_chg`
+- `change`
+- `turnover`
+
+## 日常使用流程
+
+### 1. 导入股票名单
+
+先把你手动保存的 JSON 导入到 `stocks`：
 
 ```bash
-# 每小时整点执行
-0 * * * * cd ~/stock && .venv/bin/python slow_fetcher.py >> data/fetcher.log 2>&1
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/import_json.py
 ```
 
-拉取的数据：代码、名称、现价、涨跌幅、PE、PB、市值、换手率、60日涨跌幅等。
+说明：
 
-### 2. 拉取 K 线历史
+- 只写入 `stocks`
+- 会按 `code` 去重
+- 重复导入不会产生重复股票
 
-K 线接口限制较松，可以更频繁。每 10 分钟拉 3 只股票的 1 年日 K 线。
+### 2. 盘中更新估值快照
+
+盘中只刷新 `stock_fundamentals`，不动 `stock_history`：
 
 ```bash
-# 每 10 分钟执行
-*/10 * * * * cd ~/stock && .venv/bin/python slow_fetcher.py --history --batch 3 >> data/history.log 2>&1
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --intraday-update --batch 200 --interval 10
 ```
 
-拉取的数据：每只股票 243 个交易日的 OHLCV（开高低收量）、涨跌幅、换手率。
+说明：
 
-### 3. 定期刷新 (数据拉完后)
+- 数据源：腾讯 `qt.gtimg.cn`
+- 默认按批次刷新，`--batch 200` 表示每批 200 只股票
+- `--interval 10` 表示批次间隔 10 秒
+- 现在已支持同一天断点续跑
+- 如果当天已经完整刷过，会提示无需重复刷新
 
-数据全部拉完后，定期重置并刷新：
+### 3. 收盘后正式更新
+
+收盘后统一更新：
+
+- `stock_fundamentals`
+- `stock_history`
+
+命令：
 
 ```bash
-# 每周一凌晨 1 点重置并重新拉
-0 1 * * 1 cd ~/stock && .venv/bin/python slow_fetcher.py --reset && .venv/bin/python slow_fetcher.py --reset-history
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --daily-close-update --batch 100 --interval 10
 ```
 
-### 查看拉取进度
+说明：
+
+- 先刷新当天 `stock_fundamentals`
+- 再把 `stock_history` 增量追到目标交易日
+- 已有历史的股票只补缺失日期，不会每次全量重拉
+
+### 4. 指定某个交易日更新
+
+如果你要补某个指定日期：
 
 ```bash
-python slow_fetcher.py --status
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --daily-close-update --trade-date 2026-03-23 --batch 100 --interval 10
 ```
 
-输出示例：
+这条命令适合：
 
-```
-╔══════════════════════════════════════════════════════╗
-║  [股票列表]                                          ║
-║    库中股票:   3472/3472 (100.0%)                     ║
-║    状态:       ✓ 已完成                               ║
-║                                                      ║
-║  [K线历史]                                           ║
-║    已拉股票:   3472/3472 只                           ║
-║    K线总条数:  844,296 条                             ║
-║    状态:       ✓ 已完成                               ║
-╚══════════════════════════════════════════════════════╝
-```
+- 补跑某个交易日
+- 只把所有股票追到那一天
 
----
+## 只更新 `stock_history`
 
-## 分析工具
-
-数据库填好后，以下命令均为**离线运行**（仅实时行情需 1 次轻量 API 调用）。
-
-### 分析单只股票
+如果你只想补 K 线历史：
 
 ```bash
-python slow_fetcher.py --analyze 600519
-python slow_fetcher.py --analyze 000858 --analyze-days 200
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --history --batch 100 --interval 10 --auto
 ```
 
-输出：现价、PE/PB/市值、量化评分 (-100~+100)、买卖信号、趋势方向、蒙特卡洛模拟概率、风险提示。
+说明：
 
-工作原理：历史 K 线从本地 SQLite 读取，今日实时行情从新浪拉取（1 次轻量请求），拼接后跑完整 7 维量化诊断。
+- 从 `stocks` 表读取未停牌股票
+- 按股票逐只增量补日 K
+- 不是每次全量重拉，而是从每只股票最后一条记录继续补
 
-### 选股筛选
+## 只补今天这一根日 K
+
+最推荐的做法仍然是用：
 
 ```bash
-# 在 Python 中调用
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --daily-close-update --trade-date 2026-03-23 --batch 100 --interval 10
+```
+
+因为这会把所有股票增量追到指定日期，不会把已有历史整段重拉。
+
+## 查看进度
+
+```bash
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --status
+```
+
+会显示：
+
+- `stocks` 数量
+- `stock_history` 已覆盖股票数
+- `stock_history` 总条数
+- fundamentals / history 的最近更新时间
+
+## 重置进度
+
+### 重置通用进度
+
+```bash
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --reset
+```
+
+说明：
+
+- 会清除元进度信息
+- 包括 fundamentals 的断点续跑位置
+- 不会删除已写入的数据表内容
+
+### 重置 K 线进度
+
+```bash
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --reset-history
+```
+
+## 导出快照
+
+```bash
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --export snapshot.csv
+```
+
+## 单股分析
+
+### CLI
+
+```bash
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --analyze 000066
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --analyze 600519 --analyze-days 200
+```
+
+输出会包含：
+
+- 市场环境
+- 事件因子
+- 买 / 卖 / 观望
+- 入场区间
+- 止损位 / 目标位
+- Kelly 仓位 / VaR
+- 支持理由 / 反对理由
+
+### Python
+
+```python
+from slow_fetcher import analyze_stock, load_stock_history, load_stocks_from_db
+
+result = analyze_stock("000066")
+print(result["decision"]["conclusion"])
+
+df = load_stock_history("000066")
+snapshot = load_stocks_from_db()
+```
+
+## 选股
+
+```python
 from stock_screener import screen_stocks
 
-# 价值股策略 (低PE + 低PB)
 result = screen_stocks("value", top_n=10)
+print(result["summary"])
 
-# 动量策略 (强趋势 + 放量)
 result = screen_stocks("momentum", top_n=10)
+print(result["summary"])
 
-# 超跌反弹策略
 result = screen_stocks("oversold", top_n=10)
+print(result["summary"])
 
-# 潜力股策略 (60日深跌 + 基本面完好)
 result = screen_stocks("potential", top_n=10)
-
 print(result["summary"])
 ```
 
-### 导出数据
+当前选股流程包含：
+
+- 本地市场快照读取
+- `stock_history` 历史画像评分
+- 策略初筛
+- 深度量化诊断
+- 事件复核
+- 最终交易决策排序
+
+## MCP
+
+当前 MCP 服务入口：
 
 ```bash
-# 导出股票列表到 CSV
-python slow_fetcher.py --export snapshot.csv
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/stock_mcp_server.py
 ```
 
-### Python API
+推荐的高层工具：
 
-```python
-from slow_fetcher import (
-    analyze_stock,           # 混合分析单只股票
-    load_stocks_from_db,     # 读取全部股票基本面
-    load_stock_history,      # 读取单只股票 K 线历史
-    load_all_history,        # 读取全部 K 线历史
-)
+- `resolve_stock`
+- `full_stock_analysis`
+- `stock_screener`
+- `stock_news`
+- `market_news`
 
-# 分析单只股票 (本地历史 + 线上实时)
-result = analyze_stock("600519")
-print(result["signal"])          # "buy" / "hold" / "sell"
-print(result["total_score"])     # -100 ~ +100
-print(result["prob_up"])         # 蒙特卡洛上涨概率
+单股完整分析会自动串联：
 
-# 读取本地数据
-stocks = load_stocks_from_db()   # DataFrame: 全部主板股票
-df = load_stock_history("600519") # DataFrame: 1 年日 K 线
+- 标的解析
+- 市场新闻
+- 个股新闻
+- 公告事件
+- 财报分析
+- 财务数据
+- 量化诊断
+- 量化资金分析
+- 风险评估
+
+## 重要说明
+
+### 关于 `--intraday-update`
+
+它不是更新 `stock_history`，只更新：
+
+- `stock_fundamentals`
+
+并且现在支持同一天断点续跑。
+
+### 关于 `--daily-close-update`
+
+它会做两件事：
+
+1. 刷新当天 `stock_fundamentals`
+2. 增量更新 `stock_history`
+
+### 关于 `stock_history`
+
+`stock_history` 当前仍然是逐只股票拉日 K。
+
+也就是说：
+
+- 不能一次批量拉几百只股票的完整日 K
+- 现在采用的是“逐只增量补到目标交易日”
+
+## 当前推荐的每日命令
+
+### 盘中
+
+```bash
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --intraday-update --batch 200 --interval 10
 ```
 
----
+### 收盘后
 
-## MCP 服务器 (Cursor / Claude Desktop)
-
-安装后 Cursor 和 Claude Desktop 可以直接调用以下工具：
-
-| 工具 | 功能 |
-|------|------|
-| `realtime_quote` | 实时行情 (单只/多只) |
-| `kline_data` | K 线数据 (日/周/月/分钟级) |
-| `financial_data` | 财务指标 (PE/PB/ROE/市值) |
-| `kline_chart` | K 线图 (蜡烛图 + MACD/RSI/KDJ) |
-| `batch_quote` | 批量行情对比 |
-| `stock_diagnosis` | 7 维量化诊断 (趋势/动量/波动/均值回归/量价/蒙特卡洛) |
-| `strategy_backtest` | 策略回测 (均线交叉/MACD/RSI/布林带/多因子) |
-| `risk_assessment` | 风险评估 (VaR/CVaR/凯利公式/止损建议) |
-| `stock_screener` | 全市场选股 (价值/动量/超跌/潜力) |
-
-直接对 Cursor/Claude 说「帮我分析一下 600519」或「帮我找几只低估值的股票」即可。
-
----
-
-## 数据源
-
-全部来自**东方财富**和**新浪财经**的公开 API，免费、无需注册、无需 API Key。
-
-| 数据 | 来源 | 接口 |
-|------|------|------|
-| 股票列表 + 基本面 | 东方财富 | `push2.eastmoney.com` clist API |
-| K 线历史 | 东方财富 | `push2his.eastmoney.com` kline API |
-| 实时行情 | 新浪财经 | `hq.sinajs.cn` |
-| 财务指标 | 东方财富 | `push2.eastmoney.com` stock API |
-
----
-
-## 数据库结构 (data/stocks.db)
-
+```bash
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --daily-close-update --batch 100 --interval 10
 ```
-stocks 表 — 全 A 股基本面快照
-├── code (主键), name, current, pct_chg, change
-├── volume, amount, amplitude, high, low, open, prev_close
-├── volume_ratio, turnover_rate, pe_ttm, pb
-├── total_mv (亿), float_mv (亿), chg_60d, chg_ytd
-├── raw_json (原始 API 返回), updated_at, batch_id
-│
-stock_history 表 — 个股日 K 线历史
-├── code + date (联合主键)
-├── open, close, high, low, volume, amount
-├── amplitude, pct_chg, change, turnover
-│
-meta 表 — 拉取进度追踪
-├── next_page, total_expected, batch_id
-├── history_done, history_last_fetch, ...
+
+### 补指定交易日
+
+```bash
+/Users/chenglanguo/stock/.venv/bin/python /Users/chenglanguo/stock/slow_fetcher.py --daily-close-update --trade-date 2026-03-23 --batch 100 --interval 10
 ```
 
 ## 免责声明
 
-本工具所有分析结果基于数学模型和历史数据，不构成任何投资建议。投资有风险，入市需谨慎。
+本项目仅用于量化研究与流程辅助，不构成任何投资建议。投资有风险，入市需谨慎。

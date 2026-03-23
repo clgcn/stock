@@ -22,6 +22,7 @@ import html as _html
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from urllib.parse import quote_plus
 
 try:
     from curl_cffi import requests
@@ -424,6 +425,130 @@ def _news_sentiment_delta(international: list[dict], domestic: list[dict]) -> fl
     )
     raw = (bull_count - bear_count) / max(len(all_titles), 1) * 2
     return round(max(-0.3, min(0.3, raw)), 2)
+
+
+_STOCK_BEARISH_KEYWORDS = [
+    "减持", "处罚", "问询", "诉讼", "亏损", "下滑", "暴跌", "违约", "风险", "终止",
+    "裁员", "冻结", "停产", "退市", "调查", "失败", "质押", "解禁", "商誉减值",
+    "warning", "lawsuit", "probe", "investigation", "loss", "default", "risk",
+]
+
+_STOCK_BULLISH_KEYWORDS = [
+    "回购", "增持", "中标", "签约", "订单", "突破", "增长", "扭亏", "预增", "涨停",
+    "并购", "收购", "落地", "投产", "扩产", "合作", "分红", "重组", "利好", "创新高",
+    "buyback", "profit", "growth", "contract", "order", "breakthrough", "deal",
+]
+
+
+def _fetch_google_news_search(query: str, max_items: int = 8) -> list[dict]:
+    """
+    Fetch stock-specific headlines from Google News RSS search.
+    This is a lightweight, query-driven feed that works well for company-specific headlines.
+    """
+    q = quote_plus(query)
+    url = f"https://news.google.com/rss/search?q={q}&hl=zh-CN&gl=CN&ceid=CN:zh-Hans"
+    try:
+        r = _get(url, timeout=10)
+        if r.status_code != 200:
+            return []
+        raw = _parse_rss(r.text, max_items=max_items * 2)
+    except Exception:
+        return []
+
+    items = []
+    seen = set()
+    for item in raw:
+        title = item.get("title", "").strip()
+        if not title:
+            continue
+        norm = title[:80]
+        if norm in seen:
+            continue
+        seen.add(norm)
+        item["source"] = item.get("source") or "Google News"
+        item["date_hint"] = _friendly_date(item.get("pub_date", ""))
+        items.append(item)
+        if len(items) >= max_items:
+            break
+    return items
+
+
+def _stock_news_delta(items: list[dict]) -> float:
+    """Score company-specific news headlines into a small sentiment delta."""
+    titles = [i.get("title", "").lower() for i in items]
+    bear_count = sum(1 for t in titles for kw in _STOCK_BEARISH_KEYWORDS if kw in t)
+    bull_count = sum(1 for t in titles for kw in _STOCK_BULLISH_KEYWORDS if kw in t)
+    raw = (bull_count - bear_count) / max(len(titles), 1) * 2
+    return round(max(-0.4, min(0.4, raw)), 2)
+
+
+def get_stock_news_summary(stock_name: str, stock_code: str, max_items: int = 8) -> dict:
+    """
+    Build a stock-specific news snapshot using company-name and code-driven queries.
+
+    Returns
+    -------
+    dict
+      {
+        "items": [...],
+        "score": float,
+        "label": str,
+        "query": str,
+      }
+    """
+    query = f"{stock_name} {stock_code} 股票 OR A股"
+    items = _fetch_google_news_search(query, max_items=max_items)
+    score = _stock_news_delta(items)
+    label = _score_to_label(score)
+    return {
+        "items": items,
+        "score": score,
+        "label": label,
+        "query": query,
+    }
+
+
+def get_stock_news_report(stock_name: str, stock_code: str, max_items: int = 8) -> str:
+    """
+    Generate a stock-specific news report.
+    """
+    snapshot = get_stock_news_summary(stock_name, stock_code, max_items=max_items)
+    items = snapshot["items"]
+    score = snapshot["score"]
+    label = snapshot["label"]
+    query = snapshot["query"]
+
+    lines = [
+        "【个股新闻面】",
+        f"  标的：{stock_name} ({stock_code})",
+        f"  检索关键词：{query}",
+    ]
+
+    if not items:
+        lines.extend([
+            "  （暂无可用个股新闻，可能受网络限制或当天公开报道较少）",
+            "  个股新闻情绪微调： +0.00",
+            "  个股新闻结论： 中性（数据不足）",
+        ])
+        return "\n".join(lines)
+
+    lines.append("")
+    for idx, item in enumerate(items[:max_items], 1):
+        title = item.get("title", "")
+        if len(title) > 88:
+            title = title[:85] + "..."
+        hint = item.get("date_hint", "")
+        source = item.get("source", "Google News")
+        suffix = f"  {hint}" if hint else ""
+        lines.append(f"  {idx}. [{source}] {title}{suffix}")
+
+    lines.extend([
+        "",
+        f"  个股新闻情绪微调： {score:+.2f}",
+        f"  个股新闻结论： {label}",
+        "  使用建议：将该分值与 market_news、公告/财报事件面一起综合判断，不单独作为买卖依据。",
+    ])
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════

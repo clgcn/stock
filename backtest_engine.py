@@ -135,6 +135,61 @@ def strategy_multifactor(df: pd.DataFrame, threshold_buy: float = 15,
     return signal
 
 
+def strategy_decision_engine(
+    df: pd.DataFrame,
+    window: int = 90,
+    decision_config: dict = None,
+) -> pd.Series:
+    """
+    Decision-engine strategy.
+    Replays the current buy/hold/sell logic on a rolling window and
+    converts explicit trade decisions into backtest signals.
+    """
+    import quant_engine as qe
+    from slow_fetcher import _build_trade_decision
+
+    signal = pd.Series(0, index=df.index)
+    decision_config = decision_config or {}
+    use_monte_carlo = decision_config.get("use_monte_carlo", False)
+    neutral_market = {
+        "score": 0.0,
+        "label": "neutral",
+        "action_bias": "neutral",
+        "summary": "Calibration mode uses neutral market regime.",
+    }
+    neutral_event = {
+        "available": False,
+        "score": 0.0,
+        "label": "neutral",
+        "summary": "Calibration mode ignores event risk.",
+        "recent_earnings": False,
+        "high_uncertainty": False,
+        "positive_flags": [],
+        "negative_flags": [],
+    }
+
+    for i in range(window, len(df)):
+        sub = df.iloc[:i + 1].copy()
+        sub.attrs = df.attrs.copy()
+        try:
+            diag = qe.comprehensive_diagnosis(sub, run_monte_carlo=use_monte_carlo, mc_days=20)
+            decision = _build_trade_decision(
+                sub,
+                diag,
+                float(sub.iloc[-1]["close"]),
+                neutral_market,
+                neutral_event,
+                config=decision_config,
+            )
+            if decision["action"] == "buy":
+                signal.iloc[i] = 1
+            elif decision["action"] == "sell":
+                signal.iloc[i] = -1
+        except Exception:
+            continue
+    return signal
+
+
 # Strategy registry
 STRATEGIES = {
     "ma_cross":    {"func": strategy_ma_cross,    "name": "MA Cross",     "desc": "Short MA crosses above/below long MA"},
@@ -142,6 +197,7 @@ STRATEGIES = {
     "rsi":         {"func": strategy_rsi,         "name": "RSI",          "desc": "RSI overbought/oversold reversal"},
     "bollinger":   {"func": strategy_bollinger,   "name": "Bollinger",    "desc": "Bollinger Band mean reversion"},
     "multifactor": {"func": strategy_multifactor, "name": "Multi-Factor", "desc": "Comprehensive quantitative scoring system"},
+    "decision_engine": {"func": strategy_decision_engine, "name": "Decision Engine", "desc": "Replay explicit buy/hold/sell decision rules"},
 }
 
 
@@ -383,6 +439,368 @@ def _calc_metrics(equity_curve, trades, trade_log,
         "trading_days": trading_days,
         "holding_pct": round(holding_pct, 1),
     }
+
+
+def calibrate_decision_engine(
+    df: pd.DataFrame,
+    initial_capital: float = 100000,
+    max_candidates: int = 36,
+) -> Dict:
+    """
+    Grid-search a small set of decision thresholds to find a more stable
+    configuration for the explicit buy/sell engine.
+    """
+    candidates = []
+    buy_scores = [5, 10, 15, 18]
+    buy_probs = [50, 52, 55]
+    risk_rewards = [1.2, 1.5, 1.8]
+    trend_buys = [0, 5, 10]
+    expected_return_mins = [-1.0, -0.2, 0.0]
+    min_buy_checks_list = [5, 6, 7]
+
+    for buy_score in buy_scores:
+        for buy_prob in buy_probs:
+            for rr in risk_rewards:
+                for trend_buy in trend_buys:
+                    for ev_min in expected_return_mins:
+                        for min_buy_checks in min_buy_checks_list:
+                            candidates.append({
+                                "buy_score_min": buy_score,
+                                "sell_score_max": -buy_score,
+                                "buy_prob_min": buy_prob,
+                                "sell_prob_min": buy_prob,
+                                "min_risk_reward": rr,
+                                "trend_buy_min": trend_buy,
+                                "trend_sell_max": -trend_buy,
+                                "expected_return_min": ev_min,
+                                "min_buy_checks": min_buy_checks,
+                                "min_sell_checks": 3,
+                                "require_probabilistic_edge": False,
+                                "use_monte_carlo": False,
+                            })
+    candidates = candidates[:max_candidates]
+
+    trials = []
+    for cfg in candidates:
+        result = backtest(
+            df,
+            strategy_name="decision_engine",
+            strategy_params={"window": 90, "decision_config": cfg},
+            initial_capital=initial_capital,
+            max_position=1.0,
+            stop_loss=0.0,
+            take_profit=0.0,
+        )
+        if "error" in result:
+            continue
+        score = (
+            result["total_return_pct"] * 0.5
+            + result["sharpe_ratio"] * 12
+            - result["max_drawdown_pct"] * 0.4
+            + result["win_rate_pct"] * 0.15
+            + min(result["n_trades"], 12) * 0.8
+        )
+        result["calibration_score"] = round(score, 2)
+        result["decision_config"] = cfg
+        trials.append(result)
+
+    if not trials:
+        return {"error": "No valid calibration runs completed"}
+
+    trials.sort(
+        key=lambda x: (
+            x["calibration_score"],
+            x["sharpe_ratio"],
+            x["total_return_pct"],
+            -x["max_drawdown_pct"],
+        ),
+        reverse=True,
+    )
+    return {
+        "best": trials[0],
+        "top_trials": trials[:5],
+        "tested": len(trials),
+    }
+
+
+def calibrate_decision_engine_batch(
+    datasets: list[tuple[str, pd.DataFrame]],
+    initial_capital: float = 100000,
+    max_candidates: int = 24,
+) -> Dict:
+    """
+    Batch calibration across multiple stocks.
+    Uses the same parameter grid, scores configurations by aggregate robustness.
+    """
+    if not datasets:
+        return {"error": "No datasets provided for batch calibration"}
+
+    buy_scores = [5, 10, 15, 18]
+    buy_probs = [50, 52]
+    risk_rewards = [1.2, 1.5, 1.8]
+    trend_buys = [0, 5, 10]
+    expected_return_mins = [-1.0, -0.2, 0.0]
+    min_buy_checks_list = [5, 6]
+
+    candidates = []
+    for buy_score in buy_scores:
+        for buy_prob in buy_probs:
+            for rr in risk_rewards:
+                for trend_buy in trend_buys:
+                    for ev_min in expected_return_mins:
+                        for min_buy_checks in min_buy_checks_list:
+                            candidates.append({
+                                "buy_score_min": buy_score,
+                                "sell_score_max": -buy_score,
+                                "buy_prob_min": buy_prob,
+                                "sell_prob_min": buy_prob,
+                                "min_risk_reward": rr,
+                                "trend_buy_min": trend_buy,
+                                "trend_sell_max": -trend_buy,
+                                "expected_return_min": ev_min,
+                                "min_buy_checks": min_buy_checks,
+                                "min_sell_checks": 3,
+                                "require_probabilistic_edge": False,
+                                "use_monte_carlo": False,
+                            })
+    candidates = candidates[:max_candidates]
+
+    trials = []
+    for cfg in candidates:
+        per_stock = []
+        for code, df in datasets:
+            result = backtest(
+                df,
+                strategy_name="decision_engine",
+                strategy_params={"window": 90, "decision_config": cfg},
+                initial_capital=initial_capital,
+                max_position=1.0,
+                stop_loss=0.0,
+                take_profit=0.0,
+            )
+            if "error" in result:
+                continue
+            result["code"] = code
+            per_stock.append(result)
+
+        if not per_stock:
+            continue
+
+        avg_return = float(np.mean([r["total_return_pct"] for r in per_stock]))
+        avg_sharpe = float(np.mean([r["sharpe_ratio"] for r in per_stock]))
+        avg_dd = float(np.mean([r["max_drawdown_pct"] for r in per_stock]))
+        avg_win_rate = float(np.mean([r["win_rate_pct"] for r in per_stock]))
+        avg_trades = float(np.mean([r["n_trades"] for r in per_stock]))
+        profitable_ratio = float(np.mean([1.0 if r["total_return_pct"] > 0 else 0.0 for r in per_stock])) * 100
+
+        score = (
+            avg_return * 0.7
+            + avg_sharpe * 10
+            - avg_dd * 0.6
+            + profitable_ratio * 0.12
+            + min(avg_trades, 10) * 0.5
+        )
+        trials.append({
+            "decision_config": cfg,
+            "calibration_score": round(score, 2),
+            "avg_return_pct": round(avg_return, 2),
+            "avg_sharpe_ratio": round(avg_sharpe, 2),
+            "avg_drawdown_pct": round(avg_dd, 2),
+            "avg_win_rate_pct": round(avg_win_rate, 1),
+            "avg_trades": round(avg_trades, 1),
+            "profitable_ratio_pct": round(profitable_ratio, 1),
+            "sample_size": len(per_stock),
+            "per_stock": per_stock,
+        })
+
+    if not trials:
+        return {"error": "No valid batch calibration runs completed"}
+
+    trials.sort(
+        key=lambda x: (
+            x["calibration_score"],
+            x["avg_sharpe_ratio"],
+            x["avg_return_pct"],
+            -x["avg_drawdown_pct"],
+            x["profitable_ratio_pct"],
+        ),
+        reverse=True,
+    )
+    return {
+        "best": trials[0],
+        "top_trials": trials[:5],
+        "tested": len(trials),
+        "sample_size": len(datasets),
+    }
+
+
+def format_calibration_result(result: Dict) -> str:
+    """Format decision-engine calibration results."""
+    if "error" in result:
+        return f"ERROR: {result['error']}"
+
+    best = result["best"]
+    lines = [
+        "Decision Engine Calibration",
+        "=" * 55,
+        f"Configurations tested: {result['tested']}",
+        "",
+        "Best Configuration:",
+        f"  Params           : {best['decision_config']}",
+        f"  Calibration Score: {best['calibration_score']:+.2f}",
+        f"  Total Return     : {best['total_return_pct']:+.2f}%",
+        f"  CAGR             : {best['cagr_pct']:+.2f}%",
+        f"  Max Drawdown     : {best['max_drawdown_pct']:.2f}%",
+        f"  Sharpe Ratio     : {best['sharpe_ratio']:.2f}",
+        f"  Win Rate         : {best['win_rate_pct']:.1f}%",
+        f"  Trades           : {best['n_trades']}",
+        "",
+        "Top Candidates:",
+    ]
+
+    for i, trial in enumerate(result["top_trials"], 1):
+        lines.append(
+            f"  {i}. score {trial['calibration_score']:+.2f}  "
+            f"return {trial['total_return_pct']:+.2f}%  "
+            f"DD {trial['max_drawdown_pct']:.2f}%  "
+            f"Sharpe {trial['sharpe_ratio']:.2f}  "
+            f"params {trial['decision_config']}"
+        )
+
+    return "\n".join(lines)
+
+
+def format_batch_calibration_result(result: Dict) -> str:
+    """Format batch calibration results."""
+    if "error" in result:
+        return f"ERROR: {result['error']}"
+
+    best = result["best"]
+    lines = [
+        "Decision Engine Batch Calibration",
+        "=" * 55,
+        f"Configurations tested: {result['tested']}",
+        f"Stock samples       : {result['sample_size']}",
+        "",
+        "Best Configuration:",
+        f"  Params            : {best['decision_config']}",
+        f"  Calibration Score : {best['calibration_score']:+.2f}",
+        f"  Avg Return        : {best['avg_return_pct']:+.2f}%",
+        f"  Avg Drawdown      : {best['avg_drawdown_pct']:.2f}%",
+        f"  Avg Sharpe        : {best['avg_sharpe_ratio']:.2f}",
+        f"  Avg Win Rate      : {best['avg_win_rate_pct']:.1f}%",
+        f"  Avg Trades        : {best['avg_trades']:.1f}",
+        f"  Profitable Ratio  : {best['profitable_ratio_pct']:.1f}%",
+        "",
+        "Top Candidates:",
+    ]
+    for i, trial in enumerate(result["top_trials"], 1):
+        lines.append(
+            f"  {i}. score {trial['calibration_score']:+.2f}  "
+            f"avg_return {trial['avg_return_pct']:+.2f}%  "
+            f"avg_DD {trial['avg_drawdown_pct']:.2f}%  "
+            f"avg_Sharpe {trial['avg_sharpe_ratio']:.2f}  "
+            f"profitable {trial['profitable_ratio_pct']:.1f}%  "
+            f"params {trial['decision_config']}"
+        )
+
+    lines.extend(["", "Per-stock results for best configuration:"])
+    for item in best.get("per_stock", [])[:10]:
+        lines.append(
+            f"  {item['code']}: return {item['total_return_pct']:+.2f}%  "
+            f"DD {item['max_drawdown_pct']:.2f}%  Sharpe {item['sharpe_ratio']:.2f}  "
+            f"trades {item['n_trades']}"
+        )
+    return "\n".join(lines)
+
+
+def decision_engine_signal_diagnostics(
+    df: pd.DataFrame,
+    window: int = 90,
+    decision_config: dict = None,
+) -> Dict:
+    """
+    Diagnose why the decision engine does or does not trigger.
+    """
+    import quant_engine as qe
+    from collections import Counter
+    from slow_fetcher import _build_trade_decision
+
+    decision_config = decision_config or {}
+    use_monte_carlo = decision_config.get("use_monte_carlo", False)
+    neutral_market = {
+        "score": 0.0,
+        "label": "neutral",
+        "action_bias": "neutral",
+        "summary": "Diagnostics mode uses neutral market regime.",
+    }
+    neutral_event = {
+        "available": False,
+        "score": 0.0,
+        "label": "neutral",
+        "summary": "Diagnostics mode ignores event risk.",
+        "recent_earnings": False,
+        "high_uncertainty": False,
+        "positive_flags": [],
+        "negative_flags": [],
+    }
+
+    action_counter = Counter()
+    blocker_counter = Counter()
+    support_counter = Counter()
+    buy_checks = []
+
+    for i in range(window, len(df)):
+        sub = df.iloc[:i + 1].copy()
+        try:
+            diag = qe.comprehensive_diagnosis(sub, run_monte_carlo=use_monte_carlo, mc_days=20)
+            decision = _build_trade_decision(
+                sub,
+                diag,
+                float(sub.iloc[-1]["close"]),
+                neutral_market,
+                neutral_event,
+                config=decision_config,
+            )
+            action_counter[decision["action"]] += 1
+            buy_checks.append(decision.get("buy_checks_passed", 0))
+            for reason in decision.get("reasons_against", []):
+                blocker_counter[reason] += 1
+            for reason in decision.get("reasons_for", []):
+                support_counter[reason] += 1
+        except Exception:
+            continue
+
+    total = sum(action_counter.values())
+    return {
+        "total_windows": total,
+        "action_counts": dict(action_counter),
+        "avg_buy_checks_passed": round(float(np.mean(buy_checks)) if buy_checks else 0.0, 2),
+        "top_blockers": blocker_counter.most_common(8),
+        "top_supports": support_counter.most_common(8),
+        "config": decision_config,
+    }
+
+
+def format_signal_diagnostics(result: Dict) -> str:
+    """Format signal diagnostics for the decision engine."""
+    lines = [
+        "Decision Engine Signal Diagnostics",
+        "=" * 55,
+        f"Windows analyzed      : {result['total_windows']}",
+        f"Action counts         : {result['action_counts']}",
+        f"Avg buy checks passed : {result['avg_buy_checks_passed']}",
+        f"Config                : {result['config']}",
+        "",
+        "Top blockers:",
+    ]
+    for text, count in result.get("top_blockers", []):
+        lines.append(f"  - {count:>3}x  {text}")
+    lines.append("")
+    lines.append("Top supports:")
+    for text, count in result.get("top_supports", []):
+        lines.append(f"  + {count:>3}x  {text}")
+    return "\n".join(lines)
 
 
 # =====================================================
