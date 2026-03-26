@@ -232,7 +232,7 @@ def _safe_float(v):
         return None
 
 
-def _fetch_page(page: int) -> dict:
+def _fetch_page(page: int, page_size: int = None) -> dict:
     """请求东财 clist API 的单页数据。"""
     try:
         from curl_cffi import requests
@@ -243,7 +243,7 @@ def _fetch_page(page: int) -> dict:
 
     params = {
         "pn": page,
-        "pz": PAGE_SIZE,
+        "pz": page_size or PAGE_SIZE,
         "po": 1,
         "np": 1,
         "ut": "bd1d9ddb04089700cf9c27f6f7426281",
@@ -401,7 +401,9 @@ def refresh_fundamentals_snapshot(interval: float = 10.0,
     try:
         target_trade_date = target_trade_date or datetime.now().strftime("%Y-%m-%d")
         rows = conn.execute(
-            "SELECT code, name FROM stocks WHERE suspended = 0 ORDER BY code"
+            "SELECT code, name FROM stocks "
+            "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
+            "ORDER BY code"
         ).fetchall()
         total_expected = len(rows)
         stored_total = 0
@@ -845,21 +847,49 @@ def _parse_tencent_quote_line(line: str) -> dict:
     }
 
 
+_KLINE_MAX_RETRIES = 3
+_KLINE_BACKOFF_BASE = 2.0  # 秒: 2, 4, 8
+
+# 导入全局限流器 — 与 data_fetcher 共享同一个令牌桶，
+# 确保 slow_fetcher 批量拉取和 MCP 实时分析不会同时冲击东财
+try:
+    from _http_utils import eastmoney_throttle as _throttle
+except ImportError:
+    _throttle = None  # 独立运行时没有限流器，靠 interval 参数控制
+
+
+class _KlineEmpty(Exception):
+    """服务端正常返回但 klines 为空 — 真正的无数据（停牌/退市）。"""
+    pass
+
+
+class _KlineNetError(Exception):
+    """网络/连接层失败 — 不能据此判定股票停牌。"""
+    pass
+
+
 def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
     """从东财拉取单只股票的日 K 线，返回原始行列表。
-    beg: 起始日期字符串 YYYYMMDD，优先于 days 参数。"""
+    beg: 起始日期字符串 YYYYMMDD，优先于 days 参数。
+    内置: 全局限流器 + 重试 + 指数退避。
+
+    Raises:
+        _KlineEmpty    — 服务端确认无数据（可安全标记停牌）
+        _KlineNetError — 网络故障（不应标记停牌）
+    """
     try:
-        from curl_cffi import requests
+        from curl_cffi import requests as _requests
         use_cffi = True
     except ImportError:
-        import requests
+        import requests as _requests
         use_cffi = False
 
-    secid = _get_secid(code)
     if beg is None:
         beg = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
     end = datetime.today().strftime("%Y%m%d")
+    NO_PROXY = {"http": None, "https": None}
 
+    secid = _get_secid(code)
     params = {
         "fields1": "f1,f2,f3,f4,f5,f6",
         "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
@@ -873,23 +903,49 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
         "Accept": "application/json, text/plain, */*",
     }
 
-    NO_PROXY = {"http": None, "https": None}
+    last_err = None
+    got_empty_response = False   # 服务端返回了 JSON 但 klines 为空
 
-    if use_cffi:
-        resp = requests.get(
-            KLINE_URL, params=params, headers=headers,
-            timeout=20, impersonate="chrome",
-        )
-    else:
-        resp = requests.get(
-            KLINE_URL, params=params, headers=headers,
-            timeout=20, proxies=NO_PROXY,
-        )
+    for attempt in range(_KLINE_MAX_RETRIES):
+        try:
+            # 全局限流: 排队拿令牌再发请求
+            if _throttle is not None:
+                _throttle.acquire()
 
-    resp.raise_for_status()
-    data = resp.json()
-    klines_data = data.get("data") or {}
-    return klines_data.get("klines") or []
+            if use_cffi:
+                resp = _requests.get(KLINE_URL, params=params, headers=headers,
+                                      timeout=20, impersonate="chrome")
+            else:
+                resp = _requests.get(KLINE_URL, params=params, headers=headers,
+                                      timeout=20, proxies=NO_PROXY)
+            resp.raise_for_status()
+            data = resp.json()
+            klines_data = data.get("data") or {}
+            raw = klines_data.get("klines") or []
+            if raw:
+                return raw
+            # 服务端正常响应但没有 klines → 真正的空数据
+            got_empty_response = True
+            raise ValueError(f"Empty kline response for {code}")
+        except (ValueError,) as e:
+            # ValueError 是我们自己抛的"空数据"，不需要重试
+            if got_empty_response:
+                raise _KlineEmpty(str(e))
+            last_err = e
+        except Exception as e:
+            last_err = e
+            if attempt < _KLINE_MAX_RETRIES - 1:
+                wait = _KLINE_BACKOFF_BASE * (2 ** attempt)
+                log.debug("Kline retry %d/%d for %s after %.1fs: %s",
+                          attempt + 1, _KLINE_MAX_RETRIES, code, wait, e)
+                time.sleep(wait)
+                # 刷新时间戳避免缓存
+                params["_"] = int(time.time() * 1000)
+                headers["User-Agent"] = random.choice(USER_AGENTS)
+
+    log.warning("Kline failed for %s after %d retries: %s",
+                code, _KLINE_MAX_RETRIES, last_err)
+    raise _KlineNetError(f"{code}: {last_err}")
 
 
 def _store_kline(conn: sqlite3.Connection, code: str, raw_lines: list) -> int:
@@ -926,6 +982,195 @@ def _store_kline(conn: sqlite3.Connection, code: str, raw_lines: list) -> int:
     return count
 
 
+# ── 批量当日 K 线（基于 clist API）──────────────────────────────
+#
+# 核心思想：clist 接口一次 100 只，30+ 次请求拉完全市场 3000+ 只。
+# 每只股票的当日 OHLCV + 涨跌幅 + 换手率全在同一条 JSON 里，
+# 不需要逐只调 kline API，彻底避免限流问题。
+#
+# clist 字段 → stock_history 映射：
+#   f17=open, f2=close, f15=high, f16=low,
+#   f5=volume, f6=amount, f7=amplitude,
+#   f3=pct_chg, f4=change, f8=turnover
+#
+# f2 == "-" 的股票 → 当日停牌，精确标记 suspended=1
+
+def bulk_daily_kline_from_clist(
+    target_trade_date: str = None,
+    interval: float = 3.0,
+    page_size: int = 100,
+    conn: sqlite3.Connection = None,
+) -> dict:
+    """用 clist 批量接口一次性拉全市场当日 K 线，写入 stock_history。
+
+    优势：
+      - 30~35 次分页请求拉完 3000+ 只，vs 之前逐只调 kline API 3000+ 次
+      - 不触发 kline API 限流
+      - f2=="-" 精确标记停牌，不会因网络错误误判
+
+    Args:
+        interval: 每页之间的间隔秒数（默认 3 秒，~35页 ≈ 2分钟完成）
+        page_size: 每页股票数（默认 100，可调大到 500 减少页数）
+
+    Returns:
+        {"stored": int, "suspended_marked": int, "pages": int, "errors": list}
+    """
+    target_trade_date = target_trade_date or datetime.now().strftime("%Y-%m-%d")
+    own_conn = conn is None
+    if own_conn:
+        conn = _get_db()
+
+    # ── 断点续传：记录 (日期, 已完成页数) ──
+    done_key = "clist_kline_done"       # 完成标记
+    date_key = "clist_kline_date"       # 正在拉的日期
+    page_key = "clist_kline_next_page"  # 下一页页码
+
+    done_date = _meta_get(conn, done_key, "")
+    if done_date == target_trade_date:
+        existing = conn.execute(
+            "SELECT COUNT(*) FROM stock_history WHERE date = ?",
+            (target_trade_date,),
+        ).fetchone()[0]
+        log.info("clist 当日K线: %s 已完成 (%d 条), 跳过", target_trade_date, existing)
+        if own_conn:
+            conn.close()
+        return {
+            "stored": 0,
+            "suspended_marked": 0,
+            "pages": 0,
+            "errors": [],
+            "skipped": True,
+            "existing": existing,
+        }
+
+    # 判断是否断点续传
+    progress_date = _meta_get(conn, date_key, "")
+    if progress_date == target_trade_date:
+        start_page = int(_meta_get(conn, page_key, "1") or "1")
+        log.info("clist 当日K线: 从第 %d 页断点续传", start_page)
+    else:
+        start_page = 1
+        _meta_set(conn, date_key, target_trade_date)
+        _meta_set(conn, page_key, "1")
+
+    stored = 0
+    suspended_marked = 0
+    pages = 0
+    errors = []
+
+    # 先读取所有活跃股票代码集合（用于判断哪些是主板A股）
+    active_codes = set(r[0] for r in conn.execute(
+        "SELECT code FROM stocks WHERE suspended = 0"
+    ).fetchall())
+
+    page = start_page
+    all_done = False
+    while True:
+        try:
+            data = _fetch_page(page, page_size=page_size)
+            diff = data.get("data", {}) or {}
+            records = diff.get("diff") or []
+            if not records:
+                all_done = True
+                break
+            total_count = diff.get("total", 0)
+
+            for r in records:
+                code = str(r.get("f12", ""))
+                name = str(r.get("f14", ""))
+
+                # 只处理主板A股
+                if code[:3] not in SH_MAIN and code[:3] not in SZ_MAIN:
+                    continue
+
+                # f2 == "-" → 停牌/退市
+                if r.get("f2") is None or r.get("f2") == "-":
+                    if code in active_codes:
+                        conn.execute(
+                            "UPDATE stocks SET suspended = 1 WHERE code = ?",
+                            (code,),
+                        )
+                        suspended_marked += 1
+                    continue
+
+                # 跳过 ST
+                if "ST" in name.upper():
+                    continue
+
+                close = _safe_float(r.get("f2"))
+                open_ = _safe_float(r.get("f17"))
+                high = _safe_float(r.get("f15"))
+                low = _safe_float(r.get("f16"))
+                volume = _safe_float(r.get("f5"))
+                amount = _safe_float(r.get("f6"))
+                amplitude = _safe_float(r.get("f7"))
+                pct_chg = _safe_float(r.get("f3"))
+                change = _safe_float(r.get("f4"))
+                turnover = _safe_float(r.get("f8"))
+
+                # 基本校验：收盘价必须有效
+                if not close or close <= 0:
+                    continue
+
+                try:
+                    conn.execute("""
+                        INSERT OR REPLACE INTO stock_history
+                        (code, date, open, close, high, low, volume, amount,
+                         amplitude, pct_chg, change, turnover)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        code, target_trade_date,
+                        open_, close, high, low,
+                        volume, amount, amplitude,
+                        pct_chg, change, turnover,
+                    ))
+                    stored += 1
+                except Exception as e:
+                    errors.append(f"{code}: {e}")
+
+                # 同步更新 stocks 元信息
+                _upsert_stock_meta(conn, code=code, name=name, suspended=0)
+
+            conn.commit()
+            pages += 1
+
+            # 每页成功后立即记录进度，断了也不丢
+            _meta_set(conn, page_key, str(page + 1))
+            log.info("clist 当日K线: 第 %d 页完成, 累计写入 %d 条, 标记停牌 %d 只",
+                     page, stored, suspended_marked)
+
+            # 判断是否还有下一页
+            if page * page_size >= total_count:
+                all_done = True
+                break
+            page += 1
+
+            if interval > 0:
+                time.sleep(interval)
+
+        except Exception as e:
+            errors.append(f"page {page}: {e}")
+            log.error("clist 第 %d 页失败: %s  (下次从此页继续)", page, e)
+            break
+
+    # 全部拉完才标记 done，否则保留页码进度供下次续传
+    if all_done:
+        _meta_set(conn, done_key, target_trade_date)
+
+    if own_conn:
+        conn.close()
+
+    log.info("clist 当日K线完成: %d 页, 写入 %d 条, 停牌 %d 只, 错误 %d",
+             pages, stored, suspended_marked, len(errors))
+    return {
+        "stored": stored,
+        "suspended_marked": suspended_marked,
+        "pages": pages,
+        "errors": errors,
+        "skipped": False,
+    }
+
+
 def fetch_history_batch(
     batch_size: int = 5,
     days: int = 365,
@@ -944,9 +1189,11 @@ def fetch_history_batch(
         conn = _get_db()
 
     try:
-        # 所有已入库且未标记停牌的股票代码
+        # 所有已入库、未停牌、非ST的股票代码
         all_codes = [r[0] for r in conn.execute(
-            "SELECT code FROM stocks WHERE suspended = 0 ORDER BY code"
+            "SELECT code FROM stocks "
+            "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
+            "ORDER BY code"
         ).fetchall()]
 
         if not all_codes:
@@ -1016,24 +1263,29 @@ def fetch_history_batch(
 
             try:
                 raw = _fetch_kline_raw(code, days=days, beg=beg)
-                if raw:
-                    stored = _store_kline(conn, code, raw)
-                    fetched += 1
-                    log.info(
-                        "  [%d/%d] %s %s  +%d 条日K  %s  (剩余 %d 只)",
-                        i + 1, len(batch), code, name,
-                        stored, mode_str, len(remaining) - i - 1,
-                    )
-                else:
-                    log.warning("  [%d/%d] %s %s  无数据，标记为停牌",
-                               i + 1, len(batch), code, name)
-                    conn.execute(
-                        "UPDATE stocks SET suspended = 1 WHERE code = ?",
-                        (code,),
-                    )
-                    conn.commit()
+                stored = _store_kline(conn, code, raw)
+                fetched += 1
+                log.info(
+                    "  [%d/%d] %s %s  +%d 条日K  %s (剩余 %d 只)",
+                    i + 1, len(batch), code, name,
+                    stored, mode_str, len(remaining) - i - 1,
+                )
+            except _KlineEmpty:
+                # 服务端确认无数据 → 真正停牌/退市，标记
+                log.warning("  [%d/%d] %s %s  服务端确认无数据，标记为停牌",
+                           i + 1, len(batch), code, name)
+                conn.execute(
+                    "UPDATE stocks SET suspended = 1 WHERE code = ?",
+                    (code,),
+                )
+                conn.commit()
+            except _KlineNetError as e:
+                # 网络故障 → 不标记停牌，下次重试
+                log.warning("  [%d/%d] %s %s  网络失败，跳过（不标记停牌）: %s",
+                           i + 1, len(batch), code, name, e)
+                errors.append(f"{code}: 网络失败 {e}")
             except Exception as e:
-                log.error("  [%d/%d] %s %s  失败: %s",
+                log.error("  [%d/%d] %s %s  未知错误: %s",
                          i + 1, len(batch), code, name, e)
                 errors.append(f"{code}: {e}")
 
@@ -1076,14 +1328,26 @@ def reset_history_progress():
 
 def daily_close_update(batch_size: int = 50,
                        days: int = 365,
-                       interval: float = 1.0,
+                       interval: float = 2.0,
                        snapshot_interval: float = 10.0,
                        target_trade_date: str = None,
                        max_rounds: int = 500) -> dict:
     """
-    收盘后统一更新入口:
-      1) 刷新股票宇宙和当日 stock_fundamentals 快照
-      2) 增量追平 stock_history 到目标交易日
+    收盘后统一更新入口（逐只 kline API 模式）:
+
+      1) 刷新股票宇宙和当日 stock_fundamentals 快照（腾讯批量接口）
+      2) 逐只拉取 K 线增量数据写入 stock_history（东方财富 kline API）
+         — 自动跳过已有当日数据的股票
+         — 支持断点续传（中断后再跑会从上次停的地方继续）
+         — 适合晚上用计划任务慢慢跑完 3000+ 只
+
+    Args:
+        batch_size: 每轮拉多少只（默认 50）
+        days: 全量拉取时的天数（默认 365）
+        interval: 每只股票之间的间隔秒数（默认 2 秒）
+        snapshot_interval: fundamentals 批次间隔秒数
+        target_trade_date: 目标交易日，默认今天
+        max_rounds: 最大循环轮数（防止死循环，默认 500）
 
     target_trade_date:
       - 默认使用今天日期
@@ -1092,6 +1356,7 @@ def daily_close_update(batch_size: int = 50,
     target_trade_date = target_trade_date or datetime.now().strftime("%Y-%m-%d")
     conn = _get_db()
     try:
+        # ── Step 1: Fundamentals 快照（腾讯批量）──
         snapshot_result = refresh_fundamentals_snapshot(
             interval=snapshot_interval,
             batch_size=batch_size,
@@ -1099,11 +1364,14 @@ def daily_close_update(batch_size: int = 50,
             conn=conn,
         )
 
-        history_rounds = 0
-        history_fetched = 0
-        history_errors = []
-        no_progress_rounds = 0
-        while True:
+        # ── Step 2: 逐只拉 K 线增量（kline API，自动跳过已有数据）──
+        total_fetched = 0
+        total_errors = []
+        rounds = 0
+        history_done = False
+
+        while rounds < max_rounds:
+            rounds += 1
             result = fetch_history_batch(
                 batch_size=batch_size,
                 days=days,
@@ -1111,48 +1379,38 @@ def daily_close_update(batch_size: int = 50,
                 target_trade_date=target_trade_date,
                 conn=conn,
             )
-            history_rounds += 1
-            fetched_now = result.get("fetched", 0)
-            history_fetched += fetched_now
-            history_errors.extend(result.get("errors", []))
-            if fetched_now <= 0:
-                no_progress_rounds += 1
-            else:
-                no_progress_rounds = 0
+            total_fetched += result.get("fetched", 0)
+            total_errors.extend(result.get("errors", []))
+            remaining = result.get("remaining", 0)
+
+            log.info("第 %d 轮: 本轮 %d 只, 累计 %d 只, 剩余 %d 只, 错误 %d",
+                     rounds, result.get("fetched", 0), total_fetched,
+                     remaining, len(total_errors))
+
             if result.get("done"):
-                history_remaining = 0
+                history_done = True
                 break
-            history_remaining = result.get("remaining", 0)
-            if history_remaining <= 0:
+
+            # 如果本轮一只都没拉到（全部跳过或出错），也结束
+            if result.get("fetched", 0) == 0 and remaining == 0:
+                history_done = True
                 break
-            if no_progress_rounds >= 3:
-                history_errors.append(
-                    "连续 3 轮未取得任何增量进展，已提前停止，避免死循环。"
-                )
-                break
-            if history_rounds >= max_rounds:
-                history_errors.append(
-                    f"达到最大轮次 {max_rounds}，已提前停止。"
-                )
-                break
-            log.info("收盘更新继续: 剩余 %d 只，等待 %.1fs", history_remaining, interval)
-            if interval > 0:
-                time.sleep(interval)
 
         _meta_set(conn, "daily_close_last_run", datetime.now().isoformat())
         _meta_set(conn, "daily_close_target_date", target_trade_date)
+        _meta_set(conn, "history_last_fetch", datetime.now().isoformat())
 
         return {
             "target_trade_date": target_trade_date,
             "snapshot": snapshot_result,
             "history": {
-                "rounds": history_rounds,
-                "fetched": history_fetched,
-                "remaining": history_remaining,
-                "errors": history_errors,
-                "done": history_remaining == 0 and not history_errors,
+                "method": "kline_per_stock",
+                "fetched": total_fetched,
+                "rounds": rounds,
+                "errors": total_errors,
+                "done": history_done,
             },
-            "done": snapshot_result.get("done", False) and history_remaining == 0 and not history_errors,
+            "done": snapshot_result.get("done", False) and history_done,
         }
     finally:
         conn.close()
@@ -1380,7 +1638,8 @@ def assess_event_risk(code: str) -> dict:
     }
 
     try:
-        from stock_tool import get_announcements, get_financial_history
+        from announcements import get_announcements
+        from financial import get_financial_history
     except Exception:
         return result
 
@@ -1524,9 +1783,9 @@ def _build_trade_decision(
         "positive_flags": [],
         "negative_flags": [],
     }
-    regime_score = market_regime.get("score", 0.0)
-    regime_bias = market_regime.get("action_bias", "neutral")
-    event_score = event_risk.get("score", 0.0)
+    regime_score = market_regime.get("score") or 0.0
+    regime_bias = market_regime.get("action_bias") or "neutral"
+    event_score = event_risk.get("score") or 0.0
     config = config or {}
     buy_score_min = config.get("buy_score_min", 18)
     sell_score_max = config.get("sell_score_max", -18)
@@ -1548,10 +1807,10 @@ def _build_trade_decision(
     min_sell_checks = config.get("min_sell_checks", 4)
     require_probabilistic_edge = config.get("require_probabilistic_edge", True)
 
-    trend_score = trend.get("score", 0.0)
-    momentum_score = momentum.get("score", 0.0)
-    volume_score = volume.get("score", 0.0)
-    total_score = diag.get("total_score", 0.0)
+    trend_score = trend.get("score") or 0.0
+    momentum_score = momentum.get("score") or 0.0
+    volume_score = volume.get("score") or 0.0
+    total_score = diag.get("total_score") or 0.0
     prob_up = mc.get("prob_up")
     prob_down = mc.get("prob_down")
     expected_return = mc.get("expected_return")
@@ -1872,7 +2131,7 @@ def analyze_stock(code: str, days: int = 120) -> dict:
     kline_source = "local_only"
     realtime_info = {}
     try:
-        from stock_tool import get_realtime
+        from data_fetcher import get_realtime
         rt = get_realtime(code)
         if not rt.empty:
             r = rt.iloc[0]
@@ -2268,12 +2527,20 @@ def main():
                 f"  Fundamentals: {snap['stored']} 条 / {snap['batches']} 批"
                 f"{' (有错误)' if snap.get('errors') else ''}"
             )
+        hist_fetched = hist.get("fetched", 0)
+        hist_rounds = hist.get("rounds", 0)
+        hist_done = hist.get("done", False)
+        hist_line = (
+            f"  History(逐只kline): {hist_fetched} 只完成, "
+            f"{hist_rounds} 轮"
+            f"{' ✓ 全部完成' if hist_done else ' (未全部完成，下次继续)'}"
+            f"{' (有错误)' if hist.get('errors') else ''}"
+        )
         print(
             "\n收盘更新完成\n"
             f"  目标交易日: {result['target_trade_date']}\n"
             f"{fund_line}\n"
-            f"  History: {hist['fetched']} 只，轮次 {hist['rounds']}，剩余 {hist['remaining']}"
-            f"{' (有错误)' if hist.get('errors') else ''}\n"
+            f"{hist_line}\n"
         )
         if snap.get("errors"):
             print(f"  Fundamentals errors: {snap['errors'][:3]}")

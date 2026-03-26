@@ -27,7 +27,7 @@ import pandas as pd
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
-from stock_tool import get_kline
+from data_fetcher import get_kline
 import quant_engine as qe
 
 logger = logging.getLogger(__name__)
@@ -45,18 +45,18 @@ def _decision_rank(result: Dict) -> tuple:
     return (
         action_order.get(action, 0),
         strength_order.get(strength, 0),
-        result.get("entry_quality_score", -999),
-        result.get("total_score", -999),
-        result.get("prob_up", -999) or -999,
+        result.get("entry_quality_score") if result.get("entry_quality_score") is not None else -999,
+        result.get("total_score") if result.get("total_score") is not None else -999,
+        result.get("prob_up") if result.get("prob_up") is not None else -999,
     )
 
 
 def _historical_rank(result: Dict) -> tuple:
     """Sort Stage 1 candidates by historical composite first, then strategy fit."""
     return (
-        result.get("stage1_score", -999),
-        result.get("history_score", -999),
-        result.get("fast_score", -999),
+        result.get("stage1_score") if result.get("stage1_score") is not None else -999,
+        result.get("history_score") if result.get("history_score") is not None else -999,
+        result.get("fast_score") if result.get("fast_score") is not None else -999,
     )
 
 
@@ -246,6 +246,15 @@ def fetch_all_stocks(market: str = "all",
         if df.empty:
             logger.warning("Local DB snapshot is empty; please import stocks first.")
             return df
+        # 确保数值列为 float，避免 SQLite NULL 导致 object dtype
+        _NUMERIC_COLS = [
+            "current", "pct_chg", "open", "high", "low", "volume",
+            "amount", "pe_ttm", "pb", "total_mv", "turnover_rate",
+            "volume_ratio", "chg_60d",
+        ]
+        for col in _NUMERIC_COLS:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
         logger.info("Loaded %d stocks from local DB", len(df))
         return df
     except (ImportError, FileNotFoundError) as e:
@@ -277,8 +286,8 @@ def _base_filter(df: pd.DataFrame, exclude_st: bool = True) -> pd.Series:
     # Exclude stocks at or near daily limit up/down
     # Main board limit: +/-10%, using 9.5% threshold to catch near-limit stocks
     mask &= df["pct_chg"].notna()
-    mask &= df["pct_chg"] < 9.5     # Not at or near limit up (avoid chasing)
-    mask &= df["pct_chg"] > -9.5    # Not at or near limit down (untradeable)
+    mask &= df["pct_chg"].notna() & (df["pct_chg"] < 9.5)     # Not at or near limit up (avoid chasing)
+    mask &= df["pct_chg"].notna() & (df["pct_chg"] > -9.5)    # Not at or near limit down (untradeable)
 
     # Exclude suspended / zero-volume stocks
     mask &= df["volume"].notna() & (df["volume"] > 0)
@@ -331,8 +340,8 @@ def filter_momentum(df: pd.DataFrame,
     pct_chg_max defaults to 7% to avoid stocks that are already near limit up.
     """
     mask = _base_filter(df, exclude_st=exclude_st)
-    mask &= df["pct_chg"] >= pct_chg_min
-    mask &= df["pct_chg"] <= pct_chg_max   # Cap: avoid chasing limit-up stocks
+    mask &= df["pct_chg"].notna() & (df["pct_chg"] >= pct_chg_min)
+    mask &= df["pct_chg"].notna() & (df["pct_chg"] <= pct_chg_max)   # Cap: avoid chasing limit-up stocks
     mask &= df["volume_ratio"].notna() & (df["volume_ratio"] >= volume_ratio_min)
     mask &= df["total_mv"].notna() & (df["total_mv"] >= mv_min)
     mask &= df["turnover_rate"].notna() & (df["turnover_rate"] >= turnover_min)
@@ -360,11 +369,11 @@ def filter_oversold(df: pd.DataFrame,
     Not at limit down (untradeable).
     """
     mask = _base_filter(df, exclude_st=exclude_st)
-    mask &= df["pct_chg"] <= pct_chg_max
+    mask &= df["pct_chg"].notna() & (df["pct_chg"] <= pct_chg_max)
     mask &= df["total_mv"].notna() & (df["total_mv"] >= mv_min)
     mask &= df["turnover_rate"].notna() & (df["turnover_rate"] >= turnover_min)
     # Prefer stocks that are not penny stocks
-    mask &= df["current"] >= 3.0
+    mask &= df["current"].notna() & (df["current"] >= 3.0)
 
     result = df[mask].copy()
 
@@ -422,8 +431,8 @@ def filter_potential(df: pd.DataFrame,
 
     # Core: stock must have fallen significantly over past 60 days
     mask &= df["chg_60d"].notna()
-    mask &= df["chg_60d"] <= chg_60d_max   # e.g., <= -10%
-    mask &= df["chg_60d"] >= chg_60d_min   # e.g., >= -50% (not total collapse)
+    mask &= df["chg_60d"].notna() & (df["chg_60d"] <= chg_60d_max)   # e.g., <= -10%
+    mask &= df["chg_60d"].notna() & (df["chg_60d"] >= chg_60d_min)   # e.g., >= -50% (not total collapse)
 
     # Fundamentals still solid: profitable company with reasonable valuation
     mask &= df["pe_ttm"].notna() & (df["pe_ttm"] > pe_min) & (df["pe_ttm"] <= pe_max)
@@ -431,7 +440,7 @@ def filter_potential(df: pd.DataFrame,
     mask &= df["total_mv"].notna() & (df["total_mv"] >= mv_min)
 
     # Today: NOT crashing further (stabilization signal)
-    mask &= df["pct_chg"] >= today_chg_min
+    mask &= df["pct_chg"].notna() & (df["pct_chg"] >= today_chg_min)
 
     # Still actively traded
     mask &= df["turnover_rate"].notna() & (df["turnover_rate"] >= turnover_min)
@@ -515,14 +524,22 @@ def filter_custom(df: pd.DataFrame,
 # 3. Stage 2: Deep Quantitative Scan
 # =====================================================
 
-def _load_kline(code: str, analysis_days: int = 120) -> Optional[pd.DataFrame]:
+def _load_kline(code: str, analysis_days: int = 120,
+                local_only: bool = False) -> Optional[pd.DataFrame]:
     """
     Load K-line data for a single stock.
-    Priority: local DB (instant) → online API (fallback).
+
+    local_only=True  →  仅读本地 SQLite，不触发任何网络请求（批量筛选默认模式）
+    local_only=False →  本地读取失败时回退到在线 API（单股分析模式）
+
+    说明:
+      批量筛选（deep_scan）必须 local_only=True，否则对 50-80 只候选股各发一次
+      网络请求会导致触发 API 限速，筛选耗时剧增。
+      本地 DB 数据由 slow_fetcher 定期同步写入，筛选前应确保 DB 已有数据。
     """
     start = (datetime.today() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
-    # Try local database first
+    # ── 优先读本地 DB ──
     try:
         from slow_fetcher import load_stock_history
         df = load_stock_history(code)
@@ -535,7 +552,12 @@ def _load_kline(code: str, analysis_days: int = 120) -> Optional[pd.DataFrame]:
     except (ImportError, FileNotFoundError):
         pass
 
-    # Fallback to online API
+    # ── 本地数据不足 ──
+    if local_only:
+        # 批量模式: 跳过，不发网络请求
+        return None
+
+    # 单股模式: 回退在线 API
     try:
         return get_kline(code, period="daily", start=start, adjust="qfq")
     except Exception:
@@ -544,35 +566,35 @@ def _load_kline(code: str, analysis_days: int = 120) -> Optional[pd.DataFrame]:
 
 def deep_scan(candidates: pd.DataFrame,
               top_n: int = 20,
-              analysis_days: int = 120) -> List[Dict]:
+              analysis_days: int = 120,
+              local_only: bool = True) -> List[Dict]:
     """
-    Run full quant_engine comprehensive_diagnosis on each candidate.
+    对候选股批量运行 7 维量化诊断（quant_engine.comprehensive_diagnosis）。
 
-    Data source priority:
-      1) Local SQLite stock_history (from slow_fetcher, zero network)
-      2) Online Eastmoney kline API (fallback)
+    local_only=True（默认，预筛阶段）:
+      只读本地 SQLite stock_history，0 次网络请求。
+      没有本地 kline 的股票自动跳过。
+      适合对 50~80 只候选股做快速全量打分，选出质量最高的一批进入实时深度分析。
 
-    Parameters:
-        candidates     DataFrame from Stage 1 (must have 'code' column)
-        top_n          Max number of stocks to scan (to limit time)
-        analysis_days  Days of history to analyze per stock
-
-    Returns:
-        List of dicts sorted by total_score descending, each containing:
-        code, name, current, pct_chg, total_score, signal, confidence,
-        trend, momentum, risk_level, prob_up, fast_score, and key metrics.
+    local_only=False（实时分析阶段）:
+      本地 kline 不足时，回退在线 API 拉取最新数据。
+      适合对最终候选股（通常 ≤20 只）做高质量重算。
     """
     from slow_fetcher import assess_market_regime, assess_event_risk, _build_trade_decision
 
     results = []
     scan_list = candidates
     market_regime = assess_market_regime()
+    skipped_no_data = 0
 
     for i, (_, row) in enumerate(scan_list.iterrows()):
         code = row["code"]
         try:
-            df = _load_kline(code, analysis_days)
+            # local_only=True: 批量扫描绝不触发网络请求
+            # 无本地历史数据的股票直接跳过（不是筛选质量问题，是数据完整性问题）
+            df = _load_kline(code, analysis_days, local_only=local_only)
             if df is None or len(df) < 30:
+                skipped_no_data += 1
                 continue
 
             diag = qe.comprehensive_diagnosis(
@@ -590,14 +612,22 @@ def deep_scan(candidates: pd.DataFrame,
                 float(df.iloc[-1]["close"]),
                 market_regime,
             )
+            _s1 = row.get("stage1_score") if pd.notna(row.get("stage1_score")) else (
+                row.get("fast_score") if pd.notna(row.get("fast_score")) else 0
+            )
+            _hist = row.get("history_score") if pd.notna(row.get("history_score")) else 0
+            _prob_up = mc.get("prob_up") if mc.get("prob_up") is not None else 50
+            _exp_ret = mc.get("expected_return") or 0
+            _rr = decision.get("risk_reward") or 0
+            _regime = decision.get("market_regime_score") or 0
             entry_quality_score = (
-                diag["total_score"] * 0.35
-                + row.get("stage1_score", row.get("fast_score", 0)) * 0.18
-                + row.get("history_score", 0) * 0.12
-                + (mc.get("prob_up", 0) - 50) * 0.6
-                + (mc.get("expected_return", 0) or 0) * 1.8
-                + (decision.get("risk_reward", 0) or 0) * 8
-                + (decision.get("market_regime_score", 0) or 0) * 0.15
+                (diag.get("total_score") or 0) * 0.35
+                + _s1 * 0.18
+                + _hist * 0.12
+                + (_prob_up - 50) * 0.6
+                + _exp_ret * 1.8
+                + _rr * 8
+                + _regime * 0.15
             )
             if decision.get("action") == "buy":
                 entry_quality_score += 12
@@ -644,40 +674,49 @@ def deep_scan(candidates: pd.DataFrame,
 
     results.sort(key=_decision_rank, reverse=True)
 
-    # Event-risk recheck only for top candidates to keep screener responsive.
-    review_limit = min(max(top_n * 2, 6), len(results), 12)
-    for item in results[:review_limit]:
-        try:
-            event_risk = assess_event_risk(item["code"])
-            decision = _build_trade_decision(
-                item["_df"],
-                item["_diag"],
-                item["current"],
-                market_regime,
-                event_risk,
-            )
-            item["event_risk"] = event_risk
-            item["decision"] = decision
-            item["decision_action"] = decision.get("action")
-            item["decision_text"] = decision.get("conclusion")
-            item["entry_low"] = decision.get("entry_low")
-            item["entry_high"] = decision.get("entry_high")
-            item["stop_loss"] = decision.get("stop_loss")
-            item["take_profit"] = decision.get("take_profit")
-            item["risk_reward"] = decision.get("risk_reward")
-            item["event_score"] = decision.get("event_score")
-            item["entry_quality_score"] = round(
-                item.get("entry_quality_score", 0) + (decision.get("event_score", 0) or 0) * 0.6,
-                1,
-            )
-        except Exception:
-            continue
+    # ── Stage 2.5: Event-risk recheck（仅非 local_only 模式，或 local_only 且限 top_n 只）──
+    # local_only=True 时：完全不调用公告 API，事件风险由 Stage-3（单股深度复核）完成
+    # local_only=False 时：对最多 min(top_n, 8) 只候选股补充事件风险（单股场景）
+    if not local_only:
+        review_limit = min(top_n, 8, len(results))
+        for item in results[:review_limit]:
+            try:
+                event_risk = assess_event_risk(item["code"])
+                decision = _build_trade_decision(
+                    item["_df"],
+                    item["_diag"],
+                    item["current"],
+                    market_regime,
+                    event_risk,
+                )
+                item["event_risk"] = event_risk
+                item["decision"] = decision
+                item["decision_action"] = decision.get("action")
+                item["decision_text"] = decision.get("conclusion")
+                item["entry_low"] = decision.get("entry_low")
+                item["entry_high"] = decision.get("entry_high")
+                item["stop_loss"] = decision.get("stop_loss")
+                item["take_profit"] = decision.get("take_profit")
+                item["risk_reward"] = decision.get("risk_reward")
+                item["event_score"] = decision.get("event_score")
+                item["entry_quality_score"] = round(
+                    item.get("entry_quality_score", 0) + (decision.get("event_score", 0) or 0) * 0.6,
+                    1,
+                )
+            except Exception:
+                continue
 
     for item in results:
         item.pop("_diag", None)
         item.pop("_df", None)
 
     results.sort(key=_decision_rank, reverse=True)
+
+    # 记录跳过数量供调用方参考
+    logger.info(
+        "deep_scan: scanned=%d  skipped_no_local_data=%d  results=%d  local_only=%s",
+        len(candidates), skipped_no_data, len(results[:top_n]), local_only,
+    )
     return results[:top_n]
 
 
@@ -698,49 +737,82 @@ def screen_stocks(
     strategy: str = "value",
     top_n: int = 20,
     deep_scan_enabled: bool = True,
-    stage1_limit: int = 80,
+    stage1_limit: int = 60,
+    quality_threshold: float = 5.0,
+    max_candidates: int = 25,
     analysis_days: int = 120,
     history_lookback_days: int = 240,
     history_min_days: int = 90,
     **filter_kwargs,
 ) -> Dict:
     """
-    Main entry point for stock screening.
+    A股预筛选主入口（纯本地 DB，0次网络请求）。
 
-    Parameters:
-        strategy          "value" / "momentum" / "oversold" / "custom"
-        top_n             Number of top results to return
-        deep_scan_enabled Whether to run Stage 2 deep analysis
-        stage1_limit      Max candidates to pass from Stage 1 to Stage 2
-        analysis_days     Days of history for deep scan
-        history_lookback_days Days of history used for Stage 0 profile
-        history_min_days  Minimum history days to treat profile as reliable
-        **filter_kwargs   Additional parameters passed to the filter function
+    数据流:
+      全量 ~5000 只股票
+        ↓ [基础过滤] PE/PB/市值/换手/价格（stocks + fundamentals 快照）
+        ↓ [历史趋势评分] stock_history 计算近期收益率/MA位置/量能趋势
+        ↓ [量化深度扫描] 对 stage1_limit 只候选股跑 7 维技术分析（本地kline）
+        ↓ [质量阈值过滤] entry_quality_score >= quality_threshold
+        ↓ 输出最多 max_candidates 只，按 entry_quality_score 排序
+      结果
+        → 调用方对每只结果股票做全面实时分析（新闻/公告/主力资金/实时K线/风险）
 
-    Returns:
+    参数说明:
+        strategy         筛选策略: value / momentum / oversold / potential / custom
+        top_n            deep_scan 内部返回数（供质量阈值过滤前使用）
+        deep_scan_enabled 是否运行量化深度扫描（建议始终 True）
+        stage1_limit     基础过滤后最多送入深度扫描的数量（默认60，上限80）
+        quality_threshold 深度扫描后的质量门槛（entry_quality_score，默认5.0）
+                          • 含义: 综合技术+历史+蒙特卡洛风险收益的综合得分
+                          • 经验参考: 牛市可调高到10~15; 熊市/震荡市调低到0~3
+                          • 若返回结果为0，可降低此值; 若返回过多，可提高此值
+        max_candidates   最终输出上限（默认25，保证调用方实时分析的可控性）
+        analysis_days    深度扫描使用的历史天数
+        history_lookback_days 历史横截面评分回溯天数
+        history_min_days 历史数据最少天数要求
+        **filter_kwargs  传给策略过滤函数的额外参数
+
+    返回:
         {
             "strategy": str,
-            "total_market": int,
-            "stage1_count": int,
-            "stage2_count": int,
-            "results": [ list of scored stock dicts ],
-            "summary": str
+            "total_market": int,        # 全市场股票数
+            "stage1_count": int,        # 基础过滤通过数
+            "stage2_count": int,        # 深度扫描完成数
+            "qualified_count": int,     # 通过质量阈值的数量
+            "quality_threshold": float, # 使用的质量阈值
+            "results": [                # 最终候选股列表（含预评分）
+                {
+                    "code", "name", "current", "pct_chg",
+                    "pe_ttm", "pb", "total_mv",
+                    "total_score",          # 7维量化得分 -100~+100
+                    "entry_quality_score",  # 综合质量分（排序主键）
+                    "history_score",        # 历史横截面得分
+                    "signal",               # buy/hold/sell
+                    "prob_up",              # 蒙特卡洛上涨概率
+                    "trend_dir",
+                    ...
+                }
+            ],
+            "summary": str              # 文字摘要
         }
     """
+    stage1_limit = min(int(stage1_limit), 80)
+
     try:
         from slow_fetcher import assess_market_regime
         market_regime = assess_market_regime()
     except Exception:
         market_regime = None
 
-    # -- Fetch full market --
+    # ── 从本地 DB 读取全量快照 ──
     all_stocks = fetch_all_stocks()
     if all_stocks.empty:
-        return {"error": "Failed to fetch market data from Eastmoney"}
+        return {"error": "本地数据库无股票数据，请先运行 slow_fetcher 同步数据"}
 
     total_market = len(all_stocks)
 
-    # -- Stage 0: Historical cross-sectional scoring --
+    # ── 历史横截面评分（stock_history → 趋势/动量/回撤评分）──
     all_stocks = attach_historical_profiles(
         all_stocks,
         lookback_days=history_lookback_days,
@@ -749,19 +821,25 @@ def screen_stocks(
     history_profile_count = int(all_stocks["history_score"].notna().sum()) \
         if "history_score" in all_stocks.columns else 0
 
-    # -- Stage 1: Fast filter --
+    # ── 基础过滤（PE/PB/市值/换手/价格条件）──
     filter_func = STRATEGY_MAP.get(strategy)
     if filter_func is None:
-        return {"error": f"Unknown strategy: {strategy}. Available: {list(STRATEGY_MAP.keys())}"}
+        return {"error": f"未知策略 '{strategy}'，可用: {list(STRATEGY_MAP.keys())}"}
 
-    candidates = filter_func(all_stocks, **filter_kwargs)
+    try:
+        candidates = filter_func(all_stocks, **filter_kwargs)
+    except Exception as e:
+        logger.error("filter_func(%s) failed: %s", strategy, e)
+        return {"error": f"策略 '{strategy}' 过滤失败: {e}"}
     if not candidates.empty:
-        history_component = candidates.get("history_score", pd.Series(0, index=candidates.index)).fillna(0)
-        fast_component = candidates.get("fast_score", pd.Series(0, index=candidates.index)).fillna(0)
+        history_component = candidates.get(
+            "history_score", pd.Series(0, index=candidates.index)).fillna(0)
+        fast_component = candidates.get(
+            "fast_score", pd.Series(0, index=candidates.index)).fillna(0)
         readiness_penalty = np.where(
-            candidates.get("history_ready", pd.Series(False, index=candidates.index)).fillna(False),
-            0.0,
-            -8.0,
+            candidates.get(
+                "history_ready", pd.Series(False, index=candidates.index)).fillna(False),
+            0.0, -8.0,
         )
         candidates["stage1_score"] = (
             fast_component * 0.55
@@ -781,24 +859,61 @@ def screen_stocks(
             "history_profile_count": history_profile_count,
             "stage1_count": 0,
             "stage2_count": 0,
+            "qualified_count": 0,
+            "quality_threshold": quality_threshold,
             "market_regime": market_regime,
             "results": [],
-            "summary": f"No stocks passed the {strategy} filter out of {total_market} total stocks. "
-                       f"Try relaxing filter conditions.",
+            "summary": (f"基础过滤后无股票通过（策略={strategy}，全市场{total_market}只）。"
+                        f"可考虑放宽过滤条件。"),
         }
 
-    # Limit candidates for deep scan
-    candidates = candidates.head(stage1_limit)
+    # ── 量化深度扫描（本地 kline，0 次网络）──
+    scan_candidates = candidates.head(stage1_limit)
 
-    # -- Stage 2: Deep scan (optional) --
     if deep_scan_enabled:
-        results = deep_scan(candidates, top_n=min(top_n, len(candidates)),
-                            analysis_days=analysis_days)
-        stage2_count = len(results)
+        # top_n 设为 stage1_limit，让 deep_scan 返回所有结果供后续质量过滤
+        all_scanned = deep_scan(
+            scan_candidates,
+            top_n=len(scan_candidates),
+            analysis_days=analysis_days,
+            local_only=True,   # 预筛阶段始终 local_only
+        )
+        stage2_count = len(all_scanned)
+
+        # ── 质量阈值过滤 ──
+        # entry_quality_score 综合了: 7维技术得分×0.35 + 历史得分×0.12 +
+        #   蒙特卡洛概率 + 风险收益比 + 市场趋势 + 快速得分×0.18
+        # 阈值 5.0 ≈ 正向信号略占优势，通常筛出 10~25% 的扫描结果
+        results = [
+            r for r in all_scanned
+            if (r.get("entry_quality_score") or 0) >= quality_threshold
+        ]
+
+        # 若阈值过严导致结果为0，自适应降级：取扫描结果前 min(5, stage2_count) 只
+        if not results and all_scanned:
+            results = sorted(
+                all_scanned,
+                key=lambda x: x.get("entry_quality_score") or 0,
+                reverse=True,
+            )[:min(5, len(all_scanned))]
+            logger.warning(
+                "quality_threshold=%.1f 过滤后结果为空，自适应降级取前%d只",
+                quality_threshold, len(results),
+            )
+
+        # 按综合质量分排序，上限 max_candidates
+        results = sorted(
+            results,
+            key=lambda x: x.get("entry_quality_score") or 0,
+            reverse=True,
+        )[:max_candidates]
+
     else:
-        # Return Stage 1 results only
+        # 不做量化扫描，只返回基础过滤结果
+        all_scanned = []
+        stage2_count = 0
         results = []
-        for _, row in candidates.head(top_n).iterrows():
+        for _, row in scan_candidates.head(top_n).iterrows():
             results.append({
                 "code": row["code"],
                 "name": row["name"],
@@ -808,12 +923,13 @@ def screen_stocks(
                 "pb": round(row["pb"], 2) if pd.notna(row.get("pb")) else None,
                 "total_mv": round(row["total_mv"], 1) if pd.notna(row.get("total_mv")) else None,
                 "fast_score": round(row.get("fast_score", 0), 1),
-                "history_score": round(row.get("history_score", 0), 1) if pd.notna(row.get("history_score")) else None,
+                "history_score": round(row.get("history_score", 0), 1)
+                    if pd.notna(row.get("history_score")) else None,
                 "history_label": row.get("history_label"),
                 "history_days": int(row.get("history_days", 0) or 0),
                 "stage1_score": round(row.get("stage1_score", row.get("fast_score", 0)), 1),
+                "entry_quality_score": row.get("stage1_score", 0),
             })
-        stage2_count = 0
 
     return {
         "strategy": strategy,
@@ -821,11 +937,16 @@ def screen_stocks(
         "history_profile_count": history_profile_count,
         "stage1_count": stage1_count,
         "stage2_count": stage2_count,
+        "qualified_count": len(results),
+        "quality_threshold": quality_threshold,
         "market_regime": market_regime,
         "results": results,
-        "summary": _format_summary(strategy, total_market, stage1_count,
-                                    stage2_count, results, deep_scan_enabled,
-                                    history_profile_count=history_profile_count),
+        "summary": _format_summary(
+            strategy, total_market, stage1_count, stage2_count,
+            results, deep_scan_enabled,
+            history_profile_count=history_profile_count,
+            quality_threshold=quality_threshold,
+        ),
     }
 
 
@@ -835,7 +956,8 @@ def screen_stocks(
 
 def _format_summary(strategy, total_market, stage1_count,
                     stage2_count, results, deep_enabled,
-                    history_profile_count: int = 0) -> str:
+                    history_profile_count: int = 0,
+                    quality_threshold: float = 5.0) -> str:
     """Format screening results into human-readable text."""
     market_regime = None
     if deep_enabled:
@@ -855,6 +977,10 @@ def _format_summary(strategy, total_market, stage1_count,
 
     if deep_enabled:
         lines.append(f"Stage 2 (deep quant scan): {stage2_count} stocks analyzed")
+        lines.append(
+            f"Quality Gate: entry_quality_score ≥ {quality_threshold:.1f}  →  "
+            f"{len(results)} 只通过  (候选池输出 {len(results)} 只进入实时深度复核)"
+        )
         if market_regime:
             lines.append(
                 "Market Regime: "
@@ -876,23 +1002,26 @@ def _format_summary(strategy, total_market, stage1_count,
         )
 
         # Deep scan results
-        lines.append(
-            f"  {'#':<3} {'Code':<8} {'Name':<10} {'Price':>7} {'Chg%':>7} "
-            f"{'Hist':>6} {'S1':>6} {'Action':<8} {'EQS':>6} {'Evt':>6} {'P(up)':>6}"
-        )
-        lines.append("-" * 90)
+        has_source = any(r.get("source_strategy") for r in results)
+        hdr = (f"  {'#':<3} {'Code':<8} {'Name':<10} {'Price':>7} {'Chg%':>7} "
+               f"{'Hist':>6} {'S1':>6} {'Action':<8} {'EQS':>6} {'Evt':>6} {'P(up)':>6}")
+        if has_source:
+            hdr += f" {'来源':>8}"
+        lines.append(hdr)
+        lines.append("-" * (98 if has_source else 90))
 
         for i, r in enumerate(results, 1):
             prob_up = f"{r['prob_up']:.0f}%" if r.get("prob_up") is not None else "N/A"
             evt = f"{r.get('event_score', 0):+.0f}" if r.get("event_score") is not None else "N/A"
             hist = f"{r.get('history_score', 0):+.0f}" if r.get("history_score") is not None else "N/A"
-            lines.append(
-                f"  {i:<3} {r['code']:<8} {r['name']:<10} "
-                f"{r['current']:>7.2f} {r['pct_chg']:>+6.2f}% "
-                f"{hist:>6} {r.get('stage1_score', r.get('fast_score', 0)):>+6.1f} "
-                f"{r.get('decision_action','hold'):<8} {r.get('entry_quality_score', 0):>+6.1f} "
-                f"{evt:>6} {prob_up:>6}"
-            )
+            row = (f"  {i:<3} {r['code']:<8} {r['name']:<10} "
+                   f"{r['current']:>7.2f} {r['pct_chg']:>+6.2f}% "
+                   f"{hist:>6} {r.get('stage1_score', r.get('fast_score', 0)):>+6.1f} "
+                   f"{r.get('decision_action','hold'):<8} {r.get('entry_quality_score', 0):>+6.1f} "
+                   f"{evt:>6} {prob_up:>6}")
+            if has_source:
+                row += f" {r.get('source_strategy', ''):>8}"
+            lines.append(row)
 
         lines.append("-" * 90)
 

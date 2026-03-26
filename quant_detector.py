@@ -133,9 +133,9 @@ def get_minute_kline(code: str, period: str = "1m") -> pd.DataFrame:
     """
     获取当日或近期分钟K线，用于分析成交量时间分布。
     """
-    # 复用 stock_tool 的接口，避免重复代码
-    import stock_tool as st
-    df = st.get_kline(code, period=period, limit=250)
+    # 复用 data_fetcher 的接口，避免重复代码
+    from data_fetcher import get_kline
+    df = get_kline(code, period=period, limit=250)
     return df
 
 
@@ -401,13 +401,13 @@ def get_quant_activity_report(code: str, tick_n: int = 1500) -> str:
     -------
     str  完整中文报告
     """
-    import stock_tool as st
+    from data_fetcher import get_realtime
     now = datetime.now()
     sep = "─" * 52
 
     # ── 获取股票名称 ──
     try:
-        rt = st.get_realtime([code])
+        rt = get_realtime([code])
         name = rt.iloc[0]["name"] if not rt.empty else code
         current_price = rt.iloc[0]["current"]
         pct_chg = rt.iloc[0]["pct_chg"]

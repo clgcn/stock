@@ -325,7 +325,10 @@ def stress_test(
     n_sim = 10000
 
     for days, label in [(5, "5-day"), (20, "20-day")]:
-        z = np.random.standard_normal((n_sim, days))
+        # 使用 t 分布（df=5）捕捉A股肥尾，与 quant_engine 保持一致
+        df_t = 5
+        z_raw = np.random.standard_t(df_t, size=(n_sim, days))
+        z = z_raw / np.sqrt(df_t / (df_t - 2))   # 归一化到单位方差
         paths = np.exp(np.cumsum((mu - 0.5*sigma**2) + sigma * z, axis=1))
         final_rets = paths[:, -1] - 1
         worst_1pct = np.percentile(final_rets, 1)

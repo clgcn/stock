@@ -823,6 +823,289 @@ def analyze_statistics(df: pd.DataFrame) -> Dict:
 
 
 # =====================================================
+# 9. KDJ + K线形态识别（涨停/缩量回调/吞没/锤子线）
+# =====================================================
+
+def analyze_kdj_patterns(df: pd.DataFrame) -> Dict:
+    """
+    KDJ随机指标 + 重要K线形态识别。
+
+    KDJ说明:
+      RSV = (Close - Lowest_Low_N) / (Highest_High_N - Lowest_Low_N) * 100
+      K   = EWMA(RSV, α=1/3)   (平滑周期9)
+      D   = EWMA(K, α=1/3)
+      J   = 3K - 2D
+
+    信号:
+      K从D下方上穿D → 金叉（做多信号）
+      K从D上方下穿D → 死叉（做空信号）
+      J < 10 → 严重超卖，K < 20 → 超卖
+      J > 90 → 严重超买，K > 80 → 超买
+
+    K线形态:
+      涨停板:  当日涨幅 >= 9.5%
+      缩量回调: 近3日收跌，但成交量比5日均量低30%以上
+      放量上攻: 当日涨幅>2% 且量比 >= 1.5
+      锤子线:  下影线 >= 2 * 实体，且当日收盘接近最高价
+      吞没形态: 今日阳线完全包含昨日阴线（看涨吞没）
+      死亡十字: MA5上穿MA10后又下穿（短期趋势反转）
+
+    Returns dict with score(-100~+100), kdj values, pattern signals
+    """
+    close  = df["close"].values
+    high   = df["high"].values
+    low    = df["low"].values
+    volume = df["volume"].values if "volume" in df.columns else None
+    n = len(close)
+    details = {}
+    patterns = []
+
+    # ── KDJ ──
+    kdj_score = 0
+    if n >= 9:
+        period = 9
+        k_arr  = np.full(n, 50.0)
+        d_arr  = np.full(n, 50.0)
+
+        for i in range(period - 1, n):
+            hh = max(high[i - period + 1: i + 1])
+            ll = min(low[i - period + 1: i + 1])
+            rsv = (close[i] - ll) / (hh - ll) * 100 if hh != ll else 50.0
+            k_arr[i] = k_arr[i - 1] * (2/3) + rsv * (1/3)
+            d_arr[i] = d_arr[i - 1] * (2/3) + k_arr[i] * (1/3)
+
+        j_arr = 3 * k_arr - 2 * d_arr
+        k_val, d_val, j_val = k_arr[-1], d_arr[-1], j_arr[-1]
+        details["kdj_k"] = round(k_val, 1)
+        details["kdj_d"] = round(d_val, 1)
+        details["kdj_j"] = round(j_val, 1)
+
+        # 金叉/死叉
+        if n >= 10:
+            if k_arr[-2] <= d_arr[-2] and k_val > d_val:
+                details["kdj_cross"] = "golden_cross"
+                kdj_score += 20
+                patterns.append("KDJ金叉")
+            elif k_arr[-2] >= d_arr[-2] and k_val < d_val:
+                details["kdj_cross"] = "death_cross"
+                kdj_score -= 20
+                patterns.append("KDJ死叉")
+
+        # 超买/超卖
+        if j_val < 10:
+            kdj_score += 20
+            details["kdj_signal"] = "oversold_extreme"
+            patterns.append("KDJ严重超卖(J<10)")
+        elif k_val < 20:
+            kdj_score += 12
+            details["kdj_signal"] = "oversold"
+        elif j_val > 90:
+            kdj_score -= 20
+            details["kdj_signal"] = "overbought_extreme"
+            patterns.append("KDJ严重超买(J>90)")
+        elif k_val > 80:
+            kdj_score -= 12
+            details["kdj_signal"] = "overbought"
+
+    # ── K线形态 ──
+    pattern_score = 0
+    if n >= 5:
+        o  = df["open"].values  if "open" in df.columns else close
+        c  = close
+        h  = high
+        l  = low
+
+        # 1. 涨停板检测（日涨幅 >= 9.5%）
+        if n >= 2:
+            prev_close = c[-2]
+            today_chg = (c[-1] / prev_close - 1) * 100 if prev_close > 0 else 0
+            details["today_pct_chg"] = round(today_chg, 2)
+            if today_chg >= 9.5:
+                details["limit_up"] = True
+                patterns.append("涨停板（+9.5%↑）")
+                pattern_score += 15   # 短线动能极强
+
+        # 2. 缩量回调（近3日收跌 + 量 < 5日均量的70%）
+        if n >= 8 and volume is not None:
+            last3_down = all(c[i] < c[i - 1] for i in range(-3, 0))
+            vol5_avg = np.mean(volume[-6:-1])  # 5日均量（排除今日）
+            today_vol = volume[-1]
+            if last3_down and vol5_avg > 0 and today_vol < vol5_avg * 0.70:
+                details["shrink_pullback"] = True
+                patterns.append("缩量回调（调整健康）")
+                pattern_score += 12
+
+        # 3. 放量上攻（今日涨 > 2% + 量比 >= 1.5）
+        if n >= 6 and volume is not None:
+            vol5_avg2 = np.mean(volume[-6:-1])
+            if vol5_avg2 > 0:
+                vol_ratio = volume[-1] / vol5_avg2
+                details["vol_ratio_today"] = round(vol_ratio, 2)
+                if n >= 2:
+                    chg_today = (c[-1] / c[-2] - 1) * 100 if c[-2] > 0 else 0
+                    if chg_today > 2.0 and vol_ratio >= 1.5:
+                        details["volume_surge"] = True
+                        patterns.append(f"放量上攻(量比{vol_ratio:.1f}x)")
+                        pattern_score += 15
+
+        # 4. 锤子线（下影线 >= 2 * 实体，且收盘接近最高价）
+        if n >= 2:
+            body = abs(c[-1] - o[-1])
+            lower_shadow = min(o[-1], c[-1]) - l[-1]
+            upper_shadow = h[-1] - max(o[-1], c[-1])
+            if body > 0 and lower_shadow >= 2 * body and upper_shadow <= 0.5 * body:
+                details["hammer"] = True
+                patterns.append("锤子线（支撑反弹形态）")
+                pattern_score += 10
+
+        # 5. 看涨吞没（今日阳线 > 昨日阴线）
+        if n >= 2:
+            yesterday_bear = o[-2] > c[-2]       # 昨日阴线
+            today_bull     = c[-1] > o[-1]        # 今日阳线
+            engulf = (c[-1] > o[-2]) and (o[-1] < c[-2])
+            if yesterday_bear and today_bull and engulf:
+                details["bullish_engulfing"] = True
+                patterns.append("看涨吞没形态")
+                pattern_score += 12
+
+        # 6. 高开低走（今日高开>1% 但收盘接近低点，阴线）
+        if n >= 2:
+            gap_up = (o[-1] / c[-2] - 1) * 100 if c[-2] > 0 else 0
+            if gap_up > 1.0 and c[-1] < o[-1]:
+                down_ratio = (o[-1] - c[-1]) / (h[-1] - l[-1] + 1e-10)
+                if down_ratio > 0.6:
+                    details["shooting_star"] = True
+                    patterns.append("高开低走/射击之星（警惕回调）")
+                    pattern_score -= 10
+
+    details["patterns"] = patterns
+    total_score = np.clip(kdj_score * 0.6 + pattern_score * 0.4, -100, 100)
+
+    return {
+        "score":    round(total_score, 1),
+        "kdj_k":    details.get("kdj_k"),
+        "kdj_d":    details.get("kdj_d"),
+        "kdj_j":    details.get("kdj_j"),
+        "patterns": patterns,
+        "details":  details,
+    }
+
+
+def analyze_dupont(financial_history: list) -> Dict:
+    """
+    杜邦分析 (DuPont Analysis) — 拆解ROE来源。
+
+    ROE = 净利润率 × 资产周转率 × 权益乘数
+        = (Net Profit / Revenue) × (Revenue / Total Assets) × (Total Assets / Equity)
+
+    由于东财历史财务只有ROE、毛利率、营收、净利润，
+    此处做简化版杜邦：通过多期趋势判断ROE质量。
+
+    Parameters
+    ----------
+    financial_history : list   来自 get_financial_history() 的历史财务数据
+                                需要至少3期（年报优先）
+
+    Returns
+    -------
+    dict:
+        roe_trend     : str   ROE趋势 (improving/stable/declining)
+        avg_roe       : float 近3期平均ROE (%)
+        roe_quality   : str   ROE质量判断（高毛利率驱动 vs 高杠杆驱动）
+        gross_trend   : str   毛利率趋势
+        profit_trend  : str   净利润同比增速趋势
+        verdict       : str   综合判断
+        score         : float 杜邦评分 (-30 ~ +30)
+    """
+    if not financial_history or len(financial_history) < 2:
+        return {"score": 0, "verdict": "数据不足", "roe_trend": "unknown"}
+
+    # 优先使用年报
+    annual = [r for r in financial_history if r.get("report_type") == "年报"]
+    data = annual[:4] if len(annual) >= 2 else financial_history[:6]
+
+    roes    = [r.get("roe") for r in data if r.get("roe") is not None]
+    margins = [r.get("gross_margin") for r in data if r.get("gross_margin") is not None]
+    growths = [r.get("profit_yoy") for r in data if r.get("profit_yoy") is not None]
+
+    score = 0
+    result = {}
+
+    # ROE分析
+    if roes:
+        avg_roe = sum(roes[:3]) / min(3, len(roes))
+        result["avg_roe"] = round(avg_roe, 2)
+        if len(roes) >= 2:
+            roe_slope = roes[0] - roes[-1]   # 最新 - 最早（倒序排列）
+            if roe_slope > 2:
+                result["roe_trend"] = "improving"
+                score += 15
+            elif roe_slope < -3:
+                result["roe_trend"] = "declining"
+                score -= 15
+            else:
+                result["roe_trend"] = "stable"
+                score += 5 if avg_roe > 15 else 0
+        else:
+            result["roe_trend"] = "insufficient_data"
+
+        # ROE绝对水平
+        if avg_roe >= 20:
+            score += 10
+        elif avg_roe >= 15:
+            score += 5
+        elif avg_roe < 8:
+            score -= 10
+
+    # 毛利率趋势
+    if margins and len(margins) >= 2:
+        margin_slope = margins[0] - margins[-1]
+        if margin_slope > 2:
+            result["gross_trend"] = "improving"
+            score += 5
+        elif margin_slope < -3:
+            result["gross_trend"] = "declining"
+            score -= 8
+            result["roe_quality"] = "⚠️ 毛利率下滑，ROE质量下降"
+        else:
+            result["gross_trend"] = "stable"
+        result["avg_gross_margin"] = round(sum(margins[:3]) / min(3, len(margins)), 2)
+        if margins[0] > 40:
+            result["roe_quality"] = "✅ 高毛利率驱动ROE（质量优秀）"
+        elif not result.get("roe_quality"):
+            result["roe_quality"] = "高资产周转率或财务杠杆驱动"
+
+    # 净利润增速趋势
+    if growths and len(growths) >= 2:
+        pos_growth = sum(1 for g in growths[:3] if g > 0)
+        if pos_growth >= 3:
+            result["profit_trend"] = "consistently_growing"
+            score += 8
+        elif pos_growth == 0:
+            result["profit_trend"] = "declining_all"
+            score -= 10
+        else:
+            result["profit_trend"] = "mixed"
+
+    # 综合判断
+    score = np.clip(score, -30, 30)
+    if score >= 20:
+        verdict = "🟢 优秀：ROE高且持续改善，盈利质量强"
+    elif score >= 10:
+        verdict = "🟡 良好：基本面稳健"
+    elif score >= 0:
+        verdict = "⚪ 一般：基本面无明显优势"
+    elif score >= -10:
+        verdict = "🟠 偏弱：ROE或毛利率有下滑迹象"
+    else:
+        verdict = "🔴 较差：盈利能力持续恶化"
+
+    result["score"]   = round(score, 1)
+    result["verdict"] = verdict
+    return result
+
+
+# =====================================================
 # 9. Monte Carlo Simulation
 # =====================================================
 
@@ -858,8 +1141,13 @@ def monte_carlo_simulation(
     s0 = close[-1]
 
     # Generate simulation paths
-    dt = 1.0  # Daily frequency
-    z = np.random.standard_normal((n_simulations, days))
+    # 使用 Student-t 分布（自由度 df=5）替代正态分布
+    # A股日收益率峰度远高于3，t分布更真实地捕捉极端行情概率
+    # 标准化使得方差=1：z / sqrt(df/(df-2))
+    dt = 1.0
+    df_t = 5
+    z_raw = np.random.standard_t(df_t, size=(n_simulations, days))
+    z = z_raw / np.sqrt(df_t / (df_t - 2))   # 归一化到单位方差
     daily_returns = np.exp((mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * z)
     price_paths = np.zeros((n_simulations, days + 1))
     price_paths[:, 0] = s0
@@ -909,16 +1197,52 @@ def monte_carlo_simulation(
 # 10. Comprehensive Diagnosis Scoring System
 # =====================================================
 
-# Factor weights (sum = 1.0)
+# Factor weights (sum = 1.0) — default weights for random-walk regime
 FACTOR_WEIGHTS = {
-    "trend":           0.25,   # Trend analysis
-    "momentum":        0.20,   # Momentum analysis
-    "volatility":      0.10,   # Volatility
-    "mean_reversion":  0.15,   # Mean reversion
-    "volume":          0.15,   # Volume-price relationship
-    "support_resistance": 0.10, # Support/resistance
-    "statistics":      0.05,   # Statistical features
+    "trend":              0.25,
+    "momentum":           0.20,
+    "volatility":         0.10,
+    "mean_reversion":     0.15,
+    "volume":             0.15,
+    "support_resistance": 0.10,
+    "statistics":         0.05,
 }
+
+
+def _get_adaptive_weights(hurst: float) -> Dict:
+    """
+    根据 Hurst 指数动态调整因子权重。
+
+    H > 0.6 → 趋势市：强化趋势/动量权重，削减均值回归
+    H < 0.4 → 震荡市：强化均值回归/支撑阻力，削减趋势/动量
+    H 0.4~0.6 → 随机游走：使用默认权重
+
+    原理：Hurst > 0.5 表示序列具有记忆性（趋势持续），
+          Hurst < 0.5 表示序列有回归均值倾向（震荡反弹）。
+          在不同市场状态下，用相同权重会导致错误信号被放大。
+    """
+    if hurst > 0.62:        # 趋势市
+        return {
+            "trend":              0.32,
+            "momentum":           0.25,
+            "volatility":         0.08,
+            "mean_reversion":     0.07,
+            "volume":             0.16,
+            "support_resistance": 0.08,
+            "statistics":         0.04,
+        }
+    elif hurst < 0.40:      # 震荡/均值回归市
+        return {
+            "trend":              0.10,
+            "momentum":           0.12,
+            "volatility":         0.10,
+            "mean_reversion":     0.32,
+            "volume":             0.16,
+            "support_resistance": 0.16,
+            "statistics":         0.04,
+        }
+    else:                   # 随机游走 — 使用默认权重
+        return dict(FACTOR_WEIGHTS)
 
 
 def comprehensive_diagnosis(
@@ -959,37 +1283,94 @@ def comprehensive_diagnosis(
     sr      = analyze_support_resistance(df)
     stats   = analyze_statistics(df)
 
+    # -- 自适应权重：根据 Hurst 指数动态调整各维度权重 --
+    hurst_val = stats["details"].get("hurst", 0.5)
+    w = _get_adaptive_weights(hurst_val)
+
     factors = {
-        "trend":           {"score": trend["score"],    "weight": FACTOR_WEIGHTS["trend"],           "label": "Trend"},
-        "momentum":        {"score": momentum["score"], "weight": FACTOR_WEIGHTS["momentum"],        "label": "Momentum"},
-        "volatility":      {"score": vol["score"],      "weight": FACTOR_WEIGHTS["volatility"],      "label": "Volatility"},
-        "mean_reversion":  {"score": mr["score"],       "weight": FACTOR_WEIGHTS["mean_reversion"],  "label": "Mean Reversion"},
-        "volume":          {"score": volume["score"],   "weight": FACTOR_WEIGHTS["volume"],          "label": "Volume-Price"},
-        "support_resistance": {"score": sr["score"],    "weight": FACTOR_WEIGHTS["support_resistance"], "label": "Support/Resistance"},
-        "statistics":      {"score": stats["score"],    "weight": FACTOR_WEIGHTS["statistics"],      "label": "Statistics"},
+        "trend":           {"score": trend["score"],    "weight": w["trend"],              "label": "趋势 Trend"},
+        "momentum":        {"score": momentum["score"], "weight": w["momentum"],           "label": "动量 Momentum"},
+        "volatility":      {"score": vol["score"],      "weight": w["volatility"],         "label": "波动率 Volatility"},
+        "mean_reversion":  {"score": mr["score"],       "weight": w["mean_reversion"],     "label": "均值回归 MeanRev"},
+        "volume":          {"score": volume["score"],   "weight": w["volume"],             "label": "量价 Volume-Price"},
+        "support_resistance": {"score": sr["score"],   "weight": w["support_resistance"], "label": "支撑阻力 S/R"},
+        "statistics":      {"score": stats["score"],   "weight": w["statistics"],         "label": "统计特征 Stats"},
     }
 
-    # -- Weighted score --
+    # -- 加权总分 --
     weighted_sum = sum(f["score"] * f["weight"] for f in factors.values())
 
-    # -- News sentiment adjustment (if any) --
-    news_adj = news_sentiment * 10  # -10 ~ +10
+    # -- 新闻情绪修正 --
+    news_adj = news_sentiment * 10   # -10 ~ +10
     if news_sentiment != 0:
-        factors["news"] = {"score": news_adj, "weight": 0.0, "label": "News Sentiment (adj)"}
+        factors["news"] = {"score": news_adj, "weight": 0.0, "label": "新闻情绪 News(adj)"}
 
     total = np.clip(weighted_sum + news_adj, -100, 100)
 
-    # -- Signal determination --
-    if total > 40:
-        signal = "strong_buy"
-    elif total > 15:
-        signal = "buy"
-    elif total > -15:
-        signal = "hold"
-    elif total > -40:
-        signal = "sell"
-    else:
+    # ── 多条件买卖核查清单 ──────────────────────────────────────
+    rsi_val         = momentum["details"].get("rsi_14", 50)
+    macd_hist_val   = momentum["details"].get("macd_hist", 0)
+    macd_cross_val  = momentum["details"].get("macd_cross", "")
+    vol_ratio_val   = volume["details"].get("vol_ratio_5_20", 1.0)
+    z_score_val     = mr["details"].get("z_score_20d", 0.0)
+    pos_range_val   = sr.get("details", {}).get("position_in_range", 0.5)
+    obv_sig_val     = volume["details"].get("obv_signal", "")
+    vol_div_val     = volume["details"].get("vol_divergence", "")
+
+    # 买入条件（7项，满足≥5项才触发买入信号）
+    buy_conditions = {
+        "趋势未下跌":    (trend["score"] > -10,
+                          f"趋势分={trend['score']:.0f} (需>-10)"),
+        "MACD未死叉":   (macd_cross_val != "death_cross" and macd_hist_val >= -0.002,
+                          f"MACD柱={macd_hist_val:.3f} / {macd_cross_val or '无交叉'}"),
+        "量能扩张稳定":  (vol_ratio_val > 0.90,
+                          f"量比5/20日={vol_ratio_val:.2f} (需>0.90)"),
+        "RSI未超买":    (rsi_val < 75,
+                          f"RSI14={rsi_val:.1f} (需<75)"),
+        "价格未高估":   (z_score_val < 2.0,
+                          f"Z-score20d={z_score_val:.2f} (需<2.0)"),
+        "非历史高位":   (pos_range_val < 0.80,
+                          f"区间位置={pos_range_val:.2f} (需<0.80)"),
+        "情绪未极空":   (news_sentiment > -0.30,
+                          f"情绪值={news_sentiment:.2f} (需>-0.30)"),
+    }
+    buy_met = sum(1 for met, _ in buy_conditions.values() if met)
+
+    # 卖出/风险条件（7项，触发≥3项则卖出信号）
+    sell_conditions = {
+        "强下跌趋势":   (trend["score"] < -35,
+                          f"趋势分={trend['score']:.0f} (<-35触发)"),
+        "MACD死叉":    (macd_cross_val == "death_cross",
+                          f"MACD={macd_cross_val or '无死叉'}"),
+        "RSI严重超买":  (rsi_val > 78,
+                          f"RSI14={rsi_val:.1f} (>78触发)"),
+        "历史高位":    (pos_range_val > 0.88,
+                          f"区间位置={pos_range_val:.2f} (>0.88触发)"),
+        "量价背离看空": ("bearish" in obv_sig_val or "bearish" in vol_div_val,
+                          f"OBV={obv_sig_val[:25] if obv_sig_val else '正常'}"),
+        "价格严重高估": (z_score_val > 2.3,
+                          f"Z-score20d={z_score_val:.2f} (>2.3触发)"),
+        "情绪极端看空": (news_sentiment < -0.40,
+                          f"情绪值={news_sentiment:.2f} (<-0.40触发)"),
+    }
+    sell_met = sum(1 for met, _ in sell_conditions.values() if met)
+
+    # -- 综合信号判定（多条件 + 分数双保险）--
+    # 强买：≥6项买入条件 + 总分>15
+    # 买：  ≥5项买入条件 + 总分>0 + 卖出触发<2
+    # 强卖：≥5项卖出条件 OR 总分<-45
+    # 卖：  ≥3项卖出条件 OR 总分<-15
+    # 持有：其他情况
+    if sell_met >= 5 or total < -45:
         signal = "strong_sell"
+    elif sell_met >= 3 or total < -15:
+        signal = "sell"
+    elif buy_met >= 6 and total > 15 and sell_met == 0:
+        signal = "strong_buy"
+    elif buy_met >= 5 and total > 0 and sell_met <= 1:
+        signal = "buy"
+    else:
+        signal = "hold"
 
     # -- Confidence assessment --
     # Based on: factor agreement + trend clarity + data quantity
@@ -1041,16 +1422,33 @@ def comprehensive_diagnosis(
     code = df.attrs.get("code", "")
     current = df.iloc[-1]["close"]
 
+    # 信号中文映射
+    signal_cn = {
+        "strong_buy":  "⭐强买入",
+        "buy":         "✅买入",
+        "hold":        "⏸持有观望",
+        "sell":        "🔻卖出",
+        "strong_sell": "🚨强力卖出",
+    }
+    # Hurst市场状态描述
+    if hurst_val > 0.62:
+        market_regime = f"趋势市(H={hurst_val:.3f}，权重已向趋势/动量倾斜)"
+    elif hurst_val < 0.40:
+        market_regime = f"震荡市(H={hurst_val:.3f}，权重已向均值回归倾斜)"
+    else:
+        market_regime = f"随机游走(H={hurst_val:.3f}，使用默认权重)"
+
     summary_lines = [
-        f"[{name} ({code}) Comprehensive Diagnosis]",
-        f"Current Price: {current:.2f}",
-        f"Total Score: {total:.0f}/100    Signal: {signal}    Confidence: {confidence}",
+        f"【{name}({code}) 全维度量化诊断】",
+        f"当前价格: {current:.2f}",
+        f"综合得分: {total:.0f}/100  │  信号: {signal_cn.get(signal, signal)}  │  置信度: {confidence}",
+        f"市场状态: {market_regime}",
         "",
-        f"Trend: {trend['direction']} ({trend['strength']})  Score {trend['score']:.0f}",
-        f"Momentum: Score {momentum['score']:.0f}   RSI={momentum['details'].get('rsi_14', 'N/A')}",
-        f"Volatility: {vol['risk_level']}   HV={vol['current_hv']:.0f}%",
-        f"Mean Reversion: {mr['signal']}  Score {mr['score']:.0f}",
-        f"Volume-Price: {volume['details'].get('obv_signal', 'N/A')}",
+        f"趋势: {trend['direction']} ({trend['strength']})  得分={trend['score']:.0f}",
+        f"动量: 得分={momentum['score']:.0f}   RSI={momentum['details'].get('rsi_14', 'N/A')}",
+        f"波动: {vol['risk_level']}   HV={vol['current_hv']:.0f}%",
+        f"均值回归: {mr['signal']}  得分={mr['score']:.0f}",
+        f"量价关系: {volume['details'].get('obv_signal', 'N/A')}",
     ]
 
     if sr["supports"]:
@@ -1072,24 +1470,55 @@ def comprehensive_diagnosis(
         summary_lines.append("")
         summary_lines.extend(warnings)
 
+    # ── 买卖条件核查清单 ──────────────────────────────────────────
+    buy_icon  = "✅" if buy_met >= 5 else ("⚠️" if buy_met >= 3 else "❌")
+    sell_icon = "🚨" if sell_met >= 3 else ("⚠️" if sell_met >= 2 else "✅")
+
     summary_lines.extend([
         "",
-        "DISCLAIMER: The above analysis is based on mathematical models and does not constitute investment advice. Investing involves risk.",
+        f"━━━ 买入条件核查 ({buy_met}/{len(buy_conditions)}) {buy_icon} ━━━",
+    ])
+    for cond_name, (met, desc) in buy_conditions.items():
+        mark = "✓" if met else "✗"
+        summary_lines.append(f"  {mark} {cond_name}: {desc}")
+
+    summary_lines.extend([
+        "",
+        f"━━━ 风险/卖出条件核查 ({sell_met}/{len(sell_conditions)}) {sell_icon} ━━━",
+    ])
+    for cond_name, (met, desc) in sell_conditions.items():
+        mark = "⚠" if met else "·"
+        summary_lines.append(f"  {mark} {cond_name}: {desc}")
+
+    # 最终决策说明
+    summary_lines.extend([
+        "",
+        f"【最终建议】{signal_cn.get(signal, signal)}",
+        f"  买入条件满足 {buy_met}/7，风险条件触发 {sell_met}/7",
+        f"  决策规则: 买入需≥5项买入条件+总分>0; 卖出需≥3项风险条件或总分<-15",
+        "",
+        "免责声明: 以上分析基于数学模型，不构成投资建议，投资有风险，入市须谨慎。",
     ])
 
     return {
-        "total_score": round(total, 1),
-        "signal": signal,
-        "confidence": confidence,
-        "factors": factors,
-        "trend_detail": trend,
-        "momentum_detail": momentum,
-        "volatility_detail": vol,
+        "total_score":    round(total, 1),
+        "signal":         signal,
+        "confidence":     confidence,
+        "hurst":          round(hurst_val, 3),
+        "market_regime":  market_regime,
+        "buy_met":        buy_met,
+        "sell_met":       sell_met,
+        "buy_conditions":  {k: {"met": v, "desc": d} for k, (v, d) in buy_conditions.items()},
+        "sell_conditions": {k: {"met": v, "desc": d} for k, (v, d) in sell_conditions.items()},
+        "factors":        factors,
+        "trend_detail":   trend,
+        "momentum_detail":    momentum,
+        "volatility_detail":  vol,
         "mean_reversion_detail": mr,
-        "volume_detail": volume,
+        "volume_detail":      volume,
         "support_resistance_detail": sr,
-        "statistics_detail": stats,
-        "monte_carlo": mc_result,
-        "risk_warnings": warnings,
-        "summary": "\n".join(summary_lines),
+        "statistics_detail":  stats,
+        "monte_carlo":    mc_result,
+        "risk_warnings":  warnings,
+        "summary":        "\n".join(summary_lines),
     }

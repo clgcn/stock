@@ -17,6 +17,7 @@ import sys
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # -- Add this directory to path for module imports --
 _HERE = Path(__file__).parent
@@ -32,7 +33,11 @@ except ImportError:
     )
     sys.exit(1)
 
-import stock_tool as st
+import data_fetcher as df_mod
+import financial as fin_mod
+import capital_flow as cf_mod
+import announcements as ann_mod
+import market_quote as mq
 import quant_engine as qe
 import backtest_engine as bt
 import risk_manager as rm
@@ -41,26 +46,57 @@ import news_analyzer as na
 import quant_detector as qd
 import slow_fetcher as sf
 
+# ── 环境层 (架构图 Module A) ──
+import module_a_environment as mod_a
+
+# ── 五面体系 + 评分卡 (替代旧 B1/B2/C/D 模块) ──
+from faces import (
+    TechnicalFace,
+    CapitalFace,
+    CatalystFace,
+    FundamentalFace,
+    RiskFace,
+    Scorecard,
+    compute_combined_decision,
+    format_combined_decision,
+)
+
 # -- Initialize MCP server --
 mcp = FastMCP(
     name="a-share-stock",
     instructions=(
         "你现在是A股量化投资研究员，目标不是随意给观点，而是按严格流程把市场、新闻、财报、估值、技术、量化资金、风险控制全部纳入，再给出明确的买/卖/观望结论。\n\n"
 
-        "【工具定位】\n"
-        "1. resolve_stock       — 股票名称/代码标准化解析，任何名称输入都先过这一步\n"
-        "2. full_stock_analysis — 单股完整流程入口，会自动串联市场新闻、公告、财报、估值、量化、风控\n"
-        "3. market_news         — 市场环境/外围市场/新闻面总开关，任何选股或单股分析前优先调用\n"
-        "4. stock_screener      — 全市场候选池筛选，基于本地 stocks + stock_history + stock_fundamentals\n"
-        "5. stock_news          — 个股新闻面，补充公司/行业相关新闻情绪与催化线索\n"
-        "6. stock_announcements — 个股公告/财报窗口检查，单股分析和候选复核时必调\n"
-        "7. earnings_analysis   — 命中财报/业绩公告时必调，用于判断财报质量和市场反应\n"
-        "8. financial_data      — 估值和财务质量复核\n"
-        "9. kline_data / kline_chart — 技术结构和图形复核\n"
-        "10. quant_activity      — 交易时段内的量化资金参与度分析，短线/盘中结论时强烈建议调用\n"
-        "11. stock_diagnosis     — 核心量化诊断，输出综合分、概率和交易结论\n"
-        "12. risk_assessment     — 风险、止损、仓位、Kelly、VaR/CVaR\n"
-        "13. realtime_quote / batch_quote — 实时价格确认和批量行情概览\n\n"
+        "【工具定位（共22个工具）】\n"
+        "── 入口级工具 ──\n"
+        "1.  resolve_stock        — 股票名称/代码标准化解析，任何名称输入都先过这一步\n"
+        "2.  full_stock_analysis  — 【单股分析唯一入口】五面体系全维度：环境层→催化剂面→技术面→资金面→基本面→风控面→评分卡→3×3综合决策\n"
+        "3.  full_stock_selection — 【选股唯一入口】两阶段：本地DB筛选(0次网络) → 每只候选全维度实时分析(与full_stock_analysis一致)\n"
+        "── 市场/宏观 ──\n"
+        "4.  market_news          — 外围行情+新闻面基线，任何分析前优先调用\n"
+        "5.  northbound_flow      — 北向资金（沪深港通）成交活跃度，外资参与度指标\n"
+        "── 个股基本面 ──\n"
+        "6.  stock_news            — 个股新闻情绪与催化线索\n"
+        "7.  stock_announcements   — 公告/财报窗口检查\n"
+        "8.  earnings_analysis     — 财报/业绩公告质量与市场反应\n"
+        "9.  financial_data        — PE/PB/ROE/毛利率/净利率/市值\n"
+        "10. valuation_quality     — PEG + 杜邦分析，估值质量深度\n"
+        "11. balance_sheet         — 资产负债率 + 商誉预警\n"
+        "12. dividend_history      — 分红历史（价值型/长线）\n"
+        "── 资金面 ──\n"
+        "13. moneyflow             — 主力大单净流入/流出，短线核心\n"
+        "14. margin_trading        — 融资融券余额变化，多空力量对比\n"
+        "── 技术面/量化 ──\n"
+        "15. realtime_quote        — 单股/多股实时价格快照\n"
+        "16. batch_quote           — 批量行情概览（多股横向对比）\n"
+        "17. kline_data            — K线原始数据 + MA/MACD/RSI/BOLL/KDJ（供Claude分析）\n"
+        "18. stock_diagnosis       — 7维量化诊断 + KDJ + K线形态 + 蒙特卡洛\n"
+        "19. quant_activity        — 量化资金参与度（交易时段内调用）\n"
+        "── 风控/回测 ──\n"
+        "20. risk_assessment       — VaR/CVaR/Kelly/ATR止损止盈/仓位\n"
+        "21. strategy_backtest     — 历史策略回测，按需独立调用\n"
+        "── 底层工具 ──\n"
+        "22. stock_screener        — 【非选股入口】仅用户明确要求'只看技术面粗筛'时才单独调用\n\n"
 
         "【硬规则】\n"
         "1. 用户给股票名称、别名或名称+代码混合输入时，必须先调用 resolve_stock，不能凭模型记忆猜代码。\n"
@@ -72,63 +108,129 @@ mcp = FastMCP(
         "7. 没有做 risk_assessment，不允许给最终仓位建议。\n"
         "8. 交易时段内，如果要给短线/盘中交易结论，应补 quant_activity；若无法获取，要明确说明缺失。\n"
         "9. 若市场面、新闻面、财报面、技术面互相冲突，默认降级为观望，不强行给买入。\n"
-        "10. 允许大量输出观望；不要为了给答案而勉强买卖。\n\n"
+        "10. 允许大量输出观望；不要为了给答案而勉强买卖。\n"
+        "11. balance_sheet 发现商誉/净资产 > 30%，不允许给买入建议（一律观望或卖出）。\n"
+        "12. 主力资金连续5日以上净流出（moneyflow），即便技术面良好，最多给'分批低吸'而非'直接买入'。\n"
+        "13. 长线选股中，若 valuation_quality 显示PEG>2且杜邦评分<0，不允许给价值型买入建议。\n"
+        "14. 调用 full_stock_analysis 时，对蓝筹/白马/高分红类标的应主动传 include_dividend_history=True；\n"
+        "    对两融标的应主动传 include_margin_trading=True。不要全部依赖默认值。\n\n"
+
+        "【北向资金规则】（2024年5月后港交所不再披露净买入数据，改为成交额趋势评估）\n"
+        "northbound_flow 反映外资参与度，应在 market_news 之后立即调用，作为情绪修正依据：\n"
+        "  近5日成交额 vs 早期5日变化 > +20%  → news_sentiment +0.10（外资关注度显著提升）\n"
+        "  近5日成交额变化 +5% ~ +20%         → news_sentiment +0.05（温和放量）\n"
+        "  近5日成交额变化 -5% ~ +5%          → news_sentiment 不调整（持平观望）\n"
+        "  近5日成交额变化 -20% ~ -5%         → news_sentiment -0.05（温和缩量）\n"
+        "  近5日成交额变化 < -20%             → news_sentiment -0.10（大幅缩量，外资兴趣减退）\n"
+        "  连续5日以上成交缩量                → 外资参与度持续下降，建议降低仓位积极性\n"
+        "  注意：成交额放量/缩量反映外资参与热度，但不直接等同于买入/卖出方向，需结合市场走势判断。\n\n"
+
+        "【买卖信号充分条件——必须同时核查】\n"
+        "stock_diagnosis 现在会自动输出'买入条件核查'（11项）和'风险/卖出条件核查'（10项）清单。\n"
+        "在最终结论中，必须引用该清单中的具体满足/未满足项，不能只报综合分。\n"
+        "买入建议门槛：买入条件满足≥7/11 AND 风险条件触发<3/10 AND 总分>0\n"
+        "强买入门槛  ：买入条件满足≥9/11 AND 风险条件触发=0 AND 总分>15\n"
+        "卖出建议门槛：风险条件触发≥4/10 OR 总分<-15\n"
+        "强卖建议门槛：风险条件触发≥7/10 OR 总分<-45\n"
+        "不满足买入门槛但也未触发卖出的：一律给观望，不强行买入。\n\n"
 
         "【新闻面与时效性】\n"
-        "market_news 提供的是市场与新闻环境基线，必须把它视为'新闻面步骤'的一部分。\n"
-        "若涉及极强时效事件（突发政策、地缘政治、重大科技发布、会议/展会进展），在调用 market_news 后仍应额外用 web search 补最新信息，不能把旧RSS内容当成实时事实。\n\n"
+        "market_news 提供的是市场与新闻环境基线（来源：东方财富+新浪财经），必须把它视为'新闻面步骤'的一部分。\n"
+        "若涉及极强时效事件（突发政策、地缘政治、重大科技发布、会议/展会进展），在调用 market_news 后仍应额外用 web search 补最新信息，不能把新闻API内容当成实时事实。\n\n"
 
         "【展示要求】\n"
-        "默认使用结构化、仪表板式的输出风格，优先分区、表格、评分摘要、结论卡片化表达。\n"
         "除非用户明确要求纯文本简写，否则单股和选股结果都应尽量按仪表盘格式组织，而不是写成长段散文。\n"
         "仪表盘格式应优先使用清晰分区标题、关键指标摘要、表格/短列表、结论卡片式段落，让用户一眼看到最重要信息。\n"
         "如果当前任务适合可视化，且工具能力允许，应尽量补充图形输出而不是只给纯文本。\n"
-        "可视化优先级：kline_chart > kline_data 表格 > 纯文字描述。\n"
+        "可视化优先级：Claude自行用kline_data绘图 > kline_data 表格 > 纯文字描述。\n"
         "若无法出图，要明确说明原因，不要假装已经展示图表。\n"
-        "无论是否出图，量化资金参与度分析都必须在最终结果中单独成段出现，不能只隐含在其他结论里。\n\n"
+        "无论是否出图，如果 include_quant_activity=True 或工具已返回量化资金数据，量化资金参与度分析都必须在最终结果中单独成段出现，不能只隐含在其他结论里。\n"
+        "注意：quant_activity 默认不启用（盘后无数据），仅在交易时段内且用户关注短线/盘中交易时主动传 include_quant_activity=True。\n\n"
 
         "【仪表盘输出模板】\n"
         "单股分析默认按以下区块顺序输出：\n"
-        "1. 顶部摘要：股票名称/代码、最新价、结论、强度、置信度。\n"
-        "2. 市场环境：market_news 结论与市场风险偏好。\n"
+        "1. 顶部摘要：股票名称/代码、实时价、结论、强度、置信度。\n"
+        "2. 市场环境：market_news 结论 + 北向资金(northbound_flow)趋势与情绪修正。\n"
         "3. 个股新闻面：stock_news 结论与新闻情绪微调。\n"
         "4. 公告/财报面：stock_announcements + earnings_analysis 结论。\n"
-        "5. 估值与财务面：PE/PB/ROE/毛利率/净利率/市值等。\n"
-        "6. 技术与量化诊断：趋势、动量、波动、支撑阻力、概率模拟。\n"
-        "7. 量化资金面：quant_activity 结论，明确写出是否量化主导及交易含义。\n"
-        "8. 风险面：VaR/CVaR/Kelly/止损止盈/风险收益比。\n"
-        "9. 操作建议：入场区间、止损位、目标位、仓位建议、持有周期、失效条件。\n"
-        "10. 支持理由 / 反对理由：分别单列。\n"
+        "5. 估值与财务面：PE/PB/ROE/毛利率/净利率/市值 + PEG/杜邦分析。\n"
+        "6. 资产负债健康度：负债率 + 商誉占比（>30%必须标注⚠️）。\n"
+        "7. 分红历史（价值型标的时展示）：连续分红次数、股息率趋势。\n"
+        "8. 资金面：北向资金活跃度 + 主力大单净流入(moneyflow) + 融资融券(margin_trading)。\n"
+        "9. K线技术面：近期趋势、MA排列、MACD/RSI/KDJ信号、K线形态、支撑阻力。\n"
+        "10. 量化诊断：综合分、概率模拟、买卖条件核查。\n"
+        "11. 量化资金面：quant_activity 结论，明确写出量化主导/活跃/参与/偏少及交易含义。\n"
+        "12. 风险面：VaR/CVaR/Kelly/止损止盈/风险收益比。\n"
+        "13. 综合决策（短线×长线3×3矩阵）：档位、矩阵决策、仓位比例、止损策略、持仓行为。\n"
+        "14. 操作建议：入场区间、止损位、目标位、仓位建议、持有周期、失效条件。\n"
+        "15. 支持理由 / 反对理由：分别单列。\n"
         "选股结果默认按以下区块顺序输出：\n"
-        "1. 顶部市场结论。\n"
-        "2. 推荐名单表格。\n"
-        "3. 每只股票的小卡片：新闻面、财报面、估值面、技术面、量化资金面、风险面、操作建议。\n\n"
+        "1. 市场环境 + 北向资金总结论。\n"
+        "2. 推荐名单仪表盘表格。\n"
+        "3. 每只股票深度卡片：新闻面、公告/财报面、估值面(含PEG/杜邦)、负债健康度、资金面、K线技术面、量化诊断、风险面、操作建议。\n\n"
 
+        "【五面体系架构 — 短线 vs 长线路由】\n"
+        "full_stock_analysis 和 full_stock_selection 内部按五面体系执行：\n"
+        "  环境层(A): market_news + northbound_flow → 大盘评级 H/M/L\n"
+        "  催化剂面: 个股新闻 + 公告 + 财报分析 (短线+长线共用)\n"
+        "  短线路径: 技术面(25%) + 资金面(30%+10%) + 量化诊断(10%) + 催化剂(25%) → 短线评分卡(0~100)\n"
+        "  长线路径: 基本面(财务质量30%+估值25%+负债商誉20%+成长15%+分红治理10%) + 催化剂(5%降权) → 长线评分卡(0~100)\n"
+        "  风控面: VaR/Kelly/ATR止损 → 仓位建议 (独立约束，不参与加权)\n"
+        "  评分卡: 加权总分 → 环境修正(L市场短线×0.7) → 一票否决 → 等级(A+/A/B+/B/C/D) → 仓位建议\n\n"
+        "一票否决规则（代码硬编码，触发后自动降分）：\n"
+        "  · RSI>85超买 → 技术面≤3\n"
+        "  · 均线空头排列 → 技术面≤3\n"
+        "  · 量化诊断分<-40 → 整体惩罚\n"
+        "  · 连续3日主力净流出+融资余额下降 → 整体×0.7\n"
+        "  · 融券余额快速放大 → 融资融券维度=0\n"
+        "  · 利空公告当日 → 催化剂≤1\n"
+        "  · 监管问询函 → 整体×0.8\n"
+        "  · ROE<8% → 财务质量≤3\n"
+        "  · PEG>2.0 → 高估警告\n"
+        "  · 商誉/净资产>50% → 负债商誉≤2\n"
+        "  · 资金占用/实控人变更 → 分红治理=0\n"
+        "  · Kelly仓位≤0（负期望）→ 仓位建议=0\n"
+        "  · VaR(95%)>8% → 极端波动警告\n\n"
+        "【3×3 综合决策矩阵 — 短线进场 × 长线安全垫】\n"
+        "full_stock_analysis 和 full_stock_selection 在短线+长线评分卡之后，会自动计算综合决策：\n"
+        "  短线强度: strong(≥75) / medium(65~74) / weak(<65)\n"
+        "  长线档位: A档(≥75,优质托底) / B档(55~74,一般托底) / C档(<55,无托底)\n"
+        "  3×3矩阵决策:\n"
+        "    strong+A → 全仓进攻    strong+B → 主仓进场    strong+C → 轻仓试探\n"
+        "    medium+A → 半仓布局    medium+B → 分批低吸    medium+C → 观望为主\n"
+        "    weak+A   → 底仓防守    weak+B   → 回避        weak+C   → 空仓回避\n"
+        "  仓位 = Kelly × 档位系数(A=1.0, B=0.6, C=0.3)\n"
+        "  止损:\n"
+        "    A档: ATR×1.5动态止损（无ATR时回退-8%）\n"
+        "    B档: 固定-5%\n"
+        "    C档: 固定-3%\n"
+        "  持仓行为:\n"
+        "    A档被套: 可补仓摊低, 等待反转    A档盈利: 让利润奔跑    A档逢低: 越跌越买\n"
+        "    B档被套: 止损后观望, 不补仓      B档盈利: 分批止盈      B档逢低: 谨慎低吸\n"
+        "    C档被套: 立即止损, 严格执行      C档盈利: 见好就收      C档逢低: 不抄底\n"
+        "  仅短线分析（无长线评分卡）时，按C档规则管理。\n\n"
+
+        "【analysis_mode 参数用法】\n"
+        "  analysis_mode='full'  → 短线+长线全跑（默认）\n"
+        "  analysis_mode='short' → 仅短线路径（技术面+资金面+催化剂面+风控面）\n"
+        "  analysis_mode='long'  → 仅长线路径（基本面+催化剂面+风控面）\n"
+        "  用户问'短线机会'/'今天能不能追' → 建议传 analysis_mode='short'\n"
+        "  用户问'长线价值'/'值不值得长期持有' → 建议传 analysis_mode='long'\n\n"
         "【单股分析标准流程】\n"
-        "用户问'这只股票能不能买/值不值得看/帮我分析'时，按下面顺序：\n"
-        "优先直接调用 full_stock_analysis；只有用户明确要求拆步骤时，才手工逐个工具展开。\n"
+        "用户问'这只股票能不能买/值不值得看/帮我分析'时：\n"
+        "优先直接调用 full_stock_analysis（内部自动执行五面分析+评分卡+风控）。\n"
+        "只有用户明确要求拆步骤时，才手工逐个工具展开：\n"
+        "Step 0. resolve_stock → 标准化代码+名称\n"
+        "Step 1. full_stock_analysis(analysis_mode='full') → 环境层+五面分析+评分卡+风控\n"
+        "Step 2. 根据评分卡等级和仓位建议输出最终结论\n\n"
+        "手工展开模式（仅用户要求时）：\n"
         "Step 0. resolve_stock\n"
-        "        若用户给的是股票名称、简称或名称+代码混合输入，先解析成标准 code + name；若存在歧义，先指出再继续。\n"
-        "Step 1. market_news\n"
-        "        先判断当前市场是否允许进攻，给出市场风险偏好与 news_sentiment 基线。\n"
-        "Step 2. stock_news\n"
-        "        补充公司/行业相关新闻、情绪方向和潜在催化，不要只看大盘新闻。\n"
-        "Step 3. stock_announcements\n"
-        "        检查公告、财报、业绩预告、监管事项、回购减持等事件。\n"
-        "Step 4. earnings_analysis\n"
-        "        仅当 Step 3 命中财报/业绩类公告时必须调用；根据结果修正 news_sentiment。\n"
-        "Step 5. financial_data\n"
-        "        查看 PE/PB/ROE/毛利率/净利率/市值等估值和财务质量因素。\n"
-        "Step 6. realtime_quote + kline_data\n"
-        "        确认当前价格位置、趋势、动量、支撑阻力、技术结构。\n"
-        "Step 7. quant_activity\n"
-        "        交易时段内分析量化资金参与度；非交易时段可跳过，但要说明。\n"
-        "Step 8. stock_diagnosis\n"
-        "        使用前面得到的 news_sentiment 和上下文做最终量化诊断。\n"
-        "Step 9. risk_assessment\n"
-        "        给出VaR/CVaR/Kelly/ATR止损止盈/仓位风险。\n"
-        "Step 10. 最终结论\n"
-        "        必须综合以下维度后输出：市场环境、新闻面、公告事件、财报质量、估值、技术趋势、量化资金、风险收益比、仓位建议。\n\n"
+        "Step 1. market_news + northbound_flow → 环境基线\n"
+        "Step 2. stock_news + stock_announcements → 催化剂面\n"
+        "Step 3. kline_data + stock_diagnosis + moneyflow → 技术面+资金面 (短线)\n"
+        "Step 4. financial_data + valuation_quality + balance_sheet + dividend_history → 基本面 (长线)\n"
+        "Step 5. risk_assessment → 风控面\n"
+        "Step 6. 综合结论\n\n"
 
         "【单股输出要求】\n"
         "最终回答必须明确包含：\n"
@@ -137,44 +239,55 @@ mcp = FastMCP(
         "3. 市场环境结论\n"
         "4. 新闻面/事件面结论\n"
         "5. 财报面结论（若有）\n"
-        "6. 估值面结论\n"
-        "7. 技术面结论\n"
-        "8. 量化资金结论（必须明确写出：量化主导 / 活跃 / 参与 / 偏少，以及对操作的含义）\n"
-        "9. 如工具可用且场景合适，补充图表或说明为何未出图\n"
-        "10. 入场区间、止损位、目标位、仓位建议、持有周期\n"
-        "11. 支持理由与反对理由\n"
-        "12. 失效条件\n\n"
+        "6. 估值面结论（含PEG、杜邦ROE质量评估）\n"
+        "7. 资产负债健康度（商誉占比、负债率）\n"
+        "8. 主力资金面（moneyflow近5日方向及信号）\n"
+        "9. 技术面结论（含KDJ信号、识别到的K线形态、K线数据趋势）\n"
+        "10. 量化资金结论（必须明确写出：量化主导 / 活跃 / 参与 / 偏少，以及对操作的含义）\n"
+        "11. 北向资金结论（近5日趋势、对入场时机的影响）\n"
+        "12. 如工具可用且场景合适，补充图表或说明为何未出图\n"
+        "13. 综合决策（3×3矩阵）：长线档位(A/B/C)、矩阵决策、仓位比例、止损策略、持仓行为规则\n"
+        "14. 入场区间、止损位、目标位、仓位建议、持有周期\n"
+        "15. 支持理由与反对理由\n"
+        "16. 失效条件\n\n"
 
         "【选股标准流程】\n"
-        "用户问'有哪些股票值得买/帮我选几只/找最适合入场的票'时，按下面顺序：\n"
-        "Step 0. resolve_stock\n"
-        "        若用户指定了行业龙头、公司名称、已有自选股等名称输入，先解析为标准股票代码；若只是全市场选股，可跳过。\n"
-        "Step 1. market_news\n"
-        "        先判断今天/当前阶段属于 risk_on、neutral 还是 risk_off。\n"
-        "Step 2. stock_screener\n"
-        "        运行筛选器，形成候选池。必要时可分别跑 value、momentum、oversold、potential 四种策略并合并去重。\n"
-        "Step 3. 候选复核\n"
-        "        对前排候选逐只调用 stock_news、stock_announcements；若命中财报则必调 earnings_analysis。\n"
-        "Step 4. 估值与技术复核\n"
-        "        对前排候选逐只调用 financial_data、kline_data、stock_diagnosis；如适合展示图表，可补 kline_chart。\n"
-        "Step 5. 量化资金与风险复核\n"
-        "        交易时段内优先补 quant_activity，并调用 risk_assessment。\n"
-        "Step 6. 综合排序\n"
-        "        结合市场环境、新闻面、财报面、估值面、技术面、量化资金、风险面后，输出最终推荐名单。\n\n"
+        "以下任何情况，都必须直接调用 full_stock_selection，不得手动拆步骤：\n"
+        "  · 用户问'帮我找股票'、'有什么可以买的'、'找几只值得买的票'\n"
+        "  · 用户问'适合明天买的股票'、'今天/明天有什么机会'、'帮我选几只'\n"
+        "  · 用户问'有哪些值得关注'、'扫一下市场'、'全市场扫描'\n"
+        "  · 用户给出选股策略（价值/动量/超跌/潜力），要求给出候选名单\n"
+        "  · 任何涉及'从全市场筛选'的选股需求，无论用户如何表述\n\n"
+        "full_stock_selection 已内置完整两阶段架构：\n"
+        "  第一阶段（0次网络API）：本地DB→历史评分→技术过滤→7维量化扫描→质量阈值\n"
+        "  市场级（循环外1次）：market_news + northbound_flow（北向资金修正情绪基线）\n"
+        "  第二阶段（每只候选股全维度实时分析，与full_stock_analysis一致）：\n"
+        "    实时报价 → 新闻面 → 公告面 → 财报（条件触发）→ 财务数据\n"
+        "    → PEG+杜邦 → 负债+商誉 → 分红（价值策略）→ 主力资金\n"
+        "    → 融资融券（可选）→ K线技术指标 → 量化诊断 → 量化活跃度 → 风险评估\n\n"
+        "调用示例：\n"
+        "  full_stock_selection()                                        # 推荐！auto模式，四策略综合，复核所有候选\n"
+        "  full_stock_selection(strategy='auto', quality_threshold=8)    # auto模式+提高质量门槛（减少候选数）\n"
+        "  full_stock_selection(strategy='value')                        # 仅价值策略\n"
+        "  full_stock_selection(strategy='oversold', quality_threshold=2) # 超跌策略，放宽质量门槛\n"
+        "  ⚠️  用户未指定策略时，默认用 auto 模式（四策略综合），覆盖面最广。\n"
+        "  ⚠️  review_top_n 保持默认0（=全部复核），不要随意限制。候选股过多时通过提高 quality_threshold 控制。\n\n"
+        "⚠️  stock_screener 是底层工具，只在用户明确要求'只做技术面粗筛、不需要新闻/财务/资金分析'时才单独调用。\n"
+        "    普通选股请求一律使用 full_stock_selection，不要用 stock_screener 代替。\n\n"
 
         "【选股输出要求】\n"
         "不要只给股票名单。每只候选至少要说明：\n"
-        "1. 为什么入选\n"
-        "2. 主要风险点\n"
-        "3. 量化资金是否活跃，以及这对追涨/低吸/分批下单意味着什么\n"
-        "4. 当前是否适合买入，还是只适合观察\n"
-        "5. 入场区间、止损位、目标位、仓位建议\n\n"
+        "1. 综合决策：3×3矩阵结果（如'strong+A→全仓进攻'）、长线档位、仓位比例\n"
+        "2. 为什么入选（短线评分+长线评分的关键驱动因子）\n"
+        "3. 主要风险点\n"
+        "4. 量化资金是否活跃，以及这对追涨/低吸/分批下单意味着什么\n"
+        "5. 当前是否适合买入，还是只适合观察\n"
+        "6. 入场区间、止损位（注明止损规则来源：ATR/固定比例）、目标位\n"
+        "7. 持仓建议：被套/盈利/逢低的操作策略（按档位）\n\n"
 
         "【决策原则】\n"
         "市场环境决定能不能做，财报与新闻决定有没有逻辑，技术与量化资金决定现在能不能进，风险评估决定该不该下手以及仓位大小。\n"
         "如果任何一层明显不成立，默认降级为观望。\n\n"
-
-        "免责声明：所有分析仅用于量化研究与流程辅助，不构成投资建议。"
     ),
 )
 
@@ -318,40 +431,51 @@ def resolve_stock(query: str, limit: int = 10) -> str:
 @mcp.tool()
 def full_stock_analysis(
     stock_query: str,
+    analysis_mode: str = "full",
     analysis_days: int = 250,
     monte_carlo_days: int = 20,
     include_quant_activity: bool = True,
     include_market_news: bool = True,
+    include_northbound: bool = True,
+    include_moneyflow: bool = True,
+    include_valuation_quality: bool = True,
+    include_balance_sheet: bool = True,
+    include_margin_trading: bool = False,
+    include_dividend_history: bool = False,
 ) -> str:
     """
-    Run the full single-stock analysis workflow in one call.
+    Run the complete single-stock analysis workflow in one call — all dimensions.
+
+    Architecture: Module A → B1 (short) + B2 (long) → C (scorecard) → D (risk)
 
     This tool is the preferred entry point when the user asks:
-    - "分析这只股票"
-    - "这只股票能不能买"
-    - "帮我看看某只票"
+    - "分析这只股票" / "这只股票能不能买" / "帮我看看某只票"
 
-    Workflow:
-      resolve_stock -> market_news -> stock_announcements -> earnings_analysis(if needed)
-      -> financial_data -> stock_diagnosis -> quant_activity(optional) -> risk_assessment
+    Modular workflow (对应架构图):
+      模块 A  环境感知层（每次必跑）: market_news + northbound_flow → 大盘评级 H/M/L
+      模块 B1 短线分析: stock_news → moneyflow/margin → kline → diagnosis → quant_activity
+      模块 B2 长线分析: financial_data → valuation_quality → balance_sheet → earnings → dividend
+      模块 C  综合评分卡: 短线5维(0-100) + 长线6维(0-100) + 一票否决 + 亮点/风险
+      模块 D  风控参数: risk_assessment → 止损/止盈/Kelly/VaR
 
     Parameters
     ----------
-    stock_query : str
-        Stock code or stock name.
-    analysis_days : int
-        Historical days for diagnosis/risk analysis.
-    monte_carlo_days : int
-        Forward days for Monte Carlo diagnosis.
-    include_quant_activity : bool
-        Whether to include quant activity analysis.
-    include_market_news : bool
-        Whether to include market news baseline.
+    stock_query          : str   股票代码或名称
+    analysis_mode        : str   分析模式: "full" (短线+长线全跑) / "short" (仅短线) / "long" (仅长线)
+    analysis_days        : int   诊断/风险分析的历史天数（默认250~1年）
+    monte_carlo_days     : int   蒙特卡洛模拟未来天数（默认20交易日）
+    include_quant_activity    : bool  是否调用量化活跃度（交易时段有效，默认True）
+    include_market_news       : bool  是否调用市场新闻基线（默认True）
+    include_northbound        : bool  是否调用北向资金（默认True）
+    include_moneyflow         : bool  是否调用主力资金流向（默认True）
+    include_valuation_quality : bool  是否调用PEG+杜邦分析（默认True）
+    include_balance_sheet     : bool  是否调用负债率+商誉预警（默认True）
+    include_margin_trading    : bool  是否调用融资融券余额（默认False，两融标的时开启）
+    include_dividend_history  : bool  是否调用分红历史（默认False，价值型策略时开启）
 
     Returns
     -------
-    A fully assembled stock research report including market/news, announcements,
-    earnings, valuation, quant diagnosis, quant-fund participation and risk review.
+    完整的单股研究报告，包含环境评级、短线/长线分析、评分卡、风控参数。
     """
     resolved = _resolve_stock_unique(stock_query)
     rows = resolved["rows"]
@@ -374,91 +498,674 @@ def full_stock_analysis(
 
     stock_code = resolved["code"]
     stock_name = resolved["name"]
+    run_short = analysis_mode in ("full", "short")
+    run_long = analysis_mode in ("full", "long")
 
-    market_report = market_news() if include_market_news else "Skipped market_news by request."
-    stock_news_report = stock_news(stock_query=stock_query, max_items=8)
-    ann_report = stock_announcements(stock_code)
+    # ══════════════════════════════════════════════════
+    # 环境层 A — 市场评级 H/M/L（每次必跑）
+    # ══════════════════════════════════════════════════
+    env = mod_a.assess_environment(
+        include_market_quote=include_market_news,
+        include_news=include_market_news,
+        include_northbound=include_northbound,
+    )
 
-    earnings_report = None
-    earnings_hit_keywords = ("年报", "半年报", "季报", "一季报", "三季报", "业绩预告", "业绩快报", "业绩修正")
-    if any(keyword in ann_report for keyword in earnings_hit_keywords):
-        earnings_report = earnings_analysis(stock_code)
+    # ══════════════════════════════════════════════════
+    # 各面分析 — 按 analysis_mode 选路径
+    # ══════════════════════════════════════════════════
 
-    market_sentiment = 0.0
-    stock_sentiment = 0.0
-    earnings_sentiment = 0.0
-    market_match = re.search(r"综合建议 news_sentiment 参考值：([+-]?\d+(?:\.\d+)?)", market_report)
-    if market_match:
-        market_sentiment = float(market_match.group(1))
-    stock_match = re.search(r"个股新闻情绪微调：\s*([+-]?\d+(?:\.\d+)?)", stock_news_report)
-    if stock_match:
-        stock_sentiment = float(stock_match.group(1))
-    if earnings_report:
-        if "news_sentiment 建议在技术分析基础上 +0.2 ~ +0.3" in earnings_report:
-            earnings_sentiment = 0.25
-        elif "news_sentiment 建议在技术分析基础上 -0.2 ~ -0.3" in earnings_report:
-            earnings_sentiment = -0.25
-    combined_news_sentiment = max(-1.0, min(1.0, market_sentiment + stock_sentiment + earnings_sentiment))
+    # 催化剂面（短线+长线共用）
+    catalyst_result = CatalystFace.analyze(
+        stock_code=stock_code,
+        stock_name=stock_name,
+    )
 
-    financial_report = financial_data(stock_code)
-    diagnosis_report = stock_diagnosis(
+    # 风控面（短线+长线共用）
+    risk_result = RiskFace.analyze(
         stock_code=stock_code,
         analysis_days=analysis_days,
-        news_sentiment=combined_news_sentiment,
-        monte_carlo_days=monte_carlo_days,
     )
-    quant_report = quant_activity(stock_code) if include_quant_activity else "Skipped quant_activity by request."
-    risk_report = risk_assessment(stock_code=stock_code, analysis_days=analysis_days)
 
+    # ── 短线路径: 技术面 + 资金面 + 催化剂面 + 风控面 ──
+    tech_result = None
+    capital_result = None
+    short_scorecard = None
+    if run_short:
+        tech_result = TechnicalFace.analyze(
+            stock_code=stock_code,
+            analysis_days=analysis_days,
+            news_sentiment=env["combined_sentiment"],
+            monte_carlo_days=monte_carlo_days,
+        )
+        capital_result = CapitalFace.analyze(
+            stock_code=stock_code,
+            include_margin=include_margin_trading,
+            include_quant=include_quant_activity,
+            northbound_adj=env["northbound_adj"],
+        )
+        short_scorecard = Scorecard.compute_short(
+            tech_signals=tech_result.signals,
+            capital_signals=capital_result.signals,
+            catalyst_signals=catalyst_result.signals,
+            risk_signals=risk_result.signals,
+            market_rating=env["market_rating"],
+        )
+
+    # ── 长线路径: 基本面 + 催化剂面(降权) + 风控面 ──
+    fundamental_result = None
+    long_scorecard = None
+    if run_long:
+        fundamental_result = FundamentalFace.analyze(
+            stock_code=stock_code,
+            include_valuation=include_valuation_quality,
+            include_balance=include_balance_sheet,
+            include_dividend=include_dividend_history,
+        )
+        long_scorecard = Scorecard.compute_long(
+            fundamental_signals=fundamental_result.signals,
+            catalyst_signals=catalyst_result.signals,
+            risk_signals=risk_result.signals,
+            market_rating=env["market_rating"],
+        )
+
+    # ══════════════════════════════════════════════════
+    # 组装完整报告
+    # ══════════════════════════════════════════════════
     sections = [
         f"Full Stock Analysis  {stock_name} ({stock_code})",
+        f"分析模式: {analysis_mode.upper()}",
         "=" * 72,
         "",
-        "[1] Stock Resolution",
+        "[1] 股票解析",
         resolve_stock(stock_query, limit=10),
-        "",
-        "[2] Market News / Macro Context",
-        market_report,
-        "",
-        "[3] Stock-specific News",
-        stock_news_report,
-        "",
-        "[4] Announcements / Event Review",
-        ann_report,
     ]
 
-    if earnings_report:
+    # 环境层 A
+    sections.extend(["", mod_a.format_environment_summary(env)])
+    sections.extend(["", "[A-1] 市场环境详情", env["summary_text"]])
+    news_rpt = env.get("news_report", "")
+    if news_rpt:
+        sections.extend(["", "[A-1.5] 市场新闻面", news_rpt])
+    sections.extend(["", "[A-2] 北向资金详情", env["northbound_report"]])
+
+    # 催化剂面（共用）
+    sections.extend([
+        "", "=" * 60,
+        "【催化剂/消息面】",
+        "=" * 60,
+        catalyst_result.stock_news_report,
+        "",
+        catalyst_result.announcements_report,
+    ])
+    if catalyst_result.earnings_report:
+        sections.extend(["", catalyst_result.earnings_report])
+
+    # 短线路径
+    if short_scorecard:
         sections.extend([
-            "",
-            "[5] Earnings Analysis",
-            earnings_report,
+            "", "=" * 60,
+            "【短线分析】技术面 + 资金面",
+            "=" * 60,
+        ])
+        # 技术面
+        sections.extend([
+            "", "▌ 技术面",
+            tech_result.kline_report,
+            "", tech_result.diagnosis_report,
+        ])
+        # 资金面
+        sections.extend([
+            "", "▌ 资金面",
+            capital_result.moneyflow_report,
+        ])
+        if capital_result.margin_report:
+            sections.extend(["", capital_result.margin_report])
+        if capital_result.quant_report:
+            sections.extend(["", capital_result.quant_report])
+        # 短线评分卡
+        sections.extend(["", Scorecard.format_report(short_scorecard)])
+
+    # 长线路径
+    if long_scorecard:
+        sections.extend([
+            "", "=" * 60,
+            "【长线分析】基本面",
+            "=" * 60,
+        ])
+        sections.extend([
+            "", "▌ 财务与估值",
+            fundamental_result.financial_report,
+            "", fundamental_result.valuation_report,
+        ])
+        if fundamental_result.balance_report:
+            sections.extend(["", "▌ 资产负债", fundamental_result.balance_report])
+        if fundamental_result.dividend_report:
+            sections.extend(["", "▌ 分红历史", fundamental_result.dividend_report])
+        # 长线评分卡
+        sections.extend(["", Scorecard.format_report(long_scorecard)])
+
+    # 风控面
+    sections.extend([
+        "", "=" * 60,
+        "【风控面】",
+        "=" * 60,
+        risk_result.risk_report,
+    ])
+
+    # ── 综合决策（短线×长线 3×3 矩阵）──
+    if short_scorecard and long_scorecard:
+        try:
+            # 尝试从技术面获取最新收盘价
+            rt_price = 0.0
+            try:
+                rt = df_mod.get_realtime([stock_code])
+                if rt is not None and not rt.empty:
+                    rt_price = float(rt.iloc[0].get("current", 0) or 0)
+            except Exception:
+                pass
+            combined = compute_combined_decision(
+                short_scorecard, long_scorecard,
+                risk_signals=risk_result.signals,
+                current_price=rt_price,
+            )
+            sections.extend([
+                "", "=" * 60,
+                "【综合决策】短线进场 × 长线安全垫",
+                "=" * 60,
+                format_combined_decision(combined),
+            ])
+        except Exception:
+            pass  # 不影响主报告
+    elif short_scorecard:
+        sections.extend([
+            "", "─" * 50,
+            "  ⚠️ 仅短线分析，无长线安全垫评级",
+            "  建议按 C 档（无托底）规则管理仓位和止损",
+            "─" * 50,
         ])
 
-    sections.extend([
-        "",
-        "[6] Combined News Sentiment",
-        (
-            f"Market {market_sentiment:+.2f} + Stock {stock_sentiment:+.2f}"
-            f" + Earnings {earnings_sentiment:+.2f} = {combined_news_sentiment:+.2f}"
-        ),
-        "",
-        "[7] Financial Data",
-        financial_report,
-        "",
-        "[8] Stock Diagnosis",
-        diagnosis_report,
-        "",
-        "[9] Quant Activity",
-        quant_report,
-        "",
-        "[10] Risk Assessment",
-        risk_report,
-    ])
     return "\n".join(sections)
 
 
 # =====================================================
-# Tool 3: Real-time Quote
+# Tool 3: Full Stock Selection
+# =====================================================
+
+@mcp.tool()
+def full_stock_selection(
+    strategy: str = "auto",
+    top_n: int = 10,
+    review_top_n: int = 0,
+    quality_threshold: float = 5.0,
+    analysis_days: int = 250,
+    monte_carlo_days: int = 20,
+    include_quant_activity: bool = False,
+    include_market_news: bool = True,
+    include_margin_trading: bool = False,
+) -> str:
+    """
+    ★★★ 选股唯一入口 ★★★
+    用户要求选股、找股票、扫描市场、给推荐名单时，必须调用本工具。
+    不要用 stock_screener 代替——stock_screener 只是底层粗筛，不含北向资金/新闻面/财务分析/风控。
+
+    A股全流程选股一体化工具（两阶段架构：本地DB预筛 → 实时深度复核）。
+    内置: 环境感知(market_news+northbound_flow) → 本地DB粗筛 → 五面深度分析 → 评分卡 → 风控
+
+    ══════════════════════════════════════════════════
+    两阶段架构:
+    ──────────────────────────────────────────────────
+    第一阶段（本地DB筛选，0次网络API）:
+      → 从本地 SQLite 读取全量 ~5000 只股票快照
+      → 历史横截面评分（stock_history：趋势/回撤/量能）
+      → 基础过滤（PE/PB/市值/换手率，按策略）
+      → 7维量化深度扫描（本地kline，0次网络）
+      → 质量阈值过滤（entry_quality_score ≥ quality_threshold）
+      → 产出：质量合格候选股列表（通常10~25只）
+
+    第二阶段（实时深度复核，每只股票全维度分析，与full_stock_analysis一致）:
+      → 实时报价（realtime_quote）
+      → 新闻面（stock_news）
+      → 公告面（stock_announcements）
+      → 财报分析（earnings_analysis，条件触发）
+      → 财务数据（financial_data）
+      → PEG + 杜邦分析（valuation_quality）
+      → 资产负债 + 商誉预警（balance_sheet）
+      → 分红历史（dividend_history，价值策略）
+      → 主力资金流向（moneyflow）
+      → 融资融券（margin_trading，可选）
+      → K线技术指标（kline_data）
+      → 量化诊断（stock_diagnosis，拉取最新实时K线）
+      → 量化活跃度（quant_activity，可选）
+      → 风险评估（risk_assessment）
+    ══════════════════════════════════════════════════
+
+    Parameters
+    ----------
+    strategy : str
+        auto (默认，推荐) — 自动运行 value+momentum+oversold+potential 四策略，合并去重，综合排序
+        value / momentum / oversold / potential / custom — 单策略模式
+    top_n : int
+        第一阶段筛选器内部返回候选数（建议 ≤20，影响候选池宽度）
+    review_top_n : int
+        第二阶段深度复核只数，默认0=分析所有通过质量门槛的候选股（并行执行，安全上限15只）
+        ⚠️ 建议保持默认0，让系统自动决定。设为正数会限制深度复核数量，仪表盘也只展示复核过的股票。
+        仅在用户明确要求"只看前N只"时才设正数
+    quality_threshold : float
+        第一阶段质量门槛（entry_quality_score，默认5.0）
+        牛市可调高到10~15，熊市/震荡市可调低到0~3
+    analysis_days : int
+        诊断用历史天数
+    monte_carlo_days : int
+        蒙特卡洛模拟天数
+    include_quant_activity : bool
+        是否调用量化活跃度（仅交易时段有意义，默认False）
+    include_market_news : bool
+        是否调用市场新闻基线
+
+    Returns
+    -------
+    四段式选股报告: 市场环境 + 候选池摘要 + 仪表盘 + 深度复核
+
+    ⚠️ 展示要求（必须遵守）:
+    本工具返回的所有深度复核股票都必须完整展示给用户，不允许只挑几只做精选摘要。
+    每只候选股都应列出: 股票名称/代码、当前价格与涨跌幅、短线/长线评分、综合决策、
+    建议仓位、蒙特卡洛上涨概率、核心风险点、操作建议。
+    用户花时间等待全量分析，就是为了看到完整结果，而不是被二次筛选后只看3只。
+    """
+    top_n        = min(int(top_n), 30)
+    review_top_n = int(review_top_n)
+    if review_top_n > 0:
+        review_top_n = min(review_top_n, 20)   # 手动指定时上限20
+
+    # ════ 模块 A: 环境感知层 ════
+    env = mod_a.assess_environment(
+        include_market_quote=include_market_news,
+        include_news=include_market_news,
+        include_northbound=True,
+    )
+    market_report = env["summary_text"]
+    market_sentiment = env["combined_sentiment"]
+    northbound_report = env["northbound_report"]
+    northbound_adj = env["northbound_adj"]
+    news_report = env.get("news_report", "")
+
+    # ════ 第一阶段: 纯本地DB筛选，0次外部API ════
+    # screen_stocks 内部: SQLite读取 → 历史评分 → 快速过滤 → 本地kline量化扫描 → 质量阈值
+
+    AUTO_STRATEGIES = ["value", "momentum", "oversold", "potential"]
+    run_strategies = AUTO_STRATEGIES if strategy == "auto" else [strategy]
+    strategy_label = "AUTO (value+momentum+oversold+potential)" if strategy == "auto" else strategy.upper()
+
+    all_picks = {}  # code → best result dict (按 EQS 去重取最高)
+    total_market = 0
+    total_stage1 = 0
+    total_stage2 = 0
+    total_hist = 0
+    strategy_stats = []  # 每个策略的产出统计
+
+    for strat in run_strategies:
+        sr = sc.screen_stocks(
+            strategy=strat,
+            top_n=top_n,
+            deep_scan_enabled=True,
+            stage1_limit=min(max(top_n * 4, 60), 80),
+            quality_threshold=quality_threshold,
+            max_candidates=max(review_top_n + 5, 25) if review_top_n > 0 else 25,
+        )
+        if "error" in sr:
+            strategy_stats.append(f"  {strat}: 失败 — {sr['error']}")
+            continue
+        results = sr.get("results", [])
+        total_market = max(total_market, sr.get("total_market", 0))
+        total_stage1 += sr.get("stage1_count", 0)
+        total_stage2 += sr.get("stage2_count", 0)
+        total_hist = max(total_hist, sr.get("history_profile_count", 0))
+        strategy_stats.append(f"  {strat}: {len(results)} 只通过质量门槛")
+        for r in results:
+            code = r["code"]
+            # 记录来源策略
+            r["source_strategy"] = strat
+            if code not in all_picks or (r.get("entry_quality_score", 0) or 0) > (all_picks[code].get("entry_quality_score", 0) or 0):
+                all_picks[code] = r
+
+    # 合并去重后按 EQS 降序排列
+    picks = sorted(all_picks.values(), key=lambda x: x.get("entry_quality_score", 0) or 0, reverse=True)
+    qualified_count = len(picks)
+
+    if not picks and strategy != "auto":
+        # 单策略失败时直接返回错误
+        screen_result = sc.screen_stocks(strategy=strategy, top_n=top_n, deep_scan_enabled=True)
+        if "error" in screen_result:
+            return f"ERROR: {screen_result['error']}"
+
+    # ════ 批量拉取实时行情，覆盖本地DB旧价格 ════
+    if picks:
+        try:
+            rt_codes = [p["code"] for p in picks]
+            rt_df = df_mod.get_realtime(rt_codes)
+            if rt_df is not None and not rt_df.empty:
+                rt_map = {}
+                for _, row in rt_df.iterrows():
+                    c = str(row.get("code", ""))
+                    cur = float(row.get("current", 0) or 0)
+                    if cur > 0:
+                        rt_map[c] = {
+                            "current": cur,
+                            "pct_chg": float(row.get("pct_chg", 0) or 0),
+                            "open":    float(row.get("open", 0) or 0),
+                            "high":    float(row.get("high", 0) or 0),
+                            "low":     float(row.get("low", 0) or 0),
+                            "volume":  float(row.get("volume", 0) or 0),
+                            "amount":  float(row.get("amount", 0) or 0),
+                        }
+                for p in picks:
+                    rt = rt_map.get(p["code"])
+                    if rt:
+                        p.update(rt)
+        except Exception:
+            pass  # 实时行情批量拉取失败，继续用本地DB数据
+
+    # 生成筛选摘要文本（在实时行情更新后生成，确保价格是最新的）
+    screen_report = sc._format_summary(
+        strategy_label,
+        total_market,
+        total_stage1,
+        total_stage2,
+        picks,
+        True,
+        history_profile_count=total_hist,
+        quality_threshold=quality_threshold,
+    )
+    # auto 模式追加各策略统计
+    if strategy == "auto" and strategy_stats:
+        screen_report += "\n\n各策略产出:\n" + "\n".join(strategy_stats)
+
+    if not picks:
+        return "\n".join([
+            f"Full Stock Selection — {strategy_label}",
+            "=" * 72,
+            "",
+            "【1】市场环境 / 宏观基线",
+            market_report,
+            "",
+            "【2】第一阶段筛选结果（本地DB，0次网络请求）",
+            screen_report,
+            "",
+            f"第一阶段未筛出符合质量阈值(≥{quality_threshold:.1f})的候选股。",
+            "建议: 降低 quality_threshold（如3.0），或更换策略（如 oversold / potential）",
+        ])
+
+    # ════ 精选门槛：从 EQS 候选池中筛出"最可能上涨"的股票 ════
+    # 用第一阶段已有的量化指标做硬过滤，减少无效深度复核
+    MAX_REVIEW = 15
+    pre_filter_count = len(picks)
+
+    if len(picks) > MAX_REVIEW:
+        # 精选条件（全部基于第一阶段本地数据，0网络开销）
+        refined = [p for p in picks if
+            (p.get("prob_up") or 0) >= 65          # 蒙特卡洛20日上涨概率 ≥ 65%
+            and (p.get("total_score") or 0) > 0    # 7维量化诊断看多
+            and (p.get("expected_return") or 0) > 0 # 期望收益为正
+        ]
+        # 如果精选后太少（<5只），放宽到只要求 prob_up >= 55%
+        if len(refined) < 5:
+            refined = [p for p in picks if (p.get("prob_up") or 0) >= 55]
+        # 如果精选后仍然太多，按 EQS 取前 MAX_REVIEW
+        if len(refined) > MAX_REVIEW:
+            refined = refined[:MAX_REVIEW]
+        # 如果精选后为空（极端情况），保留原始 picks 前 MAX_REVIEW
+        if not refined:
+            refined = picks[:MAX_REVIEW]
+
+        picks_for_review = refined
+    else:
+        picks_for_review = picks
+
+    actual_review = len(picks_for_review) if review_top_n <= 0 else max(1, min(review_top_n, len(picks_for_review)))
+    actual_review = min(actual_review, MAX_REVIEW)
+
+    # 精选统计（追加到 screen_report）
+    if pre_filter_count > len(picks_for_review):
+        screen_report += (
+            f"\n\n精选门槛: prob_up≥65% + total_score>0 + expected_return>0"
+            f"\n  EQS候选: {pre_filter_count} 只 → 精选后: {len(picks_for_review)} 只进入深度复核"
+        )
+
+    # ════ 第二阶段: 深度复核（所有候选股并行分析）════
+
+    # ── 辅助函数: 本地DB历史K线 + 实时补当天 ──
+    def _local_kline(code: str, days: int = 10, rt_row: dict = None) -> str:
+        """
+        从本地 stock_history 读取历史K线，如果DB缺当天数据则用 rt_row 补上。
+        rt_row: realtime quote dict {open, high, low, current, pct_chg, volume, amount}
+                传 None 时仅用本地数据（不发额外API）。
+        """
+        try:
+            import pandas as pd
+            df = sf.load_stock_history(code)
+            if df.empty:
+                return f"{code} 本地DB无K线数据"
+            df = df.sort_values("date")
+
+            today_str = datetime.today().strftime("%Y-%m-%d")
+            db_last = df.iloc[-1]["date"]
+            db_last_str = db_last.strftime("%Y-%m-%d") if hasattr(db_last, "strftime") else str(db_last)[:10]
+            source_tag = "local_db"
+
+            if db_last_str < today_str and rt_row is not None:
+                try:
+                    op = float(rt_row.get("open", 0))
+                    if op > 0:
+                        today_bar = pd.DataFrame([{
+                            "date": pd.Timestamp(today_str),
+                            "open": op,
+                            "high": float(rt_row["high"]),
+                            "low":  float(rt_row["low"]),
+                            "close": float(rt_row["current"]),
+                            "pct_chg": float(rt_row.get("pct_chg", 0)),
+                            "volume": float(rt_row.get("volume", 0)),
+                            "amount": float(rt_row.get("amount", 0)),
+                        }])
+                        df = pd.concat([df, today_bar], ignore_index=True)
+                        source_tag = "local_db+realtime"
+                except Exception:
+                    pass
+
+            df = df.tail(days).copy()
+            _fmt = lambda d: d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d)[:10]
+            lines_k = [
+                f"{code} ({code}) daily K-line   Total {len(df)} bars  [{source_tag}]",
+                f"   Range: {_fmt(df.iloc[0]['date'])} -> {_fmt(df.iloc[-1]['date'])}",
+                "-" * 70,
+            ]
+            show_cols = ["date", "open", "high", "low", "close", "pct_chg", "volume"]
+            disp = df[show_cols].copy()
+            disp["date"] = disp["date"].apply(_fmt)
+            lines_k.append(disp.to_string(index=False))
+            latest = df.iloc[-1]
+            lines_k.append("-" * 70)
+            lines_k.append(f"Latest Close: {latest['close']:.2f}  Change: {latest['pct_chg']:+.2f}%")
+            return "\n".join(lines_k)
+        except Exception as e:
+            return f"本地K线读取失败: {e}"
+
+    def _safe(fn, *a, label="", **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception as e:
+            return f"{label} 获取失败: {e}"
+
+    # ── 单只候选股全维度分析（面模块，在线程中执行）──
+    # K 线数据全部走本地 DB（local_only=True），盘前选股零 API 调用。
+    # 单股深度分析（full_stock_analysis）才走实时 API。
+    def _analyze_one(idx: int, item: dict) -> dict:
+        code = item["code"]
+        name = item["name"]
+
+        # 注: picks 已在第一阶段后批量更新过实时行情，item 中的 current/pct_chg 已是最新值
+
+        # ═ 催化剂面 ═
+        cat = CatalystFace.analyze(stock_code=code, stock_name=name, local_only=True)
+
+        # ═ 技术面 (短线) ═
+        tech = TechnicalFace.analyze(
+            stock_code=code,
+            analysis_days=analysis_days,
+            news_sentiment=env["combined_sentiment"],
+            monte_carlo_days=monte_carlo_days,
+            local_only=True,
+        )
+
+        # ═ 资金面 (短线) ═
+        cap = CapitalFace.analyze(
+            stock_code=code,
+            include_margin=include_margin_trading,
+            include_quant=include_quant_activity,
+            northbound_adj=env["northbound_adj"],
+        )
+
+        # ═ 基本面 (长线) ═
+        funda = FundamentalFace.analyze(
+            stock_code=code,
+            include_valuation=True,
+            include_balance=True,
+            include_dividend=strategy in ("value",),
+        )
+
+        # ═ 风控面 ═
+        risk = RiskFace.analyze(stock_code=code, analysis_days=analysis_days, local_only=True)
+
+        # ═ 评分卡 ═
+        sc_short = Scorecard.compute_short(
+            tech_signals=tech.signals,
+            capital_signals=cap.signals,
+            catalyst_signals=cat.signals,
+            risk_signals=risk.signals,
+            market_rating=env["market_rating"],
+        )
+        sc_long = Scorecard.compute_long(
+            fundamental_signals=funda.signals,
+            catalyst_signals=cat.signals,
+            risk_signals=risk.signals,
+            market_rating=env["market_rating"],
+        )
+
+        # ═ 综合决策（短线×长线 3×3 矩阵）═
+        rt_price = item.get("current", 0)
+        rt_price_f = float(rt_price) if isinstance(rt_price, (int, float)) else 0.0
+        combined = compute_combined_decision(
+            sc_short, sc_long,
+            risk_signals=risk.signals,
+            current_price=rt_price_f,
+        )
+
+        # 构建仪表盘行
+        rt_chg = item.get("pct_chg", "N/A")
+        short_s = sc_short.final_total
+        long_s = sc_long.final_total
+        tier_tag = combined.long_tier
+        action_tag = combined.matrix_action
+        if isinstance(rt_chg, float):
+            dash = (f"| {idx} | {name} ({code}) "
+                    f"| 短{short_s:.0f}/长{long_s:.0f}({tier_tag}档) "
+                    f"| {action_tag} "
+                    f"| {combined.position_pct:.0f}% "
+                    f"| {item.get('prob_up', 'N/A')} "
+                    f"| {rt_price} ({rt_chg:+.2f}%) |")
+        else:
+            dash = (f"| {idx} | {name} ({code}) "
+                    f"| 短{short_s:.0f}/长{long_s:.0f}({tier_tag}档) "
+                    f"| {action_tag} "
+                    f"| {combined.position_pct:.0f}% "
+                    f"| {item.get('prob_up', 'N/A')} "
+                    f"| {rt_price} |")
+
+        # 构建报告段落
+        sec = [
+            "",
+            f"【候选 {idx}】{name}（{code}）",
+            "-" * 72,
+            f"  实时价格: {rt_price}"
+            + (f" ({rt_chg:+.2f}%)" if isinstance(rt_chg, float) else ""),
+            f"  历史得分: {item.get('history_score', 0):+.1f}   "
+            f"Stage1: {item.get('stage1_score', 0):+.1f}   "
+            f"综合质量分(EQS): {item.get('entry_quality_score', 0):+.1f}",
+        ]
+        # 综合决策（最重要，放最前面）
+        sec.append(format_combined_decision(combined))
+        # 短线评分卡
+        sec.append(Scorecard.format_report(sc_short))
+        # 长线评分卡
+        sec.append(Scorecard.format_report(sc_long))
+        # 风控详情
+        sec.append(risk.risk_report)
+
+        return {"idx": idx, "dashboard": dash, "sections": sec,
+                "combined": combined}
+
+    # ── 所有候选股并行执行 ──
+    review_results = []
+    with ThreadPoolExecutor(max_workers=min(actual_review, 8)) as outer_pool:
+        futures = {
+            outer_pool.submit(_analyze_one, idx, item): idx
+            for idx, item in enumerate(picks_for_review[:actual_review], 1)
+        }
+        for fut in as_completed(futures):
+            try:
+                review_results.append(fut.result())
+            except Exception as e:
+                i = futures[fut]
+                review_results.append({
+                    "idx": i, "dashboard": f"| {i} | 分析失败: {e} |",
+                    "sections": [f"\n【候选 {i}】分析失败: {e}"],
+                })
+
+    # 按 idx 排序保持顺序
+    review_results.sort(key=lambda r: r["idx"])
+    review_sections = []
+    dashboard_rows  = []
+    for r in review_results:
+        dashboard_rows.append(r["dashboard"])
+        review_sections.extend(r["sections"])
+
+    api_summary = (
+        f"[API调用统计] 第一阶段: 0次（纯本地DB）  "
+        f"第二阶段: 对 {actual_review} 只候选股并行调用 10~14 次（全维度分析，K线从本地DB读取，上限{MAX_REVIEW}只）  "
+        f"第一阶段通过质量门槛({quality_threshold:.1f})的候选股: {qualified_count} 只"
+    )
+
+    lines = [
+        f"Full Stock Selection — {strategy_label} 策略",
+        "=" * 72,
+        api_summary,
+        "",
+        "【1】环境感知层",
+        market_report,
+        "",
+        "▌ 市场新闻面",
+        news_report if news_report else "  （未获取新闻）",
+        "",
+        "▌ 北向资金（沪深港通）" + (f"  情绪修正: {northbound_adj:+.2f}" if northbound_adj else ""),
+        northbound_report,
+        "",
+        "【2】第一阶段候选池（本地DB，0次网络请求）",
+        screen_report,
+        "",
+        "【3】深度复核仪表盘（前 {0} 只全维度分析）".format(actual_review),
+        "| # | 股票 | 短/长(档) | 决策 | 仓位 | P(上涨) | 实时价格 |",
+        "|---|---|---|---|---:|---:|---:|",
+    ]
+    lines.extend(dashboard_rows)
+    lines.extend([
+        "",
+        f"【4】第二阶段深度复核详情（前 {actual_review} 只）",
+    ])
+    lines.extend(review_sections)
+    return "\n".join(lines)
+
+
+# =====================================================
+# Tool 4: Real-time Quote
 # =====================================================
 
 @mcp.tool()
@@ -479,7 +1186,7 @@ def realtime_quote(stock_codes: str) -> str:
     """
     codes = [c.strip() for c in stock_codes.split(",") if c.strip()]
     try:
-        df = st.get_realtime(codes)
+        df = df_mod.get_realtime(codes)
     except Exception as e:
         return f"ERROR: Failed to fetch quotes: {e}"
 
@@ -533,7 +1240,7 @@ def kline_data(
         start_date = (datetime.today() - timedelta(days=recent_days)).strftime("%Y-%m-%d")
 
     try:
-        df = st.get_kline(
+        df = df_mod.get_kline(
             stock_code,
             period=period,
             start=start_date or None,
@@ -546,7 +1253,7 @@ def kline_data(
     name = df.attrs.get("name", stock_code)
 
     if with_indicators:
-        df = st.add_indicators(df)
+        df = df_mod.add_indicators(df)
 
     last = df.tail(20).copy()
     last["date"] = last["date"].dt.strftime("%Y-%m-%d")
@@ -605,7 +1312,7 @@ def financial_data(stock_code: str) -> str:
     ROE, gross margin, net margin, turnover rate, volume ratio, etc.
     """
     try:
-        d = st.get_financial(stock_code)
+        d = fin_mod.get_financial(stock_code)
     except Exception as e:
         return f"ERROR: Failed to fetch financial data: {e}"
 
@@ -645,64 +1352,6 @@ def financial_data(stock_code: str) -> str:
 
 
 # =====================================================
-# Tool 4: K-line Chart (generate image)
-# =====================================================
-
-@mcp.tool()
-def kline_chart(
-    stock_code: str,
-    period: str = "daily",
-    recent_days: int = 120,
-    indicator: str = "macd",
-    adjust: str = "qfq",
-) -> str:
-    """
-    Generate an A-share candlestick chart (dark theme, with MA lines, volume, indicator panel)
-    and save as PNG image.
-
-    Parameters
-    ----------
-    stock_code  : str  Stock code, e.g. "600519"
-    period      : str  K-line period: daily / weekly / monthly / 1m / 5m / 15m / 30m / 60m
-    recent_days : int  Show K-lines within the last N calendar days, default 120
-    indicator   : str  Bottom indicator panel: macd (default) / rsi / kdj / boll
-    adjust      : str  Adjustment: qfq (forward, default) / hfq / none
-
-    Returns
-    -------
-    File path of the saved chart, can be opened directly.
-    """
-    start = (datetime.today() - timedelta(days=recent_days)).strftime("%Y-%m-%d")
-
-    try:
-        df = st.get_kline(stock_code, period=period, start=start, adjust=adjust)
-    except Exception as e:
-        return f"ERROR: Failed to fetch K-line: {e}"
-
-    df = st.add_indicators(df)
-
-    out_dir = _HERE / "charts"
-    out_dir.mkdir(exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_path = str(out_dir / f"{stock_code}_{period}_{indicator}_{ts}.png")
-
-    try:
-        path = st.plot_kline(df, indicator=indicator, save_path=save_path)
-    except Exception as e:
-        return f"ERROR: Chart generation failed: {e}"
-
-    name = df.attrs.get("name", stock_code)
-    latest = df.iloc[-1]
-    return (
-        f"K-line chart generated\n"
-        f"   Stock: {name} ({stock_code})\n"
-        f"   Period: {period}   Indicator: {indicator.upper()}   Total {len(df)} bars\n"
-        f"   Latest Close: {latest['close']:.2f}   Change: {latest['pct_chg']:+.2f}%\n"
-        f"   File: {path}"
-    )
-
-
-# =====================================================
 # Tool 5: Batch Quote Overview
 # =====================================================
 
@@ -725,7 +1374,7 @@ def batch_quote(stock_list: str) -> str:
         return "ERROR: Please enter at least one stock code, separated by commas"
 
     try:
-        df = st.get_realtime(codes)
+        df = df_mod.get_realtime(codes)
     except Exception as e:
         return f"ERROR: Failed to fetch quotes: {e}"
 
@@ -802,7 +1451,7 @@ def stock_diagnosis(
 
     data_source = "online"
     try:
-        df = st.get_kline(stock_code, period="daily", start=start, adjust="qfq")
+        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="qfq")
     except Exception as e:
         try:
             df = sf.load_stock_history(stock_code)
@@ -942,7 +1591,7 @@ def strategy_backtest(
     start = (datetime.today() - timedelta(days=backtest_days)).strftime("%Y-%m-%d")
 
     try:
-        df = st.get_kline(stock_code, period="daily", start=start, adjust="qfq")
+        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="qfq")
     except Exception as e:
         return f"ERROR: Failed to fetch K-line data: {e}"
 
@@ -1001,7 +1650,7 @@ def risk_assessment(
     start = (datetime.today() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
     try:
-        df = st.get_kline(stock_code, period="daily", start=start, adjust="qfq")
+        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="qfq")
     except Exception as e:
         return f"ERROR: Failed to fetch K-line data: {e}"
 
@@ -1036,11 +1685,20 @@ def stock_screener(
     price_max: float = 0,
 ) -> str:
     """
-    Scan all ~5000 A-share stocks to find the most promising candidates.
+    ⚠️ 这是底层粗筛工具，不是选股入口！
+    普通选股请求请使用 full_stock_selection，它包含完整的五面分析+北向资金+深度复核。
+    只有用户明确要求"只看技术面粗筛、不需要新闻/财务/资金/风控分析"时才单独调用本工具。
 
-    Two-stage screening process:
-      Stage 1 (Fast): Fetch entire market from Eastmoney API, apply basic metric filters.
-      Stage 2 (Deep): Run full 7-dimension quant analysis + Monte Carlo on shortlisted stocks.
+    功能: 从本地SQLite扫描全市场约5000只A股，按技术面条件做初步粗筛。
+    本工具不包含: 北向资金、新闻面、财务分析、估值分析、资金面、风控评估等。
+
+    ★ API调用约束:
+      本工具全部从本地 SQLite 读取，0 次外部网络请求。
+
+    三阶段粗筛流程:
+      Stage 0 历史横截面评分  — 读 SQLite stock_history，0次网络
+      Stage 1 快速过滤        — 基于 stocks+fundamentals 内存操作，0次网络
+      Stage 2 深度量化扫描    — 读 SQLite kline 做7维技术分析+蒙特卡洛，0次网络
 
     Parameters
     ----------
@@ -1097,7 +1755,7 @@ def stock_screener(
             strategy=strategy,
             top_n=top_n,
             deep_scan_enabled=deep_scan,
-            stage1_limit=min(top_n * 4, 80),
+            stage1_limit=min(top_n * 4, 60),   # 硬上限60，防止Stage2过大
             **filter_kwargs,
         )
     except Exception as e:
@@ -1245,14 +1903,14 @@ def earnings_analysis(
     """
     # 获取股票名称
     try:
-        rt = st.get_realtime([stock_code])
+        rt = df_mod.get_realtime([stock_code])
         name = rt.iloc[0]["name"] if not rt.empty else stock_code
     except Exception:
         name = stock_code
 
     # ── 历史财务数据 ──
     try:
-        history = st.get_financial_history(stock_code, periods=periods)
+        history = fin_mod.get_financial_history(stock_code, periods=periods)
     except Exception as e:
         return f"ERROR: 历史财务数据获取失败: {e}"
 
@@ -1261,7 +1919,7 @@ def earnings_analysis(
 
     # ── 公告列表，找财报类公告 ──
     try:
-        anns = st.get_announcements(stock_code, page_size=30)
+        anns = ann_mod.get_announcements(stock_code, page_size=30)
         earnings_anns = [a for a in anns if a["is_earnings"]][:6]
     except Exception:
         earnings_anns = []
@@ -1277,7 +1935,7 @@ def earnings_analysis(
                 if oldest else
                 (datetime.today() - timedelta(days=600)).strftime("%Y-%m-%d")
             )
-            kline_df = st.get_kline(stock_code, period="daily",
+            kline_df = df_mod.get_kline(stock_code, period="daily",
                                     start=start_dt, adjust="none")
         except Exception:
             kline_df = None
@@ -1286,11 +1944,11 @@ def earnings_analysis(
     reactions = []
     for ann in earnings_anns:
         if ann["date"]:
-            r = st.analyze_earnings_reaction(stock_code, ann["date"], kline_df)
+            r = ann_mod.analyze_earnings_reaction(stock_code, ann["date"], kline_df)
             r["title"] = ann["title"]
             reactions.append(r)
 
-    return st.format_earnings_analysis(stock_code, name, history, reactions)
+    return ann_mod.format_earnings_analysis(stock_code, name, history, reactions)
 
 
 # =====================================================
@@ -1326,18 +1984,18 @@ def stock_announcements(
       - 财报数据是否可能尚未更新的风险提示
     """
     try:
-        anns = st.get_announcements(stock_code, page_size=count)
+        anns = ann_mod.get_announcements(stock_code, page_size=count)
     except Exception as e:
         return f"ERROR: 公告获取失败: {e}"
 
     # 尝试获取股票名称
     try:
-        rt = st.get_realtime([stock_code])
+        rt = df_mod.get_realtime([stock_code])
         name = rt.iloc[0]["name"] if not rt.empty else ""
     except Exception:
         name = ""
 
-    return st.format_announcements(stock_code, anns, name=name)
+    return ann_mod.format_announcements(stock_code, anns, name=name)
 
 
 # =====================================================
@@ -1347,30 +2005,174 @@ def stock_announcements(
 @mcp.tool()
 def market_news() -> str:
     """
-    获取当日市场消息面环境分析报告（中文）。
+    获取当日市场环境报告（外围行情 + 新闻面）。
 
     【建议在分析任何个股之前优先调用此工具】，以了解当日市场背景。
 
-    内容涵盖：
-      外围市场行情 —— 美股三大指数（标普/纳指/道指）+ 恐慌指数VIX、
-                      欧股三大（富时/DAX/CAC）、亚太（恒生/日经）、黄金/原油
-      国际重要新闻 —— 路透社 RSS 实时头条（地缘政治、科技事件、宏观经济等）
-      国内官方媒体 —— 新华社、人民日报、央视财经最新消息
-                      （注：国内只看政府官方媒体，不看民间财经号）
-      综合情绪研判 —— 基于外围行情+新闻关键词给出 news_sentiment 建议参考值
+    内容涵盖:
+      外围市场行情 —— 美股三大指数 + VIX、欧股、亚太、黄金/原油 (market_quote)
+      国际/全球财经新闻 —— 东方财富全球市场 + 新浪财经 (仅保留2天内)
+      国内A股/财经新闻 —— 东方财富要闻 + 股票新闻 (仅保留2天内)
+      综合情绪研判 —— 外围行情评分 + 新闻关键词微调
 
     Returns
     -------
-    完整中文市场环境日报。
-    报告末尾会给出"综合建议 news_sentiment 参考值"，
-    可直接或微调后填入 stock_diagnosis 的 news_sentiment 参数。
+    完整中文市场环境报告（含行情表格 + 新闻列表 + 综合评分）。
 
     注意：本工具需要抓取网络数据，执行时间约 20-30 秒，请耐心等待。
     """
     try:
-        return na.get_market_news_report()
+        from datetime import datetime
+
+        sep = "═" * 56
+        now = datetime.now()
+        lines = [
+            sep,
+            f"  市场环境报告   {now.strftime('%Y-%m-%d  %H:%M')}",
+            sep,
+            "",
+        ]
+
+        # ── 1. 外围行情 (market_quote) ──
+        market_data = mq.get_foreign_markets()
+        market_score = mq.compute_market_score(market_data)
+        lines.append(mq.format_market_block(market_data))
+        lines.append("")
+        lines.append(mq.build_market_interpretation(market_data, market_score))
+
+        # ── 2. 新闻面 (news_analyzer, 仅2天内) ──
+        # 只调用一次 get_news_feeds()，避免重复网络请求
+        lines.append("")
+        intl_news, domestic_news = na.get_news_feeds()
+        news_delta = na.news_sentiment_delta(intl_news, domestic_news)
+        total_count = len(intl_news) + len(domestic_news)
+        max_age = na._default_max_age_days()
+        news_sep = "═" * 56
+        news_lines = [
+            news_sep,
+            f"  市场新闻面报告   {now.strftime('%Y-%m-%d  %H:%M')}",
+            f"  (时效窗口: {max_age}天内)",
+            news_sep,
+            "",
+            na._fmt_news_block(intl_news, "【国际/全球财经新闻】"),
+            "",
+            na._fmt_news_block(domestic_news, "【国内A股/财经新闻】"),
+            "",
+            "【新闻面情绪结论】",
+            f"  有效新闻数量: {total_count} 条（{max_age}天内）",
+            f"  新闻情绪微调值: {news_delta:+.2f}  ({na._score_to_label(news_delta)})",
+            news_sep,
+        ]
+        lines.append("\n".join(news_lines))
+
+        # ── 3. 综合 ──
+        final = round(max(-1.0, min(1.0, market_score + news_delta * 0.4)), 2)
+
+        lines.extend([
+            "",
+            "【综合结论】",
+            f"  外围行情评分:     {market_score:+.2f}  ({mq.score_to_label(market_score)})",
+            f"  新闻面微调:       {news_delta:+.2f}",
+            f"  ─────────────────────────────",
+            f"  综合建议 news_sentiment 参考值: {final:+.2f}",
+            "",
+            "  ➡  使用方法:",
+            "     调用 stock_diagnosis 时，将此值传入 news_sentiment 参数。",
+            "     Claude 可根据新闻实际内容在此基础上微调 ±0.1。",
+            sep,
+        ])
+        return "\n".join(lines)
     except Exception as e:
-        return f"ERROR: 消息面分析获取失败: {e}"
+        return f"ERROR: 市场环境报告获取失败: {e}"
+
+
+# =====================================================
+# Tool 14b: 北向资金成交活跃度
+# =====================================================
+
+@mcp.tool()
+def northbound_flow(days: int = 10) -> str:
+    """
+    获取北向资金（沪深港通）成交活跃度数据。
+
+    【背景】2024年5月起港交所不再披露北向资金净买入数据，
+    本接口改为返回每日成交额和笔数，用于评估外资参与度趋势。
+
+    【重要性】北向资金成交额反映外资对A股的参与热度：
+      - 成交额持续放量 → 外资关注度上升，市场活跃度增加
+      - 成交额持续缩量 → 外资兴趣减退，参与度下降
+      - 需结合市场涨跌方向综合判断（放量+涨=看多，放量+跌=分歧加大）
+
+    【调用时机】
+      - market_news 之后立即调用，用于修正 news_sentiment
+      - 选股流程中评估外资参与热度
+      - 单股分析中判断市场整体活跃度
+
+    【news_sentiment 调整规则（基于成交额趋势）】
+      近5日成交额变化 > +20%  → +0.10（外资关注度显著提升）
+      近5日成交额变化 +5~20%  → +0.05（温和放量）
+      近5日成交额变化 -5~+5%  → 不调整（持平）
+      近5日成交额变化 -20~-5% → -0.05（温和缩量）
+      近5日成交额变化 < -20%  → -0.10（大幅缩量，兴趣减退）
+      连续5日以上缩量         → 建议降低仓位积极性
+
+    Parameters
+    ----------
+    days : int   返回最近N个交易日数据，默认10日
+
+    Returns
+    -------
+    中文报告，含每日沪/深股通成交额、合计、趋势判断、news_sentiment 调整建议。
+    """
+    try:
+        flow = cf_mod.get_northbound_flow(days=days)
+    except Exception as e:
+        return f"ERROR: 北向资金数据获取失败: {e}"
+
+    if not flow:
+        return "ERROR: 未获取到北向资金数据，请稍后重试"
+
+    report = cf_mod.format_northbound_report(flow)
+
+    # 追加 news_sentiment 调整建议（基于成交额趋势）
+    amts = [d.get("total_deal_amt", 0) for d in flow]
+    recent5 = amts[:5]
+    early5 = amts[-5:] if len(amts) >= 10 else amts[:5]
+    avg_recent = sum(recent5) / len(recent5) if recent5 else 0
+    avg_early = sum(early5) / len(early5) if early5 else 0
+    trend_pct = (avg_recent / avg_early - 1) * 100 if avg_early > 0 else 0
+
+    # 连续缩量天数
+    consecutive_shrink = 0
+    for i in range(len(amts) - 1):
+        if amts[i] < amts[i + 1]:
+            consecutive_shrink += 1
+        else:
+            break
+
+    if trend_pct > 20:
+        sentiment_adj = "+0.10"
+        advice = "外资成交大幅放量，关注度显著提升，偏积极"
+    elif trend_pct > 5:
+        sentiment_adj = "+0.05"
+        advice = "外资成交温和放量，参与度上升"
+    elif trend_pct > -5:
+        sentiment_adj = "0"
+        advice = "外资成交持平，不影响原有判断"
+    elif trend_pct > -20:
+        sentiment_adj = "-0.05"
+        advice = "外资成交温和缩量，参与度下降"
+    else:
+        sentiment_adj = "-0.10"
+        advice = "外资成交大幅缩量，建议降低仓位积极性"
+
+    report += f"\n  ▶ 成交额趋势变化: {trend_pct:+.1f}%"
+    report += f"\n  ▶ news_sentiment 调整建议: {sentiment_adj}"
+    report += f"\n  ▶ 操作含义: {advice}"
+    if consecutive_shrink >= 5:
+        report += f"\n  ⚠️ 警告: 已连续 {consecutive_shrink} 日成交缩量，外资参与度持续下降，建议降低仓位积极性"
+
+    return report
 
 
 # =====================================================
@@ -1413,6 +2215,321 @@ def quant_activity(
         return qd.get_quant_activity_report(stock_code, tick_n=tick_n)
     except Exception as e:
         return f"ERROR: 量化活跃度分析失败: {e}"
+
+
+# =====================================================
+# Tool 16: 主力资金流向（大单净流入）
+# =====================================================
+
+@mcp.tool()
+def moneyflow(
+    stock_code: str,
+    days: int = 10,
+) -> str:
+    """
+    查询个股主力资金流向（大单净流入/净卖出），输出信号解读报告。
+
+    主力资金 = 单笔成交金额 ≥ 50万元的大单；
+    超大单   = 单笔 ≥ 200万元。
+
+    主力净流入连续多日 → 机构/大资金在建仓（看多信号）
+    主力净流出加速    → 主力出货减仓（看空信号）
+
+    建议在 stock_diagnosis 之前调用，用于补充技术面缺失的资金面视角。
+    短线分析和选股复核时优先调用。
+
+    Parameters
+    ----------
+    stock_code : str   股票代码，如 "600519"
+    days       : int   查询最近 N 个交易日，默认 10
+
+    Returns
+    -------
+    中文主力资金报告（含逐日明细、近5日均值、信号判断）
+    """
+    try:
+        data = cf_mod.get_moneyflow(stock_code, days=days)
+        return cf_mod.format_moneyflow_report(data)
+    except Exception as e:
+        return f"ERROR: 主力资金流向获取失败: {e}"
+
+
+# =====================================================
+# Tool 17: 融资融券余额（两融）
+# =====================================================
+
+@mcp.tool()
+def margin_trading(
+    stock_code: str,
+    days: int = 20,
+) -> str:
+    """
+    查询个股融资融券余额历史数据（两融余额变化趋势）。
+
+    融资余额上升 → 场内资金加杠杆做多，看多信号
+    融资余额快速下降 → 多头去杠杆/止损平仓，谨慎信号
+    融券余额大幅上升 → 机构/大户加大做空头寸，看空压力
+
+    两融余额是评估场内多空力量对比的重要参考，
+    尤其对于两融标的股票（沪深300成分股等），建议在 stock_diagnosis 之前调用。
+
+    Parameters
+    ----------
+    stock_code : str   股票代码，如 "600519"
+    days       : int   查询最近 N 条记录，默认 20
+
+    Returns
+    -------
+    中文两融余额报告（含逐日融资融券余额、趋势信号）
+    若该股未纳入两融标的，会明确说明。
+    """
+    try:
+        data = cf_mod.get_margin_trading(stock_code, days=days)
+        return cf_mod.format_margin_report(data)
+    except Exception as e:
+        return f"ERROR: 两融余额数据获取失败（该股可能未纳入两融标的）: {e}"
+
+
+# =====================================================
+# Tool 18: 资产负债表关键指标（负债率/商誉）
+# =====================================================
+
+@mcp.tool()
+def balance_sheet(
+    stock_code: str,
+) -> str:
+    """
+    查询个股最新资产负债表关键指标，包含高商誉预警。
+
+    关键指标:
+      资产负债率  — 越低越稳健，>70% 为高负债预警
+      商誉/净资产 — >30% 为高商誉风险，商誉减值可能大幅侵蚀利润
+      货币资金    — 衡量短期偿债能力
+
+    重要用途:
+      - 高商誉个股筛除（对应框架中"避开高商誉个股"）
+      - 低负债率验证（长线选股的安全边际）
+      - 现金充裕度评估（抗风险能力）
+
+    建议在 financial_data 之后调用，补充资产负债健康度评估。
+
+    Parameters
+    ----------
+    stock_code : str   股票代码，如 "600519"
+
+    Returns
+    -------
+    中文资产负债关键指标报告，含高商誉/高负债预警
+    """
+    try:
+        d = fin_mod.get_balance_sheet(stock_code)
+        lines = [
+            f"资产负债表关键指标 — {stock_code}",
+            f"  报告期:       {d.get('report_date', 'N/A')}",
+            "=" * 50,
+            f"  总资产:       {d.get('total_assets') or 'N/A'} 亿元",
+            f"  总负债:       {d.get('total_liab') or 'N/A'} 亿元",
+            f"  归母净资产:   {d.get('equity') or 'N/A'} 亿元",
+            f"  货币资金:     {d.get('cash') or 'N/A'} 亿元",
+            "-" * 50,
+        ]
+
+        # 资产负债率
+        dr = d.get("debt_ratio")
+        if dr is not None:
+            dr_flag = "⚠️ 高负债风险" if dr > 70 else ("✅ 负债健康" if dr < 50 else "🟡 负债适中")
+            lines.append(f"  资产负债率:   {dr:.1f}%  {dr_flag}")
+        else:
+            lines.append("  资产负债率:   N/A")
+
+        # 商誉
+        gw    = d.get("goodwill") or 0
+        gw_r  = d.get("goodwill_ratio")
+        if gw_r is not None:
+            gw_flag = "🔴 高商誉警告！减值风险高" if gw_r > 30 else ("⚠️ 商誉偏高，需关注" if gw_r > 15 else "✅ 商誉占比低")
+            lines.append(f"  商誉:         {gw:.2f} 亿元 (占净资产 {gw_r:.1f}%)  {gw_flag}")
+        else:
+            lines.append(f"  商誉:         {gw:.2f} 亿元")
+
+        lines.extend([
+            "",
+            "注：高商誉（>30%净资产）个股在经济下行期面临大额减值风险，应谨慎介入。",
+        ])
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: 资产负债表数据获取失败: {e}"
+
+
+# =====================================================
+# Tool 19: 分红历史
+# =====================================================
+
+@mcp.tool()
+def dividend_history(
+    stock_code: str,
+    years: int = 5,
+) -> str:
+    """
+    查询个股近几年的历史分红派息记录。
+
+    持续分红是公司治理优良、现金流充裕的信号，
+    是长线价值投资的重要参考维度（对应"分红历史"因素）。
+
+    分析要点:
+      - 连续分红年数和分红频率
+      - 每股分红是否稳定或增长
+      - 总分红金额变化趋势
+
+    建议在 financial_data 和 balance_sheet 之后调用，
+    用于长线选股或价值型策略复核。
+
+    Parameters
+    ----------
+    stock_code : str   股票代码，如 "600519"
+    years      : int   查询最近 N 年记录，默认 5 年
+
+    Returns
+    -------
+    中文分红历史报告
+    """
+    try:
+        data = fin_mod.get_dividend_history(stock_code, years=years)
+        if not data:
+            return f"⚠️ {stock_code} 近{years}年无分红记录（或数据暂不可用）"
+
+        lines = [
+            f"分红历史记录 — {stock_code}",
+            "=" * 55,
+            f"  {'报告期':<12} {'公告日':<12} {'除权日':<12} {'每股分红':>8} {'送股比':>6} {'分红总额':>8}",
+            "-" * 55,
+        ]
+        for d in data:
+            dps = d.get("div_per_share")
+            bon = d.get("bonus_ratio")
+            tot = d.get("total_div")
+            lines.append(
+                f"  {d.get('report_date',''):<12} {d.get('ann_date',''):<12} "
+                f"{d.get('ex_date',''):<12} "
+                f"{(str(dps)+'元') if dps else '—':>8} "
+                f"{(str(bon)+'股') if bon else '—':>6} "
+                f"{(str(tot)+'亿') if tot else '—':>8}"
+            )
+
+        lines.append("-" * 55)
+
+        # 统计分析
+        divs = [d.get("div_per_share") for d in data if d.get("div_per_share") is not None and d.get("div_per_share") > 0]
+        if divs:
+            lines.extend([
+                f"  共 {len(divs)} 次现金分红，平均每股 {sum(divs)/len(divs):.3f} 元",
+                f"  最近一次每股: {divs[0]:.3f} 元 / 最高: {max(divs):.3f} 元",
+                "",
+                "  分红质量评估: " + (
+                    "✅ 连续多年分红，股东回报稳健" if len(divs) >= 4 else
+                    "🟡 分红记录有限，需关注现金流" if len(divs) >= 2 else
+                    "🟠 分红次数较少"
+                ),
+            ])
+        else:
+            lines.append("  ⚠️ 无现金分红记录（该公司不分红或数据缺失）")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: 分红历史数据获取失败: {e}"
+
+
+# =====================================================
+# Tool 20: PEG + 杜邦分析（估值质量增强）
+# =====================================================
+
+@mcp.tool()
+def valuation_quality(
+    stock_code: str,
+) -> str:
+    """
+    计算PEG比率 + 杜邦分析，评估估值质量与基本面竞争力。
+
+    PEG (Price/Earnings to Growth):
+      PEG = PE(TTM) / 净利润增速(%)
+      PEG < 1  → 成长性充分支撑估值（价值洼地）
+      PEG 1~2  → 合理区间
+      PEG > 2  → 估值偏高，成长性不足
+
+    杜邦分析:
+      拆解ROE来源：ROE = 净利润率 × 资产周转率 × 权益乘数
+      分析ROE趋势、毛利率趋势、净利润增速一致性
+      判断盈利是否可持续
+
+    建议在 financial_data 和 earnings_analysis 之后调用，
+    用于完成估值质量闭环，特别适合价值型选股复核。
+
+    Parameters
+    ----------
+    stock_code : str   股票代码，如 "600519"
+
+    Returns
+    -------
+    中文PEG+杜邦分析报告，含估值结论
+    """
+    try:
+        # 获取财务数据
+        fin = fin_mod.get_financial(stock_code)
+        hist = fin_mod.get_financial_history(stock_code, periods=8)
+
+        pe_ttm = fin.get("pe_ttm")
+        name   = fin.get("name", stock_code)
+
+        lines = [
+            f"估值质量分析 — {name}({stock_code})",
+            "=" * 55,
+        ]
+
+        # PEG
+        peg_result = fin_mod.compute_peg(hist, pe_ttm)
+        lines.extend([
+            "【PEG分析】",
+            f"  当前PE(TTM):    {pe_ttm or 'N/A'}",
+            f"  增速计算方式:   {peg_result.get('growth_method', 'N/A')}",
+            f"  净利润增速:     {peg_result.get('growth_rate') or 'N/A'}%",
+            f"  PEG值:          {peg_result.get('peg') or 'N/A'}",
+            f"  PEG评估:        {peg_result.get('verdict', 'N/A')}",
+            "",
+        ])
+
+        # 杜邦分析
+        dupont = qe.analyze_dupont(hist)
+        lines.extend([
+            "【杜邦分析】",
+            f"  近期平均ROE:    {dupont.get('avg_roe') or 'N/A'}%",
+            f"  ROE趋势:        {dupont.get('roe_trend', 'N/A')}",
+            f"  ROE质量来源:    {dupont.get('roe_quality', 'N/A')}",
+            f"  毛利率趋势:     {dupont.get('gross_trend', 'N/A')}",
+            f"  平均毛利率:     {dupont.get('avg_gross_margin') or 'N/A'}%",
+            f"  净利润增速一致性: {dupont.get('profit_trend', 'N/A')}",
+            f"  杜邦综合评分:   {dupont.get('score', 0)} 分",
+            f"  综合判断:       {dupont.get('verdict', 'N/A')}",
+            "",
+        ])
+
+        # 财务历史摘要
+        if hist:
+            lines.extend([
+                "【近期财务趋势（最新4期）】",
+                f"  {'报告期':<12} {'营收YoY':>8} {'净利YoY':>8} {'毛利率':>7} {'ROE':>7}",
+                "-" * 50,
+            ])
+            for r in hist[:4]:
+                lines.append(
+                    f"  {r.get('report_date',''):<12} "
+                    f"{(str(r.get('revenue_yoy'))+'%') if r.get('revenue_yoy') is not None else 'N/A':>8} "
+                    f"{(str(r.get('profit_yoy'))+'%') if r.get('profit_yoy') is not None else 'N/A':>8} "
+                    f"{(str(r.get('gross_margin'))+'%') if r.get('gross_margin') is not None else 'N/A':>7} "
+                    f"{(str(r.get('roe'))+'%') if r.get('roe') is not None else 'N/A':>7}"
+                )
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: 估值质量分析失败: {e}"
 
 
 # =====================================================

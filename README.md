@@ -12,15 +12,33 @@
 
 ```text
 stock/
-├── slow_fetcher.py         # 数据更新主入口
+├── stock_mcp_server.py     # MCP 服务入口（22个工具）
+├── slow_fetcher.py         # 数据更新主入口 + 本地DB管理
 ├── import_json.py          # 从本地 JSON 导入 stocks
-├── stock_screener.py       # 选股器
-├── stock_tool.py           # 底层行情/财务/K线工具
-├── quant_engine.py         # 量化诊断引擎
+├── stock_screener.py       # 两阶段选股器（本地DB筛选 → 量化深度扫描）
+│
+├── _http_utils.py          # 共享HTTP工具（_headers/_get/_get_secid）
+├── data_fetcher.py         # 技术面底层 — K线/实时行情/技术指标
+├── financial.py            # 基本面底层 — 财务/资产负债/分红/PEG
+├── capital_flow.py         # 资金面底层 — 北向资金/主力资金/融资融券
+├── announcements.py        # 催化剂底层 — 公告/财报反应分析
+├── news_analyzer.py        # 消息面 — 市场新闻/个股新闻/情绪
+├── market_quote.py         # 环境层 — 外围市场行情（美/欧/亚/大宗）
+│
+├── quant_engine.py         # 量化诊断引擎（7维诊断/KDJ/杜邦/蒙特卡洛）
+├── quant_detector.py       # 量化资金活跃度检测
+├── risk_manager.py         # 风险评估（VaR/Kelly/ATR止损/压力测试）
 ├── backtest_engine.py      # 回测引擎
-├── risk_manager.py         # 风险评估
-├── news_analyzer.py        # 市场新闻 / 个股新闻
-├── stock_mcp_server.py     # MCP 服务
+│
+├── module_a_environment.py # 环境感知层（外围+新闻+北向 → 市场评级H/M/L）
+├── faces/                  # 五面体系
+│   ├── face_technical.py   # 技术面（短线25%+10%）
+│   ├── face_capital.py     # 资金面（短线30%+10%）
+│   ├── face_catalyst.py    # 催化剂面（短线25%）
+│   ├── face_fundamental.py # 基本面（长线5子维度）
+│   ├── face_risk.py        # 风控面（独立约束层）
+│   └── scorecard.py        # 评分卡聚合（短线/长线加权 → 评级）
+│
 ├── data/
 │   └── stocks.db           # SQLite 数据库
 └── charts/                 # 图表输出目录
