@@ -9,10 +9,8 @@ venv/
 # Secrets
 .env
 
-# Database (too large for git, persisted via GitHub Release)
-data/stocks.db
-data/stocks.db-shm
-data/stocks.db-wal
+# Data directory (DB already on Azure PostgreSQL, no need to track locally)
+data/
 a_share.db
 
 # OS
