@@ -1425,7 +1425,8 @@ def daily_close_update(batch_size: int = 50,
                        interval: float = 2.0,
                        snapshot_interval: float = 10.0,
                        target_trade_date: str = None,
-                       max_rounds: int = 500) -> dict:
+                       max_rounds: int = 500,
+                       max_minutes: float = 0) -> dict:
     """
     收盘后统一更新入口（逐只 kline API 模式）:
 
@@ -1474,6 +1475,10 @@ def daily_close_update(batch_size: int = 50,
             "done": False,
         }
 
+    import time as _time
+    _start_ts = _time.monotonic()
+    _deadline = _start_ts + max_minutes * 60 if max_minutes > 0 else 0
+
     conn = _get_db()
     try:
         # ── Step 1: Fundamentals 快照（腾讯批量）──
@@ -1489,8 +1494,17 @@ def daily_close_update(batch_size: int = 50,
         total_errors = []
         rounds = 0
         history_done = False
+        time_expired = False
 
         while rounds < max_rounds:
+            # ── 时间墙: 到点优雅退出，下次断点续传 ──
+            if _deadline and _time.monotonic() >= _deadline:
+                elapsed = (_time.monotonic() - _start_ts) / 60
+                log.warning("⏱️  已运行 %.0f 分钟，达到 max_minutes=%d 限制，优雅退出。下次运行将断点续传。",
+                            elapsed, max_minutes)
+                time_expired = True
+                break
+
             rounds += 1
             result = fetch_history_batch(
                 batch_size=batch_size,
@@ -1520,6 +1534,7 @@ def daily_close_update(batch_size: int = 50,
         _meta_set(conn, "daily_close_target_date", target_trade_date)
         _meta_set(conn, "history_last_fetch", cn_now().isoformat())
 
+        elapsed_min = (_time.monotonic() - _start_ts) / 60
         return {
             "target_trade_date": target_trade_date,
             "snapshot": snapshot_result,
@@ -1531,6 +1546,8 @@ def daily_close_update(batch_size: int = 50,
                 "done": history_done,
             },
             "done": snapshot_result.get("done", False) and history_done,
+            "time_expired": time_expired,
+            "elapsed_minutes": round(elapsed_min, 1),
         }
     finally:
         conn.close()
@@ -1544,7 +1561,8 @@ def full_daily_update(batch_size: int = 50,
                       max_rounds: int = 500,
                       moneyflow_days: int = 60,
                       moneyflow_interval: float = 10.0,
-                      moneyflow_auto: bool = True) -> dict:
+                      moneyflow_auto: bool = True,
+                      max_minutes: float = 0) -> dict:
     """
     一键全量收盘更新 = daily_close_update + moneyflow。
 
@@ -1587,8 +1605,14 @@ def full_daily_update(batch_size: int = 50,
             "reason": f"{check_date} 不是交易日，最近交易日为 {ltd}",
         }
 
+    import time as _time
+    _start_ts = _time.monotonic()
+    _deadline = _start_ts + max_minutes * 60 if max_minutes > 0 else 0
+
     # ── Phase 1: Fundamentals + K线 ──
     log.info("═══ Phase 1/2: Fundamentals + K线增量 ═══")
+    # 给 Phase 1 分配剩余时间
+    _remaining_min = ((_deadline - _time.monotonic()) / 60) if _deadline else 0
     daily_result = daily_close_update(
         batch_size=batch_size,
         days=days,
@@ -1596,11 +1620,25 @@ def full_daily_update(batch_size: int = 50,
         snapshot_interval=snapshot_interval,
         target_trade_date=target_trade_date,
         max_rounds=max_rounds,
+        max_minutes=_remaining_min if _deadline else 0,
     )
 
     # 如果 Phase 1 因非交易日被跳过，直接返回
     if daily_result.get("skipped"):
         return daily_result
+
+    # ── 时间墙检查: Phase 1 耗尽时间则跳过 Phase 2 ──
+    if _deadline and _time.monotonic() >= _deadline:
+        log.warning("⏱️  Phase 1 用完了全部时间，Phase 2 资金流向将在下次运行时执行")
+        return {
+            "target_trade_date": daily_result.get("target_trade_date"),
+            "snapshot": daily_result.get("snapshot"),
+            "history": daily_result.get("history"),
+            "moneyflow": {"fetched": 0, "rounds": 0, "errors": [], "done": False},
+            "done": False,
+            "time_expired": True,
+            "elapsed_minutes": round((_time.monotonic() - _start_ts) / 60, 1),
+        }
 
     # ── Phase 2: 资金流向 ──
     log.info("═══ Phase 2/2: 主力资金流向 ═══")
@@ -1608,8 +1646,17 @@ def full_daily_update(batch_size: int = 50,
     mf_total_fetched = 0
     mf_errors = []
     mf_done = False
+    mf_time_expired = False
 
     while True:
+        # ── 时间墙 ──
+        if _deadline and _time.monotonic() >= _deadline:
+            elapsed = (_time.monotonic() - _start_ts) / 60
+            log.warning("⏱️  已运行 %.0f 分钟，达到 max_minutes=%d 限制，资金流向优雅退出。",
+                        elapsed, max_minutes)
+            mf_time_expired = True
+            break
+
         mf_rounds += 1
         mf_result = fetch_moneyflow_batch(
             batch_size=batch_size,
@@ -1634,6 +1681,7 @@ def full_daily_update(batch_size: int = 50,
             mf_done = True
             break
 
+    elapsed_min = (_time.monotonic() - _start_ts) / 60
     return {
         "target_trade_date": daily_result.get("target_trade_date"),
         "snapshot": daily_result.get("snapshot"),
@@ -1645,6 +1693,8 @@ def full_daily_update(batch_size: int = 50,
             "done": mf_done,
         },
         "done": daily_result.get("done", False) and mf_done,
+        "time_expired": daily_result.get("time_expired", False) or mf_time_expired,
+        "elapsed_minutes": round(elapsed_min, 1),
     }
 
 
@@ -2672,6 +2722,8 @@ def main():
                         help="重置 K 线拉取进度")
 
     # 资金流向模式
+    parser.add_argument("--max-minutes", type=float, default=0,
+                        help="最长运行分钟数，到时间优雅退出 (0=无限制，用于 CI 定时任务)")
     parser.add_argument("--moneyflow", action="store_true",
                         help="拉取主力资金流向（逐只，默认10秒间隔）")
     parser.add_argument("--moneyflow-auto", action="store_true",
@@ -2717,9 +2769,18 @@ def main():
         return
 
     if args.moneyflow or args.moneyflow_auto:
+        import time as _time
+        _start_ts = _time.monotonic()
+        _deadline = _start_ts + args.max_minutes * 60 if args.max_minutes > 0 else 0
         rounds = 0
         total_fetched = 0
+        time_expired = False
         while True:
+            if _deadline and _time.monotonic() >= _deadline:
+                elapsed = (_time.monotonic() - _start_ts) / 60
+                log.warning("⏱️  已运行 %.0f 分钟，达到 max_minutes=%d 限制，优雅退出。", elapsed, args.max_minutes)
+                time_expired = True
+                break
             rounds += 1
             result = fetch_moneyflow_batch(
                 batch_size=args.batch,
@@ -2741,6 +2802,8 @@ def main():
                 break
         if result.get("done"):
             print(f"\n全部完成! 共 {total_fetched} 只股票的资金流向已入库")
+        elif time_expired:
+            print(f"\n⏱️ 时间到! 已完成 {total_fetched} 只, 下次运行将断点续传")
         return
 
     if args.export:
@@ -2789,6 +2852,7 @@ def main():
             snapshot_interval=max(float(args.interval), 10.0),
             target_trade_date=args.trade_date,
             moneyflow_interval=max(float(args.interval), 5.0),
+            max_minutes=args.max_minutes,
         )
         snap = result.get("snapshot", {})
         hist = result.get("history", {})
@@ -2833,6 +2897,7 @@ def main():
             interval=args.interval,
             snapshot_interval=max(float(args.interval), 10.0),
             target_trade_date=args.trade_date,
+            max_minutes=args.max_minutes,
         )
         snap = result["snapshot"]
         hist = result["history"]

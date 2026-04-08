@@ -4,3 +4,5 @@ matplotlib
 requests
 curl_cffi
 mcp
+psycopg2-binary
+python-dotenv

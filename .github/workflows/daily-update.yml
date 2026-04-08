@@ -1,34 +1,57 @@
 name: A股每日数据更新
 
-# ════════════════════════════════════════════════════════
-# 触发条件:
-#   1. 每个交易日收盘后自动跑 (北京时间 16:00 = UTC 08:00)
-#   2. 手动触发 (workflow_dispatch)
-# ════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════
+# 架构说明:
+#   东财 API 限制 ~10 秒/次, 3000+ 只股票全量更新需要 ~17 小时。
+#   GitHub 托管 Runner 单 job 最长 6 小时。
+#
+#   解决方案: 每天 3 次定时触发, 每次跑 5 小时, 利用断点续传:
+#     Run 1 (16:30 CST): Fundamentals 快照 + K线增量 (开始)
+#     Run 2 (22:00 CST): K线续传 + 资金流向 (开始)
+#     Run 3 (04:00 CST): 资金流向续传 (收尾)
+#
+#   数据库: Azure PostgreSQL
+#   假日策略: 非交易日全部跳过, 开盘日增量自动补齐缺失天数
+# ════════════════════════════════════════════════════════════════
 
 on:
   schedule:
-    # UTC 08:00 = 北京时间 16:00 (A股15:00收盘, 留1小时缓冲)
-    # 周一到周五跑, 但 cron 不支持跳过节假日, 脚本内部会自行判断
-    - cron: '0 8 * * 1-5'
+    # Run 1: UTC 08:30 = 北京时间 16:30 (收盘后1.5小时, 等数据源更新)
+    - cron: '30 8 * * 1-5'
+    # Run 2: UTC 14:00 = 北京时间 22:00
+    - cron: '0 14 * * 1-5'
+    # Run 3: UTC 20:00 = 北京时间 04:00 (次日凌晨)
+    - cron: '0 20 * * 1-5'
 
   workflow_dispatch:
     inputs:
+      mode:
+        description: '运行模式'
+        required: true
+        default: 'full-update'
+        type: choice
+        options:
+          - full-update
+          - daily-close-update
+          - moneyflow
       batch_size:
         description: '每轮拉取股票数'
         required: false
-        default: '50'
+        default: '100'
       interval:
         description: '每只间隔秒数'
         required: false
-        default: '3'
-      skip_moneyflow:
-        description: '跳过资金流向 (只跑 K线+基本面)'
+        default: '10'
+      max_minutes:
+        description: '最长运行分钟数 (0=无限制)'
+        required: false
+        default: '300'
+      force_run:
+        description: '强制运行 (忽略交易日判断)'
         type: boolean
         required: false
         default: false
 
-# 同一时间只允许一个实例运行, 防止并发写DB
 concurrency:
   group: daily-update
   cancel-in-progress: false
@@ -36,10 +59,10 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 360      # 最长6小时
+    timeout-minutes: 330     # 5.5小时硬限制 (比 max_minutes 多30分钟缓冲)
 
-    permissions:
-      contents: write         # 需要写 Release
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
 
     steps:
       # ── 1. 拉代码 ──
@@ -56,116 +79,79 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── 3. 下载上次的数据库 (从 latest Release) ──
-      - name: Download DB from latest release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p data
-          echo "尝试从最新 Release 下载 stocks.db.gz ..."
-          if gh release download db-latest \
-               --pattern "stocks.db.gz" \
-               --dir data/ \
-               --clobber 2>/dev/null; then
-            echo "下载成功, 解压中..."
-            gunzip -f data/stocks.db.gz
-            ls -lh data/stocks.db
-          else
-            echo "没有找到已有数据库, 将从零开始 (首次运行)"
-          fi
+      # ── 3. 测试数据库连接 ──
+      - name: Test DB connection
+        run: python db.py
 
       # ── 4. 判断今天是否交易日 ──
-      - name: Check if today is a trade day
+      - name: Check trade day
         id: trade_check
-        env:
-          GITHUB_OUTPUT_FILE: ${{ github.output }}
         run: |
           python3 << 'PYEOF'
           import os, sys
           sys.path.insert(0, '.')
-          from _http_utils import is_trade_day, cn_today
+          from _http_utils import is_trade_day, last_trade_day, cn_today
+
           today = cn_today()
           is_td = is_trade_day(today)
-          print(f"今天: {today} (周{today.weekday()}) → 交易日: {is_td}")
-          output_file = os.environ.get("GITHUB_OUTPUT", "")
-          if output_file:
-              with open(output_file, "a") as f:
-                  f.write(f"is_trade_day={str(is_td).lower()}\n")
+          force = os.environ.get("FORCE_RUN", "false") == "true"
+
+          if is_td:
+              print(f"✅ {today} 是交易日")
+          else:
+              ltd = last_trade_day(today)
+              print(f"❌ {today} 不是交易日 (最近交易日: {ltd})")
+
+          should_run = "true" if (is_td or force) else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"should_run={should_run}\n")
           PYEOF
-
-      # ── 5. 导入股票列表 (如有 JSON) ──
-      - name: Import stock list
-        if: steps.trade_check.outputs.is_trade_day == 'true'
-        run: |
-          if ls data/*.json 1>/dev/null 2>&1; then
-            echo "发现 JSON 文件, 执行导入..."
-            python import_json.py
-          else
-            echo "无 JSON 文件, 跳过导入"
-          fi
-
-      # ── 6. 核心: 全量更新 ──
-      - name: Run full daily update
-        if: steps.trade_check.outputs.is_trade_day == 'true'
         env:
-          BATCH_SIZE: ${{ github.event.inputs.batch_size || '50' }}
-          INTERVAL: ${{ github.event.inputs.interval || '3' }}
-          SKIP_MF: ${{ github.event.inputs.skip_moneyflow || 'false' }}
+          FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+
+      # ── 5. 核心: 全量更新 (带时间墙, 断点续传) ──
+      - name: Run update
+        if: steps.trade_check.outputs.should_run == 'true'
+        env:
+          MODE: ${{ github.event.inputs.mode || 'full-update' }}
+          BATCH: ${{ github.event.inputs.batch_size || '100' }}
+          INTERVAL: ${{ github.event.inputs.interval || '10' }}
+          MAX_MIN: ${{ github.event.inputs.max_minutes || '300' }}
         run: |
-          if [ "$SKIP_MF" = "true" ]; then
-            echo "═══ 仅更新 K线 + 基本面 ═══"
+          echo "═══════════════════════════════════════"
+          echo "  模式: $MODE"
+          echo "  Batch: $BATCH, Interval: ${INTERVAL}s"
+          echo "  时间墙: ${MAX_MIN} 分钟"
+          echo "═══════════════════════════════════════"
+
+          if [ "$MODE" = "daily-close-update" ]; then
             python slow_fetcher.py \
               --daily-close-update \
-              --batch "$BATCH_SIZE" \
-              --interval "$INTERVAL"
+              --batch "$BATCH" \
+              --interval "$INTERVAL" \
+              --max-minutes "$MAX_MIN"
+          elif [ "$MODE" = "moneyflow" ]; then
+            python slow_fetcher.py \
+              --moneyflow --moneyflow-auto \
+              --batch "$BATCH" \
+              --interval "$INTERVAL" \
+              --max-minutes "$MAX_MIN"
           else
-            echo "═══ 全量更新: K线 + 基本面 + 资金流向 ═══"
             python slow_fetcher.py \
               --full-update \
-              --batch "$BATCH_SIZE" \
-              --interval "$INTERVAL"
+              --batch "$BATCH" \
+              --interval "$INTERVAL" \
+              --max-minutes "$MAX_MIN"
           fi
 
-      # ── 7. 打印数据库状态 ──
-      - name: Print DB status
-        if: steps.trade_check.outputs.is_trade_day == 'true'
+      # ── 6. 打印状态 ──
+      - name: Print status
+        if: steps.trade_check.outputs.should_run == 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python slow_fetcher.py --status
 
-      # ── 8. 压缩 & 上传到 Release ──
-      - name: Compress and upload DB
-        if: steps.trade_check.outputs.is_trade_day == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cd data
-          if [ ! -f stocks.db ]; then
-            echo "stocks.db 不存在, 跳过上传"
-            exit 0
-          fi
-
-          DB_SIZE=$(du -sh stocks.db | cut -f1)
-          echo "数据库大小: $DB_SIZE"
-
-          echo "压缩中..."
-          gzip -9 -k stocks.db
-          GZ_SIZE=$(du -sh stocks.db.gz | cut -f1)
-          echo "压缩后: $GZ_SIZE"
-          cd ..
-
-          TODAY=$(python3 -c "from _http_utils import cn_str; print(cn_str())")
-
-          # 删除旧 release (如果存在) 然后重建
-          gh release delete db-latest --yes 2>/dev/null || true
-          gh release create db-latest \
-            --title "DB Snapshot $TODAY" \
-            --notes "自动更新于 $TODAY (北京时间)
-          数据库: $DB_SIZE → 压缩后 $GZ_SIZE" \
-            --latest=false \
-            data/stocks.db.gz
-
-          echo "上传完成: db-latest"
-
-      # ── 9. 非交易日跳过提示 ──
+      # ── 7. 非交易日跳过 ──
       - name: Skip non-trade day
-        if: steps.trade_check.outputs.is_trade_day != 'true'
-        run: echo "今天不是交易日, 跳过更新"
+        if: steps.trade_check.outputs.should_run != 'true'
+        run: echo "❌ 今天不是交易日, 跳过更新"
