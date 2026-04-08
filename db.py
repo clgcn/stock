@@ -26,6 +26,7 @@ import os
 import sys
 import psycopg2
 import psycopg2.extras
+import psycopg2.extensions
 import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv
@@ -35,6 +36,18 @@ _env_path = Path(__file__).parent / ".env"
 load_dotenv(_env_path)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# ── 全局类型适配器: PostgreSQL NUMERIC/DOUBLE → Python float ────
+# psycopg2 默认把 DOUBLE PRECISION 返回为 float，但 NUMERIC 返回为 Decimal。
+# 注册适配器后，所有数值列统一返回 float，避免 Decimal + float 运算报错。
+
+def _cast_numeric_to_float(value, cur):
+    if value is None:
+        return None
+    return float(value)
+
+_NUMERIC = psycopg2.extensions.new_type((1700,), "NUMERIC_AS_FLOAT", _cast_numeric_to_float)
+psycopg2.extensions.register_type(_NUMERIC)
 
 # Connection pool for reuse
 _shared_conn = None
@@ -142,7 +155,12 @@ def read_sql(sql, conn, params=None):
         pd.DataFrame: Query results as DataFrame
     """
     sql = sql.replace("?", "%s")
-    return pd.read_sql_query(sql, conn, params=params)
+    df = pd.read_sql_query(sql, conn, params=params)
+    # 强制把所有 Decimal/object 数值列转为 float，避免下游运算报错
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = pd.to_numeric(df[col], errors="ignore")
+    return df
 
 
 def upsert_sql(table: str, columns: list, conflict_keys: list) -> str:
@@ -292,7 +310,6 @@ def init_schema(conn=None):
         """)
 
         conn.commit()
-        print("Schema initialized successfully")
     except Exception as e:
         conn.rollback()
         print(f"Error initializing schema: {e}")
