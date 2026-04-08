@@ -9,10 +9,10 @@
      只维护 code / name / suspended 这类股票宇宙信息。
 
   2) 个股历史 K 线 (push2his.eastmoney.com kline API)
-     每次拉 N 只股票各 1 年日 K，增量存入同一个 SQLite。
+     每次拉 N 只股票各 1 年日 K，增量存入 PostgreSQL。
      日度行情、涨跌幅、换手率等实际分析数据全部以 stock_history 为准。
 
-数据库:  data/stocks.db
+数据库:  Azure PostgreSQL (配置见 .env DATABASE_URL)
   - stocks        表: 股票总览元信息 (code / name / suspended)
   - stock_history 表: 个股日 K 线历史 (OHLCV/涨跌幅/换手率...)
   - stock_fundamentals 表: 每日估值快照 (PE/PB/总市值/流通市值)
@@ -32,6 +32,8 @@
       # 盘中刷新股票宇宙 + fundamentals 快照（不动正式日K）
   python slow_fetcher.py --daily-close-update --batch 100 --interval 3
       # 收盘后统一更新 fundamentals + 当日/缺失 history
+  python slow_fetcher.py --full-update --batch 50 --interval 5
+      # 一键全量: fundamentals + history + moneyflow (收盘后推荐)
 
   # ── 通用 ──
   python slow_fetcher.py --status                 # 查看所有进度
@@ -49,12 +51,14 @@ Cron 示例:
 import argparse
 import logging
 import random
-import sqlite3
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+
+import db
+from _http_utils import cn_now, cn_today, cn_str, is_trade_day, last_trade_day
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,7 +70,6 @@ log = logging.getLogger(__name__)
 # ── 配置 ──────────────────────────────────────────────────────
 
 DATA_DIR = Path(__file__).parent / "data"
-DB_PATH = DATA_DIR / "stocks.db"
 
 EM_URL = "https://82.push2.eastmoney.com/api/qt/clist/get"
 EM_FIELDS = (
@@ -91,133 +94,55 @@ USER_AGENTS = [
 
 # ── 数据库 ────────────────────────────────────────────────────
 
-def _connect_db() -> sqlite3.Connection:
-    """Open a SQLite connection with common pragmas."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+def _get_db():
+    """Open a ready-to-use database connection."""
+    conn = db.get_conn()
+    db.init_schema(conn)
     return conn
 
 
-def _init_schema(conn: sqlite3.Connection):
-    """Create base tables/indexes if they do not exist."""
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS stocks (
-            code          TEXT PRIMARY KEY,
-            name          TEXT,
-            suspended     INTEGER DEFAULT 0
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS stock_history (
-            code     TEXT NOT NULL,
-            date     TEXT NOT NULL,
-            open     REAL,
-            close    REAL,
-            high     REAL,
-            low      REAL,
-            volume   REAL,
-            amount   REAL,
-            amplitude REAL,
-            pct_chg  REAL,
-            change   REAL,
-            turnover REAL,
-            PRIMARY KEY (code, date)
-        )
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_history_code
-        ON stock_history(code)
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS stock_fundamentals (
-            code          TEXT NOT NULL,
-            trade_date    TEXT NOT NULL,
-            pe_ttm        REAL,
-            pb            REAL,
-            total_mv      REAL,
-            float_mv      REAL,
-            updated_at    TEXT,
-            source        TEXT,
-            batch_id      TEXT,
-            PRIMARY KEY (code, trade_date)
-        )
-    """)
-    conn.execute("""
-        CREATE INDEX IF NOT EXISTS idx_fundamentals_code_date
-        ON stock_fundamentals(code, trade_date)
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS meta (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
-    conn.commit()
-
-
-def _get_db() -> sqlite3.Connection:
-    """Open a ready-to-use database connection without running migrations."""
-    conn = _connect_db()
-    _init_schema(conn)
-    return conn
-
-
-def _meta_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
-    row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+def _meta_get(conn, key: str, default: str = "") -> str:
+    row = db.fetchone(conn, "SELECT value FROM meta WHERE key=?", (key,))
     return row[0] if row else default
 
 
-def _meta_set(conn: sqlite3.Connection, key: str, value: str):
-    conn.execute(
-        "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-        (key, str(value)),
-    )
+def _meta_set(conn, key: str, value: str):
+    sql = db.upsert_sql("meta", ["key", "value"], ["key"])
+    db.execute(conn, sql, (key, str(value)))
     conn.commit()
 
 
-def _upsert_stock_meta(conn: sqlite3.Connection, code: str, name: str,
+def _upsert_stock_meta(conn, code: str, name: str,
                        suspended: int = 0):
     """Keep stocks as a lightweight universe table."""
-    conn.execute(
-        """
-        INSERT INTO stocks (code, name, suspended)
-        VALUES (?, ?, ?)
-        ON CONFLICT(code) DO UPDATE SET
-            name = excluded.name,
-            suspended = excluded.suspended
-        """,
-        (code, name or "", int(bool(suspended))),
-    )
+    sql = db.upsert_sql("stocks", ["code", "name", "suspended"], ["code"])
+    db.execute(conn, sql, (code, name or "", int(bool(suspended))))
 
 
-def _upsert_fundamentals_snapshot(conn: sqlite3.Connection, code: str,
+def _upsert_fundamentals_snapshot(conn, code: str,
                                   trade_date: str, snapshot: dict,
                                   source: str = "clist",
                                   batch_id: str = ""):
     """Store daily valuation/market-cap snapshot."""
-    conn.execute(
-        """
-        INSERT OR REPLACE INTO stock_fundamentals
-        (code, trade_date, pe_ttm, pb, total_mv, float_mv,
-         updated_at, source, batch_id)
-        SELECT ?,?,?,?,?,?,?,?,?
-        WHERE EXISTS (SELECT 1 FROM stocks WHERE code = ?)
-        """,
-        (
-            code,
-            trade_date,
-            snapshot.get("pe_ttm"),
-            snapshot.get("pb"),
-            snapshot.get("total_mv"),
-            snapshot.get("float_mv"),
-            snapshot.get("updated_at"),
-            source,
-            batch_id,
-            code,
-        ),
-    )
+    # Check if stock exists first
+    row = db.fetchone(conn, "SELECT 1 FROM stocks WHERE code = ?", (code,))
+    if not row:
+        return
+
+    sql = db.upsert_sql("stock_fundamentals",
+                        ["code", "trade_date", "pe_ttm", "pb", "total_mv", "float_mv", "updated_at", "source", "batch_id"],
+                        ["code", "trade_date"])
+    db.execute(conn, sql, (
+        code,
+        trade_date,
+        snapshot.get("pe_ttm"),
+        snapshot.get("pb"),
+        snapshot.get("total_mv"),
+        snapshot.get("float_mv"),
+        snapshot.get("updated_at"),
+        snapshot.get("source"),
+        snapshot.get("batch_id"),
+    ))
 
 
 
@@ -278,7 +203,7 @@ def _fetch_page(page: int, page_size: int = None) -> dict:
     return resp.json()
 
 
-def _parse_and_store(conn: sqlite3.Connection, records) -> int:
+def _parse_and_store(conn,records) -> int:
     """解析东财返回的 diff 数据，存入数据库。返回入库条数。"""
     if isinstance(records, dict):
         records = list(records.values())
@@ -310,7 +235,7 @@ def _parse_and_store(conn: sqlite3.Connection, records) -> int:
 
 # ── 主逻辑 ────────────────────────────────────────────────────
 
-def fetch_next_page(conn: sqlite3.Connection = None) -> dict:
+def fetch_next_page(conn = None) -> dict:
     """
     拉取下一页数据并存入数据库。
 
@@ -324,7 +249,7 @@ def fetch_next_page(conn: sqlite3.Connection = None) -> dict:
     try:
         batch_id = _meta_get(conn, "batch_id", "")
         if not batch_id:
-            batch_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+            batch_id = cn_now().strftime("%Y%m%d_%H%M%S")
             _meta_set(conn, "batch_id", batch_id)
 
         page = int(_meta_get(conn, "next_page", "1"))
@@ -343,23 +268,23 @@ def fetch_next_page(conn: sqlite3.Connection = None) -> dict:
 
         if not diff:
             _meta_set(conn, "done", "1")
-            _meta_set(conn, "done_at", datetime.now().isoformat())
+            _meta_set(conn, "done_at", cn_now().isoformat())
             return {"page": page, "stored": 0, "total": total_expected,
                     "done": True, "error": None}
 
         stored = _parse_and_store(conn, diff)
 
         _meta_set(conn, "next_page", str(page + 1))
-        _meta_set(conn, "last_fetch_at", datetime.now().isoformat())
+        _meta_set(conn, "last_fetch_at", cn_now().isoformat())
         _meta_set(conn, "last_page_stored", str(stored))
 
-        db_count = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
+        db_count = db.fetchone(conn, "SELECT COUNT(*) FROM stocks")[0]
         total_pages = (total_expected + PAGE_SIZE - 1) // PAGE_SIZE if total_expected else "?"
         done = page >= total_pages if isinstance(total_pages, int) else False
 
         if done:
             _meta_set(conn, "done", "1")
-            _meta_set(conn, "done_at", datetime.now().isoformat())
+            _meta_set(conn, "done_at", cn_now().isoformat())
 
         log.info(
             "第 %d/%s 页  +%d 条  数据库累计: %d/%d  %s",
@@ -382,7 +307,7 @@ def fetch_next_page(conn: sqlite3.Connection = None) -> dict:
 def refresh_fundamentals_snapshot(interval: float = 10.0,
                                   batch_size: int = 200,
                                   target_trade_date: str = None,
-                                  conn: sqlite3.Connection = None) -> dict:
+                                  conn = None) -> dict:
     """
     Full refresh of the market overview snapshot from Tencent.
 
@@ -399,12 +324,11 @@ def refresh_fundamentals_snapshot(interval: float = 10.0,
         conn = _get_db()
 
     try:
-        target_trade_date = target_trade_date or datetime.now().strftime("%Y-%m-%d")
-        rows = conn.execute(
+        target_trade_date = target_trade_date or cn_str("%Y-%m-%d")
+        rows = db.fetchall(conn,
             "SELECT code, name FROM stocks "
             "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
-            "ORDER BY code"
-        ).fetchall()
+            "ORDER BY code")
         total_expected = len(rows)
         stored_total = 0
         errors = []
@@ -485,7 +409,7 @@ def refresh_fundamentals_snapshot(interval: float = 10.0,
                 next_offset = min(start + batch_size, total_expected)
                 _meta_set(conn, "fund_trade_date", target_trade_date)
                 _meta_set(conn, "fund_next_offset", str(next_offset))
-                _meta_set(conn, "fund_last_fetch_at", datetime.now().isoformat())
+                _meta_set(conn, "fund_last_fetch_at", cn_now().isoformat())
                 log.info(
                     "Fundamentals(Tencent): 批次 %d 写入 %d 条 (累计 %d/%d, 进度 %d/%d)",
                     (start // batch_size) + 1, line_count, stored_total, total_expected,
@@ -502,7 +426,7 @@ def refresh_fundamentals_snapshot(interval: float = 10.0,
         done = not errors and (resume_offset + batches * batch_size) >= total_expected
         if done:
             _meta_set(conn, "fund_done", "1")
-            _meta_set(conn, "fund_done_at", datetime.now().isoformat())
+            _meta_set(conn, "fund_done_at", cn_now().isoformat())
             _meta_set(conn, "fund_next_offset", str(total_expected))
         else:
             _meta_set(conn, "fund_done", "0")
@@ -527,7 +451,7 @@ def get_status() -> dict:
     """获取拉取进度摘要。"""
     conn = _get_db()
     try:
-        db_count = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
+        db_count = db.fetchone(conn, "SELECT COUNT(*) FROM stocks")[0]
         total_expected_str = _meta_get(conn, "total_expected", "?")
         meta_done = _meta_get(conn, "done", "0") == "1"
         done_at = _meta_get(conn, "done_at", "")
@@ -538,7 +462,7 @@ def get_status() -> dict:
                 if not done_at:
                     done_at = _meta_get(conn, "last_fetch_at", "")
         return {
-            "db_path": str(DB_PATH),
+            "db_path": "PostgreSQL (Azure)",
             "stocks_in_db": db_count,
             "next_page": _meta_get(conn, "next_page", "1"),
             "total_expected": total_expected_str,
@@ -559,7 +483,7 @@ def reset_progress():
                      "done", "done_at", "last_fetch_at",
                      "fund_trade_date", "fund_next_offset", "fund_done",
                      "fund_done_at", "fund_last_fetch_at"]:
-            conn.execute("DELETE FROM meta WHERE key=?", (key,))
+            db.execute(conn, "DELETE FROM meta WHERE key=?", (key,))
         conn.commit()
         log.info("进度已重置，下次将从第 1 页开始")
     finally:
@@ -570,8 +494,8 @@ def clear_all():
     """清空数据库中所有股票数据和进度。"""
     conn = _get_db()
     try:
-        conn.execute("DELETE FROM stocks")
-        conn.execute("DELETE FROM meta")
+        db.execute(conn, "DELETE FROM stocks")
+        db.execute(conn, "DELETE FROM meta")
         conn.commit()
         log.info("数据库已清空")
     finally:
@@ -696,13 +620,12 @@ def load_stocks_from_db() -> pd.DataFrame:
     因此这里会基于 stock_history 生成“最近一日市场快照”，并与 stocks
     元信息表合并，返回与 stock_screener.fetch_all_stocks() 兼容的 DataFrame。
     """
-    if not DB_PATH.exists():
-        raise FileNotFoundError(f"数据库不存在: {DB_PATH}，请先运行 slow_fetcher.py")
+    # PostgreSQL — no file check needed, connection will fail if DB is unreachable
 
     conn = _get_db()
     try:
         query = _stock_overview_query("NULL", "")
-        df = pd.read_sql_query(query, conn)
+        df = db.read_sql(query, conn)
         numeric_cols = [
             "current", "pct_chg", "change", "volume", "amount", "amplitude",
             "high", "low", "open", "prev_close", "volume_ratio",
@@ -713,7 +636,7 @@ def load_stocks_from_db() -> pd.DataFrame:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
         df.attrs["source"] = "local_db"
-        df.attrs["db_path"] = str(DB_PATH)
+        df.attrs["db_path"] = "PostgreSQL (Azure)"
         if "current" in df.columns:
             df = df[df["current"].notna() & (df["current"] > 0)].copy()
         return df
@@ -730,8 +653,7 @@ def export_to_csv(path: str):
 
 def load_stock_overview(code: str) -> dict:
     """Load a single-stock overview directly from SQL."""
-    if not DB_PATH.exists():
-        return {}
+    # PostgreSQL — no file check needed
     conn = _get_db()
     try:
         query = _stock_overview_query(
@@ -739,7 +661,7 @@ def load_stock_overview(code: str) -> dict:
             "",
             "WHERE s.code = ?",
         )
-        df = pd.read_sql_query(query, conn, params=(str(code).strip(),))
+        df = db.read_sql(query, conn, params=(str(code).strip(),))
         if df.empty:
             return {}
         numeric_cols = [
@@ -842,7 +764,7 @@ def _parse_tencent_quote_line(line: str) -> dict:
         "pb": _safe_float(fields[46]),
         "total_mv": _safe_float(fields[45]),
         "float_mv": _safe_float(fields[44]),
-        "updated_at": updated_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": updated_at or cn_now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "tencent",
     }
 
@@ -885,8 +807,8 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
         use_cffi = False
 
     if beg is None:
-        beg = (datetime.today() - timedelta(days=days)).strftime("%Y%m%d")
-    end = datetime.today().strftime("%Y%m%d")
+        beg = (cn_now() - timedelta(days=days)).strftime("%Y%m%d")
+    end = cn_now().strftime("%Y%m%d")
     NO_PROXY = {"http": None, "https": None}
 
     secid = _get_secid(code)
@@ -948,20 +870,19 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
     raise _KlineNetError(f"{code}: {last_err}")
 
 
-def _store_kline(conn: sqlite3.Connection, code: str, raw_lines: list) -> int:
+def _store_kline(conn,code: str, raw_lines: list) -> int:
     """解析 K 线并存入 stock_history 表，返回入库条数。"""
     count = 0
+    sql = db.upsert_sql("stock_history",
+                        ["code", "date", "open", "close", "high", "low", "volume", "amount",
+                         "amplitude", "pct_chg", "change", "turnover"],
+                        ["code", "date"])
     for line in raw_lines:
         parts = line.split(",")
         if len(parts) < 11:
             continue
         try:
-            conn.execute("""
-                INSERT OR REPLACE INTO stock_history
-                (code, date, open, close, high, low, volume, amount,
-                 amplitude, pct_chg, change, turnover)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
+            db.execute(conn, sql, (
                 code,
                 parts[0],                     # date
                 _safe_float(parts[1]),         # open
@@ -999,7 +920,7 @@ def bulk_daily_kline_from_clist(
     target_trade_date: str = None,
     interval: float = 3.0,
     page_size: int = 100,
-    conn: sqlite3.Connection = None,
+    conn = None,
 ) -> dict:
     """用 clist 批量接口一次性拉全市场当日 K 线，写入 stock_history。
 
@@ -1015,7 +936,7 @@ def bulk_daily_kline_from_clist(
     Returns:
         {"stored": int, "suspended_marked": int, "pages": int, "errors": list}
     """
-    target_trade_date = target_trade_date or datetime.now().strftime("%Y-%m-%d")
+    target_trade_date = target_trade_date or cn_str("%Y-%m-%d")
     own_conn = conn is None
     if own_conn:
         conn = _get_db()
@@ -1027,10 +948,9 @@ def bulk_daily_kline_from_clist(
 
     done_date = _meta_get(conn, done_key, "")
     if done_date == target_trade_date:
-        existing = conn.execute(
+        existing = db.fetchone(conn,
             "SELECT COUNT(*) FROM stock_history WHERE date = ?",
-            (target_trade_date,),
-        ).fetchone()[0]
+            (target_trade_date,))[0]
         log.info("clist 当日K线: %s 已完成 (%d 条), 跳过", target_trade_date, existing)
         if own_conn:
             conn.close()
@@ -1058,10 +978,19 @@ def bulk_daily_kline_from_clist(
     pages = 0
     errors = []
 
-    # 先读取所有活跃股票代码集合（用于判断哪些是主板A股）
-    active_codes = set(r[0] for r in conn.execute(
-        "SELECT code FROM stocks WHERE suspended = 0"
-    ).fetchall())
+    # 每个交易日开始时先重置停牌标记，让所有股票都有机会被重新检测
+    # 这样只有当天真正 f2=="-" 的才会被标记停牌
+    if start_page == 1 and is_trade_day(cn_today()):
+        reset_count = db.fetchone(conn,
+            "SELECT COUNT(*) FROM stocks WHERE suspended = 1")[0]
+        if reset_count > 0:
+            db.execute(conn, "UPDATE stocks SET suspended = 0")
+            conn.commit()
+            log.info("交易日开始，已重置 %d 只停牌标记，将重新检测", reset_count)
+
+    # 读取所有股票代码集合（用于判断哪些是主板A股）
+    active_codes = set(r[0] for r in db.fetchall(conn,
+        "SELECT code FROM stocks"))
 
     page = start_page
     all_done = False
@@ -1084,9 +1013,10 @@ def bulk_daily_kline_from_clist(
                     continue
 
                 # f2 == "-" → 停牌/退市
+                # 但仅在交易日才标记停牌，避免周末/节假日误标全市场
                 if r.get("f2") is None or r.get("f2") == "-":
-                    if code in active_codes:
-                        conn.execute(
+                    if code in active_codes and is_trade_day(cn_today()):
+                        db.execute(conn,
                             "UPDATE stocks SET suspended = 1 WHERE code = ?",
                             (code,),
                         )
@@ -1113,12 +1043,11 @@ def bulk_daily_kline_from_clist(
                     continue
 
                 try:
-                    conn.execute("""
-                        INSERT OR REPLACE INTO stock_history
-                        (code, date, open, close, high, low, volume, amount,
-                         amplitude, pct_chg, change, turnover)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
+                    sql = db.upsert_sql("stock_history",
+                                        ["code", "date", "open", "close", "high", "low", "volume", "amount",
+                                         "amplitude", "pct_chg", "change", "turnover"],
+                                        ["code", "date"])
+                    db.execute(conn, sql, (
                         code, target_trade_date,
                         open_, close, high, low,
                         volume, amount, amplitude,
@@ -1176,7 +1105,7 @@ def fetch_history_batch(
     days: int = 365,
     interval: float = 2,
     target_trade_date: str = None,
-    conn: sqlite3.Connection = None,
+    conn = None,
 ) -> dict:
     """
     从 stocks 表读取下一批股票，拉取它们的日 K 线历史。
@@ -1190,11 +1119,10 @@ def fetch_history_batch(
 
     try:
         # 所有已入库、未停牌、非ST的股票代码
-        all_codes = [r[0] for r in conn.execute(
+        all_codes = [r[0] for r in db.fetchall(conn,
             "SELECT code FROM stocks "
             "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
-            "ORDER BY code"
-        ).fetchall()]
+            "ORDER BY code")]
 
         if not all_codes:
             log.warning("stocks 表为空，请先拉取股票列表")
@@ -1203,24 +1131,21 @@ def fetch_history_batch(
 
         # 每只股票的最新真实 K 线日期（close IS NOT NULL = 真实数据，排除占位）
         latest_date_map = {
-            r[0]: r[1] for r in conn.execute(
+            r[0]: r[1] for r in db.fetchall(conn,
                 "SELECT code, MAX(date) FROM stock_history "
-                "WHERE close IS NOT NULL GROUP BY code"
-            ).fetchall()
+                "WHERE close IS NOT NULL GROUP BY code")
         }
 
         # 每只股票最近一次"检查"日期（含占位记录）
         latest_checked_map = {
-            r[0]: r[1] for r in conn.execute(
-                "SELECT code, MAX(date) FROM stock_history GROUP BY code"
-            ).fetchall()
+            r[0]: r[1] for r in db.fetchall(conn,
+                "SELECT code, MAX(date) FROM stock_history GROUP BY code")
         }
 
         # 默认用库中已有的最新交易日作为"已是最新"的判断标准；
         # 日更模式下可显式传入目标交易日（如当天收盘日期）。
-        latest_trading_day = target_trade_date or conn.execute(
-            "SELECT MAX(date) FROM stock_history WHERE close IS NOT NULL"
-        ).fetchone()[0] or "0000-00-00"
+        latest_trading_day = target_trade_date or db.fetchone(conn,
+            "SELECT MAX(date) FROM stock_history WHERE close IS NOT NULL")[0] or "0000-00-00"
 
         log.info("库中最新交易日: %s", latest_trading_day)
 
@@ -1237,7 +1162,7 @@ def fetch_history_batch(
 
         if not remaining:
             _meta_set(conn, "history_done", "1")
-            _meta_set(conn, "history_done_at", datetime.now().isoformat())
+            _meta_set(conn, "history_done_at", cn_now().isoformat())
             return {"fetched": 0, "remaining": 0, "done": True, "errors": []}
 
         batch = remaining[:batch_size]
@@ -1245,9 +1170,8 @@ def fetch_history_batch(
         errors = []
 
         for i, code in enumerate(batch):
-            name = conn.execute(
-                "SELECT name FROM stocks WHERE code=?", (code,)
-            ).fetchone()
+            name = db.fetchone(conn,
+                "SELECT name FROM stocks WHERE code=?", (code,))
             name = name[0] if name else code
 
             # 确定增量起点：有历史则从最新日期拉，否则全量拉 days 天
@@ -1271,14 +1195,19 @@ def fetch_history_batch(
                     stored, mode_str, len(remaining) - i - 1,
                 )
             except _KlineEmpty:
-                # 服务端确认无数据 → 真正停牌/退市，标记
-                log.warning("  [%d/%d] %s %s  服务端确认无数据，标记为停牌",
-                           i + 1, len(batch), code, name)
-                conn.execute(
-                    "UPDATE stocks SET suspended = 1 WHERE code = ?",
-                    (code,),
-                )
-                conn.commit()
+                # 服务端确认无数据
+                # 仅在交易日才标记停牌，避免周末/节假日误标全市场
+                if is_trade_day(cn_today()):
+                    log.warning("  [%d/%d] %s %s  服务端确认无数据，标记为停牌",
+                               i + 1, len(batch), code, name)
+                    db.execute(conn,
+                        "UPDATE stocks SET suspended = 1 WHERE code = ?",
+                        (code,),
+                    )
+                    conn.commit()
+                else:
+                    log.info("  [%d/%d] %s %s  非交易日无数据，跳过（不标记停牌）",
+                            i + 1, len(batch), code, name)
             except _KlineNetError as e:
                 # 网络故障 → 不标记停牌，下次重试
                 log.warning("  [%d/%d] %s %s  网络失败，跳过（不标记停牌）: %s",
@@ -1292,14 +1221,14 @@ def fetch_history_batch(
             if i < len(batch) - 1:
                 time.sleep(interval)
 
-        _meta_set(conn, "history_last_fetch", datetime.now().isoformat())
+        _meta_set(conn, "history_last_fetch", cn_now().isoformat())
 
         new_remaining = len(remaining) - len(batch)
         done = new_remaining <= 0
 
         if done:
             _meta_set(conn, "history_done", "1")
-            _meta_set(conn, "history_done_at", datetime.now().isoformat())
+            _meta_set(conn, "history_done_at", cn_now().isoformat())
 
         return {
             "fetched": fetched,
@@ -1317,11 +1246,176 @@ def reset_history_progress():
     """清空 K 线历史数据，重新拉取。"""
     conn = _get_db()
     try:
-        conn.execute("DELETE FROM stock_history")
+        db.execute(conn, "DELETE FROM stock_history")
         for key in ["history_done", "history_done_at", "history_last_fetch"]:
-            conn.execute("DELETE FROM meta WHERE key=?", (key,))
+            db.execute(conn, "DELETE FROM meta WHERE key=?", (key,))
         conn.commit()
         log.info("K 线历史进度已重置")
+    finally:
+        conn.close()
+
+
+# ── 资金流向增量拉取 ─────────────────────────────────────
+
+def fetch_moneyflow_batch(
+    batch_size: int = 5,
+    days: int = 60,
+    interval: float = 10.0,
+    conn = None,
+) -> dict:
+    """
+    逐只拉取主力资金流向，存入 stock_moneyflow 表。
+
+    默认拉 60 个交易日（约3个月），覆盖低位建仓识别所需的数据窗口：
+      - 20日累计净流出分析需要 20 天滑窗
+      - 流出量"逐周递减"趋势需要 3-4 周对比基线
+      - 建仓期本身 3-8 周 + 之前的对比期
+
+    设计与 fetch_history_batch 一致：
+      - 每次拉 batch_size 只（默认5只，10秒间隔 ≈ 50秒/批）
+      - 自动跳过近3天已有数据的股票
+      - 支持断点续传：多次调用会自动从上次停的地方继续
+      - 适合夜间计划任务慢慢跑
+
+    3000只 × 10秒 ≈ 8小时。建议分批跑:
+      python slow_fetcher.py --moneyflow --batch 50 --interval 10
+      # 每次约 8 分钟拉 50 只，每天跑几次，几天覆盖全市场
+
+    Returns:
+        {"fetched": int, "remaining": int, "done": bool, "errors": list}
+    """
+    from capital_flow import get_moneyflow
+
+    own_conn = conn is None
+    if own_conn:
+        conn = _get_db()
+
+    try:
+        # 所有活跃非ST股票
+        all_codes = [r[0] for r in db.fetchall(conn,
+            "SELECT code FROM stocks "
+            "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
+            "ORDER BY code")]
+
+        if not all_codes:
+            return {"fetched": 0, "remaining": 0, "done": False,
+                    "errors": ["stocks 表为空"]}
+
+        # 每只股票在 moneyflow 表中的最新日期
+        latest_map = {
+            r[0]: r[1] for r in db.fetchall(conn,
+                "SELECT code, MAX(date) FROM stock_moneyflow GROUP BY code")
+        }
+
+        # 用 stock_history 中的最新交易日作为"已是最新"判断标准
+        latest_trading_day = db.fetchone(conn,
+            "SELECT MAX(date) FROM stock_history WHERE close IS NOT NULL")[0] or "0000-00-00"
+
+        # 需要更新的：从未拉过 或 最新数据比最新交易日早3天以上
+        from datetime import timedelta
+        cutoff = (datetime.strptime(latest_trading_day, "%Y-%m-%d")
+                  - timedelta(days=3)).strftime("%Y-%m-%d") if latest_trading_day > "2000-01-01" else "0000-00-00"
+
+        remaining = [
+            c for c in all_codes
+            if latest_map.get(c, "0000-00-00") < cutoff
+        ]
+
+        if not remaining:
+            return {"fetched": 0, "remaining": 0, "done": True, "errors": []}
+
+        batch = remaining[:batch_size]
+        fetched = 0
+        errors = []
+
+        for i, code in enumerate(batch):
+            name = db.fetchone(conn,
+                "SELECT name FROM stocks WHERE code=?", (code,))
+            name = name[0] if name else code
+
+            try:
+                flow_data = get_moneyflow(code, days=days)
+                stored = 0
+                sql = db.upsert_sql("stock_moneyflow",
+                                    ["code", "date", "main_net", "main_net_pct", "super_net",
+                                     "big_net", "mid_net", "small_net", "close", "pct_chg"],
+                                    ["code", "date"])
+                for d in flow_data:
+                    db.execute(conn, sql, (
+                        code, d["date"],
+                        d.get("main_net"), d.get("main_net_pct"),
+                        d.get("super_net"), d.get("big_net"),
+                        d.get("mid_net"), d.get("small_net"),
+                        d.get("close"), d.get("pct_chg"),
+                    ))
+                    stored += 1
+                conn.commit()
+                fetched += 1
+                log.info("  [%d/%d] %s %s  +%d 条资金流向 (剩余 %d 只)",
+                         i + 1, len(batch), code, name,
+                         stored, len(remaining) - i - 1)
+            except Exception as e:
+                log.warning("  [%d/%d] %s %s  资金流向失败: %s",
+                           i + 1, len(batch), code, name, e)
+                errors.append(f"{code}: {e}")
+
+            if i < len(batch) - 1:
+                time.sleep(interval)
+
+        _meta_set(conn, "moneyflow_last_fetch", cn_now().isoformat())
+
+        new_remaining = len(remaining) - len(batch)
+        done = new_remaining <= 0
+
+        if done:
+            _meta_set(conn, "moneyflow_done", "1")
+            _meta_set(conn, "moneyflow_done_at", cn_now().isoformat())
+
+        return {
+            "fetched": fetched,
+            "remaining": max(new_remaining, 0),
+            "done": done,
+            "errors": errors,
+        }
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def reset_moneyflow_progress():
+    """清空资金流向数据，重新拉取。"""
+    conn = _get_db()
+    try:
+        db.execute(conn, "DELETE FROM stock_moneyflow")
+        for key in ["moneyflow_done", "moneyflow_done_at", "moneyflow_last_fetch"]:
+            db.execute(conn, "DELETE FROM meta WHERE key=?", (key,))
+        conn.commit()
+        log.info("资金流向进度已重置")
+    finally:
+        conn.close()
+
+
+def load_stock_moneyflow(code: str, days: int = 60) -> list:
+    """从本地 DB 读取单只股票的资金流向数据。
+
+    Returns:
+        list of dict，与 capital_flow.get_moneyflow() 返回格式一致
+    """
+    conn = _get_db()
+    try:
+        rows = db.fetchall(conn,
+            "SELECT date, main_net, main_net_pct, super_net, big_net, "
+            "mid_net, small_net, close, pct_chg "
+            "FROM stock_moneyflow WHERE code=? ORDER BY date DESC LIMIT ?",
+            (code, days))
+        return [
+            {
+                "date": r[0], "main_net": r[1], "main_net_pct": r[2],
+                "super_net": r[3], "big_net": r[4], "mid_net": r[5],
+                "small_net": r[6], "close": r[7], "pct_chg": r[8],
+            }
+            for r in rows
+        ]
     finally:
         conn.close()
 
@@ -1353,7 +1447,33 @@ def daily_close_update(batch_size: int = 50,
       - 默认使用今天日期
       - 可手动指定 YYYY-MM-DD，便于补历史或重跑
     """
-    target_trade_date = target_trade_date or datetime.now().strftime("%Y-%m-%d")
+    today = cn_today()
+    target_trade_date = target_trade_date or cn_str("%Y-%m-%d")
+
+    # ── 非交易日保护：周末/节假日不应跑更新，避免误标停牌 ──
+    check_date = today
+    if target_trade_date:
+        try:
+            from datetime import datetime as _dt
+            check_date = _dt.strptime(target_trade_date, "%Y-%m-%d").date()
+        except Exception:
+            pass
+    if not is_trade_day(check_date):
+        ltd = last_trade_day(check_date)
+        log.warning(
+            "⚠️  %s 不是交易日（周末或节假日），跳过更新。"
+            "如需补数据请指定最近交易日: --target-date %s",
+            check_date.strftime("%Y-%m-%d"), ltd.strftime("%Y-%m-%d"),
+        )
+        return {
+            "target_trade_date": target_trade_date,
+            "skipped": True,
+            "reason": f"{check_date} 不是交易日，最近交易日为 {ltd}",
+            "snapshot": {"done": False},
+            "history": {"fetched": 0, "done": False},
+            "done": False,
+        }
+
     conn = _get_db()
     try:
         # ── Step 1: Fundamentals 快照（腾讯批量）──
@@ -1396,9 +1516,9 @@ def daily_close_update(batch_size: int = 50,
                 history_done = True
                 break
 
-        _meta_set(conn, "daily_close_last_run", datetime.now().isoformat())
+        _meta_set(conn, "daily_close_last_run", cn_now().isoformat())
         _meta_set(conn, "daily_close_target_date", target_trade_date)
-        _meta_set(conn, "history_last_fetch", datetime.now().isoformat())
+        _meta_set(conn, "history_last_fetch", cn_now().isoformat())
 
         return {
             "target_trade_date": target_trade_date,
@@ -1414,6 +1534,118 @@ def daily_close_update(batch_size: int = 50,
         }
     finally:
         conn.close()
+
+
+def full_daily_update(batch_size: int = 50,
+                      days: int = 365,
+                      interval: float = 2.0,
+                      snapshot_interval: float = 10.0,
+                      target_trade_date: str = None,
+                      max_rounds: int = 500,
+                      moneyflow_days: int = 60,
+                      moneyflow_interval: float = 10.0,
+                      moneyflow_auto: bool = True) -> dict:
+    """
+    一键全量收盘更新 = daily_close_update + moneyflow。
+
+    合并了两步操作：
+      1) Fundamentals 快照 + K线增量 (原 --daily-close-update)
+      2) 主力资金流向 (原 --moneyflow --moneyflow-auto)
+
+    适合收盘后一条命令跑完所有数据更新:
+      python slow_fetcher.py --full-update --batch 50 --interval 5
+
+    Args:
+        batch_size: 每轮拉取股票数（默认 50）
+        days: K线全量天数（默认 365）
+        interval: K线每只间隔秒数（默认 2）
+        snapshot_interval: fundamentals 批次间隔秒数
+        target_trade_date: 目标交易日 YYYY-MM-DD
+        max_rounds: K线最大循环轮数
+        moneyflow_days: 资金流向拉取天数（默认 60）
+        moneyflow_interval: 资金流向每只间隔秒数（默认 10）
+        moneyflow_auto: 资金流向是否循环到完成（默认 True）
+    """
+    # ── 非交易日保护 ──
+    today = cn_today()
+    check_date = today
+    if target_trade_date:
+        try:
+            from datetime import datetime as _dt
+            check_date = _dt.strptime(target_trade_date, "%Y-%m-%d").date()
+        except Exception:
+            pass
+    if not is_trade_day(check_date):
+        ltd = last_trade_day(check_date)
+        log.warning(
+            "⚠️  %s 不是交易日（周末或节假日），跳过全量更新。"
+            "如需补数据请指定: --target-date %s",
+            check_date.strftime("%Y-%m-%d"), ltd.strftime("%Y-%m-%d"),
+        )
+        return {
+            "skipped": True,
+            "reason": f"{check_date} 不是交易日，最近交易日为 {ltd}",
+        }
+
+    # ── Phase 1: Fundamentals + K线 ──
+    log.info("═══ Phase 1/2: Fundamentals + K线增量 ═══")
+    daily_result = daily_close_update(
+        batch_size=batch_size,
+        days=days,
+        interval=interval,
+        snapshot_interval=snapshot_interval,
+        target_trade_date=target_trade_date,
+        max_rounds=max_rounds,
+    )
+
+    # 如果 Phase 1 因非交易日被跳过，直接返回
+    if daily_result.get("skipped"):
+        return daily_result
+
+    # ── Phase 2: 资金流向 ──
+    log.info("═══ Phase 2/2: 主力资金流向 ═══")
+    mf_rounds = 0
+    mf_total_fetched = 0
+    mf_errors = []
+    mf_done = False
+
+    while True:
+        mf_rounds += 1
+        mf_result = fetch_moneyflow_batch(
+            batch_size=batch_size,
+            days=moneyflow_days,
+            interval=moneyflow_interval,
+        )
+        mf_total_fetched += mf_result.get("fetched", 0)
+        mf_errors.extend(mf_result.get("errors", []))
+        remaining = mf_result.get("remaining", 0)
+
+        log.info("资金流向第 %d 轮: 本轮 %d 只, 累计 %d 只, 剩余 %d 只",
+                 mf_rounds, mf_result.get("fetched", 0),
+                 mf_total_fetched, remaining)
+
+        if mf_result.get("done"):
+            mf_done = True
+            break
+        if not moneyflow_auto:
+            break
+        # 安全: 本轮 0 只也结束
+        if mf_result.get("fetched", 0) == 0 and remaining == 0:
+            mf_done = True
+            break
+
+    return {
+        "target_trade_date": daily_result.get("target_trade_date"),
+        "snapshot": daily_result.get("snapshot"),
+        "history": daily_result.get("history"),
+        "moneyflow": {
+            "fetched": mf_total_fetched,
+            "rounds": mf_rounds,
+            "errors": mf_errors,
+            "done": mf_done,
+        },
+        "done": daily_result.get("done", False) and mf_done,
+    }
 
 
 def intraday_update(snapshot_interval: float = 10.0,
@@ -1436,7 +1668,7 @@ def intraday_update(snapshot_interval: float = 10.0,
             target_trade_date=target_trade_date,
             conn=conn,
         )
-        _meta_set(conn, "intraday_last_run", datetime.now().isoformat())
+        _meta_set(conn, "intraday_last_run", cn_now().isoformat())
         return {
             "snapshot": snapshot_result,
             "done": snapshot_result.get("done", False),
@@ -1449,12 +1681,11 @@ def intraday_update(snapshot_interval: float = 10.0,
 
 def load_stock_history(code: str) -> pd.DataFrame:
     """读取单只股票的日 K 线历史。"""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = _get_db()
     try:
-        df = pd.read_sql_query(
+        df = db.read_sql(
             "SELECT * FROM stock_history WHERE code=? AND close IS NOT NULL ORDER BY date",
-            conn, params=(code,),
-        )
+            conn, params=(code,))
         for col in ["open", "close", "high", "low", "volume", "amount",
                      "amplitude", "pct_chg", "change", "turnover"]:
             if col in df.columns:
@@ -1468,12 +1699,11 @@ def load_stock_history(code: str) -> pd.DataFrame:
 
 def load_all_history() -> pd.DataFrame:
     """读取全部股票的日 K 线历史 (大表)。"""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = _get_db()
     try:
-        df = pd.read_sql_query(
+        df = db.read_sql(
             "SELECT * FROM stock_history WHERE close IS NOT NULL ORDER BY code, date",
-            conn,
-        )
+            conn)
         for col in ["open", "close", "high", "low", "volume", "amount",
                      "amplitude", "pct_chg", "change", "turnover"]:
             if col in df.columns:
@@ -1503,8 +1733,8 @@ def assess_market_regime() -> dict:
     优先离线可用，不依赖外部接口。
     """
     try:
-        conn = sqlite3.connect(str(DB_PATH))
-        row = conn.execute(
+        conn = _get_db()
+        row = db.fetchone(conn,
             """
             WITH last_trade AS (
                 SELECT code, MAX(date) AS last_date
@@ -1547,8 +1777,7 @@ def assess_market_regime() -> dict:
                 AVG(l.turnover) AS avg_turnover
             FROM latest l
             LEFT JOIN hist ON l.code = hist.code
-            """
-        ).fetchone()
+            """)
         conn.close()
     except Exception:
         return {
@@ -1643,7 +1872,7 @@ def assess_event_risk(code: str) -> dict:
     except Exception:
         return result
 
-    today = datetime.today().date()
+    today = cn_today()
     anns = []
     try:
         anns = get_announcements(code, page_size=20)
@@ -1901,7 +2130,7 @@ def _build_trade_decision(
             f"波动风险为 {risk_level}，不是高波动博弈",
             f"波动风险为 {risk_level}，需要更保守")
     add_buy(risk_reward is not None and risk_reward >= min_risk_reward,
-            f"预估盈亏比 1:{risk_reward:.2f}",
+            f"预估盈亏比 1:{risk_reward:.2f}" if risk_reward is not None else "暂时无法计算盈亏比",
             f"预估盈亏比仅 1:{risk_reward:.2f}" if risk_reward is not None else "暂时无法计算盈亏比")
     add_buy(regime_score >= regime_buy_floor,
             f"市场环境分 {regime_score:+.1f}，系统性风险可控",
@@ -1946,7 +2175,7 @@ def _build_trade_decision(
              f"事件因子 {event_score:+.1f}，事件风险尚未构成卖出")
     add_sell(
         dist_to_support is not None and dist_to_support >= min_support_gap_sell,
-        f"距离最近支撑 {dist_to_support:.1f}%，回撤缓冲不足",
+        f"距离最近支撑 {dist_to_support:.1f}%，回撤缓冲不足" if dist_to_support is not None else "支撑距离未知",
         f"距离最近支撑仅 {dist_to_support:.1f}%，暂未明显失守" if dist_to_support is not None else "支撑距离未知",
     )
 
@@ -2351,25 +2580,21 @@ def _print_status():
     conn = _get_db()
     try:
         # 非停牌股中有 K 线数据的数量
-        history_stocks = conn.execute(
+        history_stocks = db.fetchone(conn,
             """SELECT COUNT(DISTINCT h.code) FROM stock_history h
                JOIN stocks s ON h.code = s.code
-               WHERE h.close IS NOT NULL AND s.suspended = 0"""
-        ).fetchone()[0]
-        history_rows = conn.execute(
-            "SELECT COUNT(*) FROM stock_history WHERE close IS NOT NULL"
-        ).fetchone()[0]
+               WHERE h.close IS NOT NULL AND s.suspended = 0""")[0]
+        history_rows = db.fetchone(conn,
+            "SELECT COUNT(*) FROM stock_history WHERE close IS NOT NULL")[0]
         # 非停牌股中还没有 K 线数据的数量
-        history_remaining = conn.execute(
+        history_remaining = db.fetchone(conn,
             """SELECT COUNT(*) FROM stocks s
                WHERE s.suspended = 0
                AND s.code NOT IN (
                    SELECT DISTINCT code FROM stock_history WHERE close IS NOT NULL
-               )"""
-        ).fetchone()[0]
-        suspended_count = conn.execute(
-            "SELECT COUNT(*) FROM stocks WHERE suspended = 1"
-        ).fetchone()[0]
+               )""")[0]
+        suspended_count = db.fetchone(conn,
+            "SELECT COUNT(*) FROM stocks WHERE suspended = 1")[0]
         history_done = _meta_get(conn, "history_done", "0") == "1"
         history_last = _meta_get(conn, "history_last_fetch", "never")
         history_done_at = _meta_get(conn, "history_done_at", "")
@@ -2419,6 +2644,8 @@ def main():
                         help="盘中刷新股票宇宙和 fundamentals 快照")
     parser.add_argument("--daily-close-update", action="store_true",
                         help="收盘后统一更新: fundamentals + history")
+    parser.add_argument("--full-update", action="store_true",
+                        help="一键全量更新: fundamentals + history + moneyflow (收盘后推荐)")
     parser.add_argument("--trade-date", type=str,
                         help="指定目标交易日 YYYY-MM-DD (默认今天)")
 
@@ -2429,6 +2656,8 @@ def main():
                         help="已弃用: 在线检查新股")
     parser.add_argument("--reset", action="store_true",
                         help="重置列表拉取进度")
+    parser.add_argument("--reset-suspended", action="store_true",
+                        help="将所有误标为停牌的股票恢复为正常（修复周末误标）")
     parser.add_argument("--clear", action="store_true",
                         help="清空整个数据库")
 
@@ -2441,6 +2670,14 @@ def main():
                         help="拉取多少天的历史 (默认365)")
     parser.add_argument("--reset-history", action="store_true",
                         help="重置 K 线拉取进度")
+
+    # 资金流向模式
+    parser.add_argument("--moneyflow", action="store_true",
+                        help="拉取主力资金流向（逐只，默认10秒间隔）")
+    parser.add_argument("--moneyflow-auto", action="store_true",
+                        help="自动模式：循环拉取直到全部完成")
+    parser.add_argument("--reset-moneyflow", action="store_true",
+                        help="重置资金流向拉取进度")
 
     # 实时分析模式
     parser.add_argument("--analyze", type=str, metavar="CODE",
@@ -2462,8 +2699,48 @@ def main():
         reset_progress()
         return
 
+    if args.reset_suspended:
+        conn = _get_db()
+        before = db.fetchone(conn, "SELECT COUNT(*) FROM stocks WHERE suspended = 1")[0]
+        db.execute(conn, "UPDATE stocks SET suspended = 0")
+        conn.commit()
+        conn.close()
+        log.info("已将 %d 只停牌标记重置为正常。下次交易日运行更新时会重新检测真正停牌的股票。", before)
+        return
+
     if args.reset_history:
         reset_history_progress()
+        return
+
+    if args.reset_moneyflow:
+        reset_moneyflow_progress()
+        return
+
+    if args.moneyflow or args.moneyflow_auto:
+        rounds = 0
+        total_fetched = 0
+        while True:
+            rounds += 1
+            result = fetch_moneyflow_batch(
+                batch_size=args.batch,
+                days=args.days if args.days != 365 else 60,
+                interval=max(float(args.interval), 5.0),
+            )
+            total_fetched += result.get("fetched", 0)
+            remaining = result.get("remaining", 0)
+            errs = result.get("errors", [])
+            print(
+                f"第 {rounds} 轮: 本轮 {result.get('fetched', 0)} 只, "
+                f"累计 {total_fetched} 只, 剩余 {remaining} 只"
+                f"{f', 错误 {len(errs)}' if errs else ''}"
+            )
+            if errs:
+                for e in errs[:3]:
+                    print(f"  {e}")
+            if result.get("done") or not args.moneyflow_auto:
+                break
+        if result.get("done"):
+            print(f"\n全部完成! 共 {total_fetched} 只股票的资金流向已入库")
         return
 
     if args.export:
@@ -2501,6 +2778,51 @@ def main():
         )
         if snap.get("errors"):
             print(f"  Fundamentals errors: {snap['errors'][:3]}")
+        _print_status()
+        return
+
+    if args.full_update:
+        result = full_daily_update(
+            batch_size=args.batch,
+            days=args.days,
+            interval=args.interval,
+            snapshot_interval=max(float(args.interval), 10.0),
+            target_trade_date=args.trade_date,
+            moneyflow_interval=max(float(args.interval), 5.0),
+        )
+        snap = result.get("snapshot", {})
+        hist = result.get("history", {})
+        mf = result.get("moneyflow", {})
+
+        # Fundamentals 行
+        if snap.get("already_complete"):
+            fund_line = "  Fundamentals: 当天快照已完整"
+        else:
+            fund_line = f"  Fundamentals: {snap.get('stored', 0)} 条 / {snap.get('batches', 0)} 批"
+
+        # History 行
+        hist_line = (
+            f"  K线历史: {hist.get('fetched', 0)} 只, {hist.get('rounds', 0)} 轮"
+            f"{'  ✓ 全部完成' if hist.get('done') else '  (未完成，下次继续)'}"
+        )
+
+        # Moneyflow 行
+        mf_line = (
+            f"  资金流向: {mf.get('fetched', 0)} 只, {mf.get('rounds', 0)} 轮"
+            f"{'  ✓ 全部完成' if mf.get('done') else '  (未完成，下次继续)'}"
+        )
+
+        print(
+            f"\n═══ 全量更新完成 ═══\n"
+            f"  目标交易日: {result.get('target_trade_date')}\n"
+            f"{fund_line}\n"
+            f"{hist_line}\n"
+            f"{mf_line}\n"
+        )
+        for label, section in [("Fundamentals", snap), ("History", hist), ("Moneyflow", mf)]:
+            errs = section.get("errors", [])
+            if errs:
+                print(f"  {label} errors: {errs[:3]}")
         _print_status()
         return
 
@@ -2559,7 +2881,7 @@ def main():
     if args.history:
         conn = _get_db()
         try:
-            stocks_count = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
+            stocks_count = db.fetchone(conn, "SELECT COUNT(*) FROM stocks")[0]
             if stocks_count == 0:
                 print("错误: stocks 表为空，请先拉取股票列表 (不带 --history)")
                 return
@@ -2605,7 +2927,8 @@ def main():
     print("后续更新建议：")
     print("  1. python import_json.py")
     print("  2. python slow_fetcher.py --intraday-update")
-    print("  3. python slow_fetcher.py --daily-close-update --batch 100 --interval 10")
+    print("  3. python slow_fetcher.py --full-update --batch 50 --interval 5  (推荐: 一键全量)")
+    print("     或分步: --daily-close-update + --moneyflow --moneyflow-auto")
 
 
 if __name__ == "__main__":

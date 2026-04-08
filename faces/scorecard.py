@@ -116,7 +116,8 @@ class Scorecard:
         all_vetos.extend(RiskFace.check_veto(risk_signals))
 
         result.vetos = [
-            {"triggered": v[0], "reason": v[1], "cap_score": v[2]}
+            {"triggered": v[0], "reason": v[1], "cap_score": v[2],
+             "dim_name": v[3] if len(v) > 3 else None}
             for v in all_vetos if v[0]
         ]
 
@@ -179,7 +180,8 @@ class Scorecard:
         all_vetos.extend(RiskFace.check_veto(risk_signals))
 
         result.vetos = [
-            {"triggered": v[0], "reason": v[1], "cap_score": v[2]}
+            {"triggered": v[0], "reason": v[1], "cap_score": v[2],
+             "dim_name": v[3] if len(v) > 3 else None}
             for v in all_vetos if v[0]
         ]
 
@@ -273,24 +275,50 @@ def _renormalize_weights(dims: list):
 
 
 def _apply_vetos(adjusted_total: float, dims: list, vetos: list) -> float:
-    """应用一票否决，返回最终得分。"""
-    final = adjusted_total
+    """应用一票否决，返回最终得分。
+
+    改进逻辑:
+      1. 有 dim_name + cap_score → 精确封顶对应维度，重新算加权总分
+      2. 无 dim_name 但有 cap_score → 降级为全局惩罚
+      3. cap_score=None → 整体×0.75 惩罚
+    """
+    # 先处理维度封顶型 veto
+    capped_dims = {}  # dim_name → min cap
+    global_penalty = 1.0
 
     for v in vetos:
         cap = v.get("cap_score")
-        if cap is not None:
-            # 特定维度封顶 → 等效扣分
-            # cap 是该维度得分上限 (0~10)
-            # 简化处理: 如果cap很低，对总分施加惩罚
+        dim_name = v.get("dim_name")
+
+        if cap is not None and dim_name:
+            # 精确封顶: 记录最严格的 cap
+            if dim_name not in capped_dims or cap < capped_dims[dim_name]:
+                capped_dims[dim_name] = cap
+        elif cap is not None and not dim_name:
+            # 有cap但无维度名 → 降级为全局惩罚
             if cap == 0:
-                final *= 0.5
+                global_penalty *= 0.5
             elif cap <= 2:
-                final *= 0.7
+                global_penalty *= 0.7
             elif cap <= 3:
-                final *= 0.8
+                global_penalty *= 0.8
         else:
-            # 整体惩罚 (通常×0.7~0.8)
-            final *= 0.75
+            # 整体惩罚
+            global_penalty *= 0.75
+
+    # 如果有维度封顶，直接修改维度分数并重算
+    if capped_dims:
+        for d in dims:
+            name = d.get("name", "")
+            if name in capped_dims:
+                original = d.get("score", 0)
+                cap_val = capped_dims[name]
+                if original > cap_val:
+                    d["score"] = cap_val
+        # 基于封顶后的维度重新算加权总分
+        final = _weighted_sum(dims) * global_penalty
+    else:
+        final = adjusted_total * global_penalty
 
     return max(0, min(100, final))
 

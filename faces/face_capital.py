@@ -108,6 +108,7 @@ class CapitalFace:
         moneyflow_days: int = 10,
         margin_days: int = 20,
         northbound_adj: float = 0.0,
+        local_only: bool = False,
     ) -> CapitalResult:
         """
         执行完整资金面分析。
@@ -120,6 +121,7 @@ class CapitalFace:
         moneyflow_days  : int   主力资金查询天数
         margin_days     : int   融资融券查询天数
         northbound_adj  : float 北向资金修正值 (从环境层传入)
+        local_only      : bool  True时跳过 moneyflow/margin API（选股批量模式）
         """
         signals = CapitalSignals()
         mf_report = ""
@@ -127,7 +129,10 @@ class CapitalFace:
         qt_report = ""
 
         # ── 1. 主力资金流向 ──
-        mf_data, mf_report, mf_err = CapitalFace._fetch_moneyflow(stock_code, moneyflow_days)
+        if local_only:
+            mf_data, mf_report, mf_err = CapitalFace._fetch_moneyflow_local(stock_code, moneyflow_days)
+        else:
+            mf_data, mf_report, mf_err = CapitalFace._fetch_moneyflow(stock_code, moneyflow_days)
         if not mf_err:
             CapitalFace._extract_moneyflow(signals, mf_data, mf_report)
 
@@ -138,7 +143,7 @@ class CapitalFace:
             signals.northbound_direction = "outflow"
 
         # ── 3. 融资融券 ──
-        if include_margin:
+        if include_margin and not local_only:
             mg_data, mg_report, mg_err = CapitalFace._fetch_margin(stock_code, margin_days)
             if not mg_err:
                 CapitalFace._extract_margin(signals, mg_data, mg_report)
@@ -212,9 +217,9 @@ class CapitalFace:
         """
         vetos = []
         if signals.consecutive_outflow_days >= 3 and signals.margin_trend == "down":
-            vetos.append((True, "连续3日主力净流出且融资余额下降", None))
+            vetos.append((True, "连续3日主力净流出且融资余额下降", None, None))
         if signals.short_selling_surge:
-            vetos.append((True, "融券余额快速放大（做空信号）", 0))
+            vetos.append((True, "融券余额快速放大（做空信号）", 0, "融资融券"))
         return vetos
 
     # ╔══════════════════════════════════════════════════╗
@@ -222,8 +227,22 @@ class CapitalFace:
     # ╚══════════════════════════════════════════════════╝
 
     @staticmethod
+    def _fetch_moneyflow_local(stock_code: str, days: int):
+        """从本地 DB 读取资金流向。无数据时返回空（不报错）。"""
+        try:
+            import slow_fetcher as sf
+            data = sf.load_stock_moneyflow(stock_code, days=days)
+            if not data:
+                return [], "  [本地DB] 暂无资金流向数据（需先运行 --moneyflow 拉取）", "no_local_data"
+            report = format_moneyflow_report(data)
+            report = report.replace("主力资金流向报告", "主力资金流向报告 [本地DB]")
+            return data, report, None
+        except Exception as e:
+            return [], f"  [本地DB] 资金流向读取失败: {e}", str(e)
+
+    @staticmethod
     def _fetch_moneyflow(stock_code: str, days: int):
-        """获取主力资金流向数据。Returns: (data, report, error_msg)"""
+        """获取主力资金流向数据（在线API）。Returns: (data, report, error_msg)"""
         try:
             data = get_moneyflow(stock_code, days=days)
             report = format_moneyflow_report(data)

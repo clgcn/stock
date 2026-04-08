@@ -21,6 +21,7 @@
 from __future__ import annotations
 import sys
 from pathlib import Path
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, Dict
 
@@ -28,6 +29,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from _http_utils import cn_now
 from data_fetcher import get_kline, get_kline_prefer_db
 import risk_manager as rm
 
@@ -227,11 +229,11 @@ class RiskFace:
         """
         vetos = []
         if signals.kelly_position_pct is not None and signals.kelly_position_pct <= 0:
-            vetos.append((True, "Kelly仓位建议为0（负期望策略）", None))
+            vetos.append((True, "Kelly仓位建议为0（负期望策略）", None, None))
         if signals.var_95_pct is not None and signals.var_95_pct > 8:
-            vetos.append((True, f"VaR(95%)={signals.var_95_pct:.1f}%>8% 极端波动", None))
+            vetos.append((True, f"VaR(95%)={signals.var_95_pct:.1f}%>8% 极端波动", None, None))
         if signals.risk_level == "extreme":
-            vetos.append((True, "综合风险等级: 极端", None))
+            vetos.append((True, "综合风险等级: 极端", None, None))
         return vetos
 
     @staticmethod
@@ -286,8 +288,7 @@ class RiskFace:
     def _fetch_kline(stock_code: str, analysis_days: int, local_only: bool = False):
         """获取K线数据。local_only=True 时纯本地，不发 API。Returns: (df, error_msg)"""
         try:
-            from datetime import datetime, timedelta
-            start = (datetime.today() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
+            start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
             df = get_kline_prefer_db(stock_code, period="daily", start=start,
                                       adjust="qfq", local_only=local_only)
             if df is None:

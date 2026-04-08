@@ -1,19 +1,18 @@
 """
-从 data/ 目录下的 JSON 文件（4.json, 5.json, ...）批量导入股票数据到 stocks.db
+从 data/ 目录下的 JSON 文件（4.json, 5.json, ...）批量导入股票数据到 PostgreSQL
 用法: python import_json.py
 """
 
 import json
-import sqlite3
+import db
 import glob
 import os
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-DB_PATH  = os.path.join(DATA_DIR, "stocks.db")
 
 
-def ensure_tables(conn: sqlite3.Connection):
-    conn.execute("""
+def ensure_tables(conn):
+    db.execute(conn, """
         CREATE TABLE IF NOT EXISTS stocks (
             code          TEXT PRIMARY KEY,
             name          TEXT,
@@ -22,7 +21,7 @@ def ensure_tables(conn: sqlite3.Connection):
     """)
     conn.commit()
 
-def import_file(conn: sqlite3.Connection, path: str) -> tuple[int, int]:
+def import_file(conn, path: str) -> tuple[int, int]:
     """导入单个 JSON 文件，返回 (新增, 跳过) 数量。"""
     with open(path, encoding="utf-8") as f:
         data = json.load(f)
@@ -40,10 +39,10 @@ def import_file(conn: sqlite3.Connection, path: str) -> tuple[int, int]:
             skipped += 1
             continue
 
-        conn.execute(
+        db.execute(conn,
             """
             INSERT INTO stocks (code, name, suspended)
-            VALUES (?, ?, 0)
+            VALUES (%s, %s, 0)
             ON CONFLICT(code) DO UPDATE SET
                 name = excluded.name
             """,
@@ -67,12 +66,11 @@ def main():
         print("data/ 目录下没有找到数字命名的 JSON 文件（如 4.json, 5.json）")
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn = db.get_conn()
     ensure_tables(conn)
 
     # 导入前总数
-    before = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
+    before = db.execute(conn, "SELECT COUNT(*) FROM stocks", ()).fetchone()[0]
     print(f"导入前数据库已有: {before} 条\n")
 
     total_inserted = 0
@@ -84,7 +82,7 @@ def main():
         total_skipped  += skipped
         print(f"  ✅ {os.path.basename(path):10s}  新增/覆盖: {inserted:3d} 条  跳过: {skipped} 条")
 
-    after = conn.execute("SELECT COUNT(*) FROM stocks").fetchone()[0]
+    after = db.execute(conn, "SELECT COUNT(*) FROM stocks", ()).fetchone()[0]
     conn.close()
 
     print(f"\n导入完成！")

@@ -12,7 +12,7 @@
   PERIOD_MAP, ADJUST_MAP
 """
 
-from _http_utils import _get, _get_secid, _sina_prefix, eastmoney_throttle, kline_cache
+from _http_utils import _get, _get_secid, _sina_prefix, eastmoney_throttle, kline_cache, cn_now, cn_today
 
 import pandas as pd
 import numpy as np
@@ -86,7 +86,7 @@ def get_kline(
     secid = _get_secid(code)
 
     beg = start.replace("-", "") if start else "19900101"
-    ened = end.replace("-", "") if end else datetime.today().strftime("%Y%m%d")
+    ened = end.replace("-", "") if end else cn_now().strftime("%Y%m%d")
 
     # ── 缓存检查 ──
     cache_key = (code, period, beg, ened, adjust, limit)
@@ -406,7 +406,7 @@ def plot_kline(df, indicator="macd", save_path=None, title=None) -> str:
 
     if save_path is None:
         out_dir = Path(__file__).parent / "charts"; out_dir.mkdir(exist_ok=True)
-        save_path = str(out_dir / f"{code}_{period}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
+        save_path = str(out_dir / f"{code}_{period}_{cn_now().strftime('%Y%m%d_%H%M%S')}.png")
     plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=bg); plt.close(fig)
     return save_path
 
@@ -444,7 +444,7 @@ def _cli():
         return
     if not args.code: parser.print_help(); sys.exit(0)
 
-    start = args.start or (datetime.today() - timedelta(days=args.days)).strftime("%Y-%m-%d")
+    start = args.start or (cn_now() - timedelta(days=args.days)).strftime("%Y-%m-%d")
     df = get_kline(args.code, period=args.period, start=start, end=args.end, adjust=args.adjust)
     print(f"Total {len(df)} bars  Name: {df.attrs.get('name','')}")
     if not args.no_tech: df = add_indicators(df)

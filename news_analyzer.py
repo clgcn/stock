@@ -31,6 +31,8 @@ import time
 from datetime import datetime, timedelta
 from urllib.parse import quote_plus
 
+from _http_utils import cn_now, cn_today, cn_str, CN_TZ
+
 try:
     from curl_cffi import requests
     _USE_CURL = True
@@ -80,7 +82,7 @@ def _default_max_age_days() -> int:
     工作日: 2 天窗口（昨天+今天）
     周末/周一盘前: 3 天（覆盖周五的消息）
     """
-    wd = datetime.now().weekday()  # 0=Mon ... 6=Sun
+    wd = cn_now().weekday()  # 0=Mon ... 6=Sun
     return 3 if wd in (0, 5, 6) else 2
 
 
@@ -91,7 +93,7 @@ def _parse_datetime(dt_str: str):
     # Unix timestamp (新浪 ctime)
     if str(dt_str).isdigit() and len(str(dt_str)) >= 10:
         try:
-            return datetime.fromtimestamp(int(dt_str))
+            return datetime.fromtimestamp(int(dt_str), tz=CN_TZ)
         except Exception:
             pass
     # 常见字符串格式
@@ -128,9 +130,10 @@ def _friendly_time(dt_str) -> str:
     if dt is None:
         return ""
     try:
-        now = datetime.now()
+        now = cn_now()
         if dt.tzinfo is not None:
             dt = dt.replace(tzinfo=None)
+        now = now.replace(tzinfo=None)
         delta = now - dt
         hours = int(delta.total_seconds() / 3600)
         if hours < 1:
@@ -150,9 +153,10 @@ def _is_within_window(dt_str, max_age_days: int = None) -> bool:
     dt = _parse_datetime(str(dt_str) if dt_str else "")
     if dt is None:
         return True  # 无法判断日期时，保守保留
-    now = datetime.now()
+    now = cn_now()
     if dt.tzinfo is not None:
         dt = dt.replace(tzinfo=None)
+    now = now.replace(tzinfo=None)
     delta_days = (now - dt).total_seconds() / 86400
     return 0 <= delta_days <= max_age_days
 
@@ -197,7 +201,7 @@ def _fetch_sina_roll(pageid: str, lid: str, label: str,
                 continue
             ctime = item.get("ctime") or item.get("create_time") or ""
             if str(ctime).isdigit() and len(str(ctime)) >= 10:
-                dt = datetime.fromtimestamp(int(ctime))
+                dt = datetime.fromtimestamp(int(ctime), tz=CN_TZ)
                 pub_time = dt.strftime("%Y-%m-%d %H:%M:%S")
             else:
                 pub_time = str(ctime)
@@ -241,7 +245,7 @@ def _fetch_sina_search_news(keyword: str, max_items: int = 10) -> list[dict]:
                     continue
                 ctime = item.get("ctime") or item.get("create_time") or ""
                 if str(ctime).isdigit() and len(str(ctime)) >= 10:
-                    dt = datetime.fromtimestamp(int(ctime))
+                    dt = datetime.fromtimestamp(int(ctime), tz=CN_TZ)
                     pub_time = dt.strftime("%Y-%m-%d %H:%M:%S")
                 else:
                     pub_time = str(ctime)
@@ -572,7 +576,7 @@ def get_market_news_report() -> str:
       2. 国内A股/财经新闻
       3. 新闻情绪微调值
     """
-    now = datetime.now()
+    now = cn_now()
     sep = "═" * 56
     max_age = _default_max_age_days()
 

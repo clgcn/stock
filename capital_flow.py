@@ -13,8 +13,11 @@
       本模块改为基于"成交额趋势 + 十大活跃股"评估外资活跃度。
 """
 
-from _http_utils import _get, _get_secid
+from _http_utils import _get, _get_secid, eastmoney_throttle
 import time
+import logging
+
+_log = logging.getLogger(__name__)
 
 
 # ──────────────────────────────────────────
@@ -38,6 +41,7 @@ def _fetch_northbound_deal(days: int) -> list:
         "source":      "WEB",
         "client":      "WEB",
     }
+    eastmoney_throttle.acquire()
     resp = _get(url, params=params)
     resp.raise_for_status()
     data = resp.json()
@@ -89,6 +93,7 @@ def _fetch_northbound_top10(days: int = 3) -> list:
         "client":      "WEB",
     }
     try:
+        eastmoney_throttle.acquire()
         resp = _get(url, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
@@ -239,6 +244,7 @@ def get_moneyflow(code: str, days: int = 10) -> list:
         "_":      int(time.time() * 1000),
     }
     try:
+        eastmoney_throttle.acquire()
         resp = _get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -256,13 +262,13 @@ def get_moneyflow(code: str, days: int = 10) -> list:
             continue
         def _yi(v):
             try: return round(float(v) / 1e8, 4)
-            except: return None
+            except Exception: return None
         def _pct(v):
             try: return round(float(v), 2)
-            except: return None
+            except Exception: return None
         def _f(v):
             try: return round(float(v), 2)
-            except: return None
+            except Exception: return None
         results.append({
             "date":         parts[0],
             "close":        _f(parts[1]),
@@ -363,6 +369,7 @@ def get_margin_trading(code: str, days: int = 20) -> list:
         "client":      "WEB",
     }
     try:
+        eastmoney_throttle.acquire()
         resp = _get(url, params=params)
         resp.raise_for_status()
         data = resp.json()
@@ -375,10 +382,10 @@ def get_margin_trading(code: str, days: int = 20) -> list:
 
     def _yi(v):
         try: return round(float(v) / 1e8, 4) if v else None
-        except: return None
+        except Exception: return None
     def _wan(v):
         try: return round(float(v) / 1e4, 2) if v else None
-        except: return None
+        except Exception: return None
 
     results = []
     for r in rows:

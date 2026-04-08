@@ -18,6 +18,35 @@ from datetime import datetime
 from typing import Dict, List, Optional, Callable
 
 # =====================================================
+# A-Share-Specific Helpers
+# =====================================================
+
+def _get_price_limit(code: str, name: str = "") -> float:
+    """
+    Return price limit percentage for the stock.
+    - ST stocks: ±5%
+    - ChiNext (3xxxx): ±20%
+    - STAR Market (688xxx): ±20%
+    - Main board (60xxxx, 00xxxx): ±10%
+    """
+    if "ST" in name.upper():
+        return 0.05
+    if code.startswith("30") or code.startswith("688"):
+        return 0.20
+    return 0.10
+
+
+def _is_limit_up(close: float, prev_close: float, limit_pct: float) -> bool:
+    """Check if stock hit limit up (涨停)."""
+    return close >= prev_close * (1 + limit_pct - 0.005)
+
+
+def _is_limit_down(close: float, prev_close: float, limit_pct: float) -> bool:
+    """Check if stock hit limit down (跌停)."""
+    return close <= prev_close * (1 - limit_pct + 0.005)
+
+
+# =====================================================
 # Built-in Strategy Definitions
 # =====================================================
 
@@ -216,6 +245,8 @@ def backtest(
     max_position: float = 1.0,     # Maximum position ratio
     stop_loss: float = 0.0,        # Stop-loss ratio (0 = disabled)
     take_profit: float = 0.0,      # Take-profit ratio (0 = disabled)
+    code: str = "",                # Stock code for price limit determination
+    name: str = "",                # Stock name for ST detection
 ) -> Dict:
     """
     Execute strategy backtest.
@@ -231,8 +262,15 @@ def backtest(
         max_position     Maximum position ratio
         stop_loss        Stop-loss ratio (e.g. 0.05 = stop at 5% loss)
         take_profit      Take-profit ratio
+        code             Stock code (e.g. "600519") for price limit detection
+        name             Stock name for ST detection (涨跌停 handling)
 
     Returns: Complete backtest result dictionary
+
+    A-Share-Specific Features:
+        - 涨跌停 (Daily Price Limit): Enforces ±10% (main), ±20% (ChiNext/STAR), ±5% (ST)
+        - T+1 Settlement: Cannot sell on the same day as buy
+        - Stock Suspension: Skips trading on days with zero volume
     """
     if strategy_name not in STRATEGIES:
         return {"error": f"Unknown strategy: {strategy_name}, available: {list(STRATEGIES.keys())}"}
@@ -249,14 +287,28 @@ def backtest(
     capital = initial_capital
     shares = 0
     entry_price = 0
+    buy_bar_idx = -999  # Track which bar we bought on (for T+1 settlement)
     trades = []
     equity_curve = []
     positions = []
     trade_log = []
 
+    # Get price limit for this stock
+    price_limit_pct = _get_price_limit(code, name)
+
     for i in range(n):
         price = df_bt.iloc[i]["close"]
         sig = signal.iloc[i]
+
+        # Feature 3: Stock Suspension Handling
+        # If volume is zero or missing, treat as suspended day
+        volume = df_bt.iloc[i].get("volume", 0)
+        is_suspended = volume <= 0 or pd.isna(volume)
+
+        # Feature 1: 涨跌停 (Daily Price Limit) Handling
+        prev_close = df_bt.iloc[i - 1]["close"] if i > 0 else price
+        is_limit_up_flag = _is_limit_up(price, prev_close, price_limit_pct)
+        is_limit_down_flag = _is_limit_down(price, prev_close, price_limit_pct)
 
         # Stop-loss / take-profit check (when holding)
         if shares > 0 and entry_price > 0:
@@ -267,46 +319,58 @@ def backtest(
                 sig = -1  # Trigger take-profit
 
         # Buy
-        if sig == 1 and shares == 0:
-            buy_price = price * (1 + slippage)
-            buy_amount = capital * max_position
-            shares = int(buy_amount / buy_price / 100) * 100  # A-share: multiples of 100
-            # If insufficient for 1 lot, allow 100 shares for backtest purposes
-            if shares == 0 and buy_amount >= buy_price:
-                shares = 100
-            elif shares == 0 and buy_amount < buy_price:
-                shares = 100  # Allow minimum 1 lot for strategy validation
-            if shares > 0:
-                cost = shares * buy_price * (1 + commission)
-                capital -= cost
-                entry_price = buy_price
-                trade_log.append({
-                    "date": df_bt.iloc[i]["date"],
-                    "action": "BUY",
-                    "price": round(buy_price, 2),
-                    "shares": shares,
-                    "cost": round(cost, 2),
-                })
+        if sig == 1 and shares == 0 and not is_suspended:
+            # Cannot buy on limit up day
+            if is_limit_up_flag:
+                sig = 0  # Cancel buy order
+            else:
+                buy_price = price * (1 + slippage)
+                buy_amount = capital * max_position
+                shares = int(buy_amount / buy_price / 100) * 100  # A-share: multiples of 100
+                # If insufficient for 1 lot, allow 100 shares for backtest purposes
+                if shares == 0 and buy_amount >= buy_price:
+                    shares = 100
+                elif shares == 0 and buy_amount < buy_price:
+                    shares = 100  # Allow minimum 1 lot for strategy validation
+                if shares > 0:
+                    cost = shares * buy_price * (1 + commission)
+                    capital -= cost
+                    entry_price = buy_price
+                    buy_bar_idx = i  # Feature 2: T+1 Settlement tracking
+                    trade_log.append({
+                        "date": df_bt.iloc[i]["date"],
+                        "action": "BUY",
+                        "price": round(buy_price, 2),
+                        "shares": shares,
+                        "cost": round(cost, 2),
+                    })
 
         # Sell
-        elif sig == -1 and shares > 0:
-            sell_price = price * (1 - slippage)
-            revenue = shares * sell_price * (1 - commission - stamp_tax)
-            pnl = revenue - (shares * entry_price * (1 + commission))
-            capital += revenue
+        elif sig == -1 and shares > 0 and not is_suspended:
+            # Feature 2: T+1 Settlement - cannot sell on same day as buy
+            if i <= buy_bar_idx:
+                sig = 0  # Cancel sell order (T+1 rule)
+            # Cannot sell on limit down day (but stop-loss can queue for next available)
+            elif is_limit_down_flag:
+                sig = 0  # Cancel sell order
+            else:
+                sell_price = price * (1 - slippage)
+                revenue = shares * sell_price * (1 - commission - stamp_tax)
+                pnl = revenue - (shares * entry_price * (1 + commission))
+                capital += revenue
 
-            trade_log.append({
-                "date": df_bt.iloc[i]["date"],
-                "action": "SELL",
-                "price": round(sell_price, 2),
-                "shares": shares,
-                "revenue": round(revenue, 2),
-                "pnl": round(pnl, 2),
-                "pnl_pct": round(pnl / (shares * entry_price) * 100, 2),
-            })
-            trades.append(pnl)
-            shares = 0
-            entry_price = 0
+                trade_log.append({
+                    "date": df_bt.iloc[i]["date"],
+                    "action": "SELL",
+                    "price": round(sell_price, 2),
+                    "shares": shares,
+                    "revenue": round(revenue, 2),
+                    "pnl": round(pnl, 2),
+                    "pnl_pct": round(pnl / (shares * entry_price) * 100, 2),
+                })
+                trades.append(pnl)
+                shares = 0
+                entry_price = 0
 
         total_equity = capital + shares * price
         equity_curve.append(total_equity)
@@ -577,6 +641,7 @@ def calibrate_decision_engine_batch(
                 max_position=1.0,
                 stop_loss=0.0,
                 take_profit=0.0,
+                code=code,  # Pass stock code for A-share-specific features
             )
             if "error" in result:
                 continue

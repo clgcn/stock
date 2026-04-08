@@ -23,6 +23,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 
+import db
+from _http_utils import cn_now, cn_today, cn_str, next_trade_day, last_trade_day
+
 try:
     from mcp.server.fastmcp import FastMCP
 except ImportError:
@@ -61,234 +64,17 @@ from faces import (
     format_combined_decision,
 )
 
+# -- Load instructions from prompt file --
+_PROMPT_FILE = _HERE / "prompt.md"
+if _PROMPT_FILE.exists():
+    _instructions = _PROMPT_FILE.read_text(encoding="utf-8")
+else:
+    _instructions = "A股量化投资研究员 — 请确保 prompt.md 文件存在于 MCP Server 同级目录。"
+
 # -- Initialize MCP server --
 mcp = FastMCP(
     name="a-share-stock",
-    instructions=(
-        "你现在是A股量化投资研究员，目标不是随意给观点，而是按严格流程把市场、新闻、财报、估值、技术、量化资金、风险控制全部纳入，再给出明确的买/卖/观望结论。\n\n"
-
-        "【工具定位（共22个工具）】\n"
-        "── 入口级工具 ──\n"
-        "1.  resolve_stock        — 股票名称/代码标准化解析，任何名称输入都先过这一步\n"
-        "2.  full_stock_analysis  — 【单股分析唯一入口】五面体系全维度：环境层→催化剂面→技术面→资金面→基本面→风控面→评分卡→3×3综合决策\n"
-        "3.  full_stock_selection — 【选股唯一入口】两阶段：本地DB筛选(0次网络) → 每只候选全维度实时分析(与full_stock_analysis一致)\n"
-        "── 市场/宏观 ──\n"
-        "4.  market_news          — 外围行情+新闻面基线，任何分析前优先调用\n"
-        "5.  northbound_flow      — 北向资金（沪深港通）成交活跃度，外资参与度指标\n"
-        "── 个股基本面 ──\n"
-        "6.  stock_news            — 个股新闻情绪与催化线索\n"
-        "7.  stock_announcements   — 公告/财报窗口检查\n"
-        "8.  earnings_analysis     — 财报/业绩公告质量与市场反应\n"
-        "9.  financial_data        — PE/PB/ROE/毛利率/净利率/市值\n"
-        "10. valuation_quality     — PEG + 杜邦分析，估值质量深度\n"
-        "11. balance_sheet         — 资产负债率 + 商誉预警\n"
-        "12. dividend_history      — 分红历史（价值型/长线）\n"
-        "── 资金面 ──\n"
-        "13. moneyflow             — 主力大单净流入/流出，短线核心\n"
-        "14. margin_trading        — 融资融券余额变化，多空力量对比\n"
-        "── 技术面/量化 ──\n"
-        "15. realtime_quote        — 单股/多股实时价格快照\n"
-        "16. batch_quote           — 批量行情概览（多股横向对比）\n"
-        "17. kline_data            — K线原始数据 + MA/MACD/RSI/BOLL/KDJ（供Claude分析）\n"
-        "18. stock_diagnosis       — 7维量化诊断 + KDJ + K线形态 + 蒙特卡洛\n"
-        "19. quant_activity        — 量化资金参与度（交易时段内调用）\n"
-        "── 风控/回测 ──\n"
-        "20. risk_assessment       — VaR/CVaR/Kelly/ATR止损止盈/仓位\n"
-        "21. strategy_backtest     — 历史策略回测，按需独立调用\n"
-        "── 底层工具 ──\n"
-        "22. stock_screener        — 【非选股入口】仅用户明确要求'只看技术面粗筛'时才单独调用\n\n"
-
-        "【硬规则】\n"
-        "1. 用户给股票名称、别名或名称+代码混合输入时，必须先调用 resolve_stock，不能凭模型记忆猜代码。\n"
-        "2. 用户给股票代码时，也应优先用 resolve_stock 反查名称并确认标的是同一只股票。\n"
-        "3. 如果名称和代码冲突，必须指出冲突并以本地 stocks 表解析结果为准，不能直接进入分析。\n"
-        "4. 没有先看 market_news，不允许直接给买入建议。\n"
-        "5. 没有检查 stock_announcements，不允许直接给单股最终结论。\n"
-        "6. 命中财报/业绩预告/业绩快报时，没有调用 earnings_analysis，不允许直接给买入建议。\n"
-        "7. 没有做 risk_assessment，不允许给最终仓位建议。\n"
-        "8. 交易时段内，如果要给短线/盘中交易结论，应补 quant_activity；若无法获取，要明确说明缺失。\n"
-        "9. 若市场面、新闻面、财报面、技术面互相冲突，默认降级为观望，不强行给买入。\n"
-        "10. 允许大量输出观望；不要为了给答案而勉强买卖。\n"
-        "11. balance_sheet 发现商誉/净资产 > 30%，不允许给买入建议（一律观望或卖出）。\n"
-        "12. 主力资金连续5日以上净流出（moneyflow），即便技术面良好，最多给'分批低吸'而非'直接买入'。\n"
-        "13. 长线选股中，若 valuation_quality 显示PEG>2且杜邦评分<0，不允许给价值型买入建议。\n"
-        "14. 调用 full_stock_analysis 时，对蓝筹/白马/高分红类标的应主动传 include_dividend_history=True；\n"
-        "    对两融标的应主动传 include_margin_trading=True。不要全部依赖默认值。\n\n"
-
-        "【北向资金规则】（2024年5月后港交所不再披露净买入数据，改为成交额趋势评估）\n"
-        "northbound_flow 反映外资参与度，应在 market_news 之后立即调用，作为情绪修正依据：\n"
-        "  近5日成交额 vs 早期5日变化 > +20%  → news_sentiment +0.10（外资关注度显著提升）\n"
-        "  近5日成交额变化 +5% ~ +20%         → news_sentiment +0.05（温和放量）\n"
-        "  近5日成交额变化 -5% ~ +5%          → news_sentiment 不调整（持平观望）\n"
-        "  近5日成交额变化 -20% ~ -5%         → news_sentiment -0.05（温和缩量）\n"
-        "  近5日成交额变化 < -20%             → news_sentiment -0.10（大幅缩量，外资兴趣减退）\n"
-        "  连续5日以上成交缩量                → 外资参与度持续下降，建议降低仓位积极性\n"
-        "  注意：成交额放量/缩量反映外资参与热度，但不直接等同于买入/卖出方向，需结合市场走势判断。\n\n"
-
-        "【买卖信号充分条件——必须同时核查】\n"
-        "stock_diagnosis 现在会自动输出'买入条件核查'（11项）和'风险/卖出条件核查'（10项）清单。\n"
-        "在最终结论中，必须引用该清单中的具体满足/未满足项，不能只报综合分。\n"
-        "买入建议门槛：买入条件满足≥7/11 AND 风险条件触发<3/10 AND 总分>0\n"
-        "强买入门槛  ：买入条件满足≥9/11 AND 风险条件触发=0 AND 总分>15\n"
-        "卖出建议门槛：风险条件触发≥4/10 OR 总分<-15\n"
-        "强卖建议门槛：风险条件触发≥7/10 OR 总分<-45\n"
-        "不满足买入门槛但也未触发卖出的：一律给观望，不强行买入。\n\n"
-
-        "【新闻面与时效性】\n"
-        "market_news 提供的是市场与新闻环境基线（来源：东方财富+新浪财经），必须把它视为'新闻面步骤'的一部分。\n"
-        "若涉及极强时效事件（突发政策、地缘政治、重大科技发布、会议/展会进展），在调用 market_news 后仍应额外用 web search 补最新信息，不能把新闻API内容当成实时事实。\n\n"
-
-        "【展示要求】\n"
-        "除非用户明确要求纯文本简写，否则单股和选股结果都应尽量按仪表盘格式组织，而不是写成长段散文。\n"
-        "仪表盘格式应优先使用清晰分区标题、关键指标摘要、表格/短列表、结论卡片式段落，让用户一眼看到最重要信息。\n"
-        "如果当前任务适合可视化，且工具能力允许，应尽量补充图形输出而不是只给纯文本。\n"
-        "可视化优先级：Claude自行用kline_data绘图 > kline_data 表格 > 纯文字描述。\n"
-        "若无法出图，要明确说明原因，不要假装已经展示图表。\n"
-        "无论是否出图，如果 include_quant_activity=True 或工具已返回量化资金数据，量化资金参与度分析都必须在最终结果中单独成段出现，不能只隐含在其他结论里。\n"
-        "注意：quant_activity 默认不启用（盘后无数据），仅在交易时段内且用户关注短线/盘中交易时主动传 include_quant_activity=True。\n\n"
-
-        "【仪表盘输出模板】\n"
-        "单股分析默认按以下区块顺序输出：\n"
-        "1. 顶部摘要：股票名称/代码、实时价、结论、强度、置信度。\n"
-        "2. 市场环境：market_news 结论 + 北向资金(northbound_flow)趋势与情绪修正。\n"
-        "3. 个股新闻面：stock_news 结论与新闻情绪微调。\n"
-        "4. 公告/财报面：stock_announcements + earnings_analysis 结论。\n"
-        "5. 估值与财务面：PE/PB/ROE/毛利率/净利率/市值 + PEG/杜邦分析。\n"
-        "6. 资产负债健康度：负债率 + 商誉占比（>30%必须标注⚠️）。\n"
-        "7. 分红历史（价值型标的时展示）：连续分红次数、股息率趋势。\n"
-        "8. 资金面：北向资金活跃度 + 主力大单净流入(moneyflow) + 融资融券(margin_trading)。\n"
-        "9. K线技术面：近期趋势、MA排列、MACD/RSI/KDJ信号、K线形态、支撑阻力。\n"
-        "10. 量化诊断：综合分、概率模拟、买卖条件核查。\n"
-        "11. 量化资金面：quant_activity 结论，明确写出量化主导/活跃/参与/偏少及交易含义。\n"
-        "12. 风险面：VaR/CVaR/Kelly/止损止盈/风险收益比。\n"
-        "13. 综合决策（短线×长线3×3矩阵）：档位、矩阵决策、仓位比例、止损策略、持仓行为。\n"
-        "14. 操作建议：入场区间、止损位、目标位、仓位建议、持有周期、失效条件。\n"
-        "15. 支持理由 / 反对理由：分别单列。\n"
-        "选股结果默认按以下区块顺序输出：\n"
-        "1. 市场环境 + 北向资金总结论。\n"
-        "2. 推荐名单仪表盘表格。\n"
-        "3. 每只股票深度卡片：新闻面、公告/财报面、估值面(含PEG/杜邦)、负债健康度、资金面、K线技术面、量化诊断、风险面、操作建议。\n\n"
-
-        "【五面体系架构 — 短线 vs 长线路由】\n"
-        "full_stock_analysis 和 full_stock_selection 内部按五面体系执行：\n"
-        "  环境层(A): market_news + northbound_flow → 大盘评级 H/M/L\n"
-        "  催化剂面: 个股新闻 + 公告 + 财报分析 (短线+长线共用)\n"
-        "  短线路径: 技术面(25%) + 资金面(30%+10%) + 量化诊断(10%) + 催化剂(25%) → 短线评分卡(0~100)\n"
-        "  长线路径: 基本面(财务质量30%+估值25%+负债商誉20%+成长15%+分红治理10%) + 催化剂(5%降权) → 长线评分卡(0~100)\n"
-        "  风控面: VaR/Kelly/ATR止损 → 仓位建议 (独立约束，不参与加权)\n"
-        "  评分卡: 加权总分 → 环境修正(L市场短线×0.7) → 一票否决 → 等级(A+/A/B+/B/C/D) → 仓位建议\n\n"
-        "一票否决规则（代码硬编码，触发后自动降分）：\n"
-        "  · RSI>85超买 → 技术面≤3\n"
-        "  · 均线空头排列 → 技术面≤3\n"
-        "  · 量化诊断分<-40 → 整体惩罚\n"
-        "  · 连续3日主力净流出+融资余额下降 → 整体×0.7\n"
-        "  · 融券余额快速放大 → 融资融券维度=0\n"
-        "  · 利空公告当日 → 催化剂≤1\n"
-        "  · 监管问询函 → 整体×0.8\n"
-        "  · ROE<8% → 财务质量≤3\n"
-        "  · PEG>2.0 → 高估警告\n"
-        "  · 商誉/净资产>50% → 负债商誉≤2\n"
-        "  · 资金占用/实控人变更 → 分红治理=0\n"
-        "  · Kelly仓位≤0（负期望）→ 仓位建议=0\n"
-        "  · VaR(95%)>8% → 极端波动警告\n\n"
-        "【3×3 综合决策矩阵 — 短线进场 × 长线安全垫】\n"
-        "full_stock_analysis 和 full_stock_selection 在短线+长线评分卡之后，会自动计算综合决策：\n"
-        "  短线强度: strong(≥75) / medium(65~74) / weak(<65)\n"
-        "  长线档位: A档(≥75,优质托底) / B档(55~74,一般托底) / C档(<55,无托底)\n"
-        "  3×3矩阵决策:\n"
-        "    strong+A → 全仓进攻    strong+B → 主仓进场    strong+C → 轻仓试探\n"
-        "    medium+A → 半仓布局    medium+B → 分批低吸    medium+C → 观望为主\n"
-        "    weak+A   → 底仓防守    weak+B   → 回避        weak+C   → 空仓回避\n"
-        "  仓位 = Kelly × 档位系数(A=1.0, B=0.6, C=0.3)\n"
-        "  止损:\n"
-        "    A档: ATR×1.5动态止损（无ATR时回退-8%）\n"
-        "    B档: 固定-5%\n"
-        "    C档: 固定-3%\n"
-        "  持仓行为:\n"
-        "    A档被套: 可补仓摊低, 等待反转    A档盈利: 让利润奔跑    A档逢低: 越跌越买\n"
-        "    B档被套: 止损后观望, 不补仓      B档盈利: 分批止盈      B档逢低: 谨慎低吸\n"
-        "    C档被套: 立即止损, 严格执行      C档盈利: 见好就收      C档逢低: 不抄底\n"
-        "  仅短线分析（无长线评分卡）时，按C档规则管理。\n\n"
-
-        "【analysis_mode 参数用法】\n"
-        "  analysis_mode='full'  → 短线+长线全跑（默认）\n"
-        "  analysis_mode='short' → 仅短线路径（技术面+资金面+催化剂面+风控面）\n"
-        "  analysis_mode='long'  → 仅长线路径（基本面+催化剂面+风控面）\n"
-        "  用户问'短线机会'/'今天能不能追' → 建议传 analysis_mode='short'\n"
-        "  用户问'长线价值'/'值不值得长期持有' → 建议传 analysis_mode='long'\n\n"
-        "【单股分析标准流程】\n"
-        "用户问'这只股票能不能买/值不值得看/帮我分析'时：\n"
-        "优先直接调用 full_stock_analysis（内部自动执行五面分析+评分卡+风控）。\n"
-        "只有用户明确要求拆步骤时，才手工逐个工具展开：\n"
-        "Step 0. resolve_stock → 标准化代码+名称\n"
-        "Step 1. full_stock_analysis(analysis_mode='full') → 环境层+五面分析+评分卡+风控\n"
-        "Step 2. 根据评分卡等级和仓位建议输出最终结论\n\n"
-        "手工展开模式（仅用户要求时）：\n"
-        "Step 0. resolve_stock\n"
-        "Step 1. market_news + northbound_flow → 环境基线\n"
-        "Step 2. stock_news + stock_announcements → 催化剂面\n"
-        "Step 3. kline_data + stock_diagnosis + moneyflow → 技术面+资金面 (短线)\n"
-        "Step 4. financial_data + valuation_quality + balance_sheet + dividend_history → 基本面 (长线)\n"
-        "Step 5. risk_assessment → 风控面\n"
-        "Step 6. 综合结论\n\n"
-
-        "【单股输出要求】\n"
-        "最终回答必须明确包含：\n"
-        "1. 结论：买入 / 卖出 / 观望\n"
-        "2. 结论强度与置信度\n"
-        "3. 市场环境结论\n"
-        "4. 新闻面/事件面结论\n"
-        "5. 财报面结论（若有）\n"
-        "6. 估值面结论（含PEG、杜邦ROE质量评估）\n"
-        "7. 资产负债健康度（商誉占比、负债率）\n"
-        "8. 主力资金面（moneyflow近5日方向及信号）\n"
-        "9. 技术面结论（含KDJ信号、识别到的K线形态、K线数据趋势）\n"
-        "10. 量化资金结论（必须明确写出：量化主导 / 活跃 / 参与 / 偏少，以及对操作的含义）\n"
-        "11. 北向资金结论（近5日趋势、对入场时机的影响）\n"
-        "12. 如工具可用且场景合适，补充图表或说明为何未出图\n"
-        "13. 综合决策（3×3矩阵）：长线档位(A/B/C)、矩阵决策、仓位比例、止损策略、持仓行为规则\n"
-        "14. 入场区间、止损位、目标位、仓位建议、持有周期\n"
-        "15. 支持理由与反对理由\n"
-        "16. 失效条件\n\n"
-
-        "【选股标准流程】\n"
-        "以下任何情况，都必须直接调用 full_stock_selection，不得手动拆步骤：\n"
-        "  · 用户问'帮我找股票'、'有什么可以买的'、'找几只值得买的票'\n"
-        "  · 用户问'适合明天买的股票'、'今天/明天有什么机会'、'帮我选几只'\n"
-        "  · 用户问'有哪些值得关注'、'扫一下市场'、'全市场扫描'\n"
-        "  · 用户给出选股策略（价值/动量/超跌/潜力），要求给出候选名单\n"
-        "  · 任何涉及'从全市场筛选'的选股需求，无论用户如何表述\n\n"
-        "full_stock_selection 已内置完整两阶段架构：\n"
-        "  第一阶段（0次网络API）：本地DB→历史评分→技术过滤→7维量化扫描→质量阈值\n"
-        "  市场级（循环外1次）：market_news + northbound_flow（北向资金修正情绪基线）\n"
-        "  第二阶段（每只候选股全维度实时分析，与full_stock_analysis一致）：\n"
-        "    实时报价 → 新闻面 → 公告面 → 财报（条件触发）→ 财务数据\n"
-        "    → PEG+杜邦 → 负债+商誉 → 分红（价值策略）→ 主力资金\n"
-        "    → 融资融券（可选）→ K线技术指标 → 量化诊断 → 量化活跃度 → 风险评估\n\n"
-        "调用示例：\n"
-        "  full_stock_selection()                                        # 推荐！auto模式，四策略综合，复核所有候选\n"
-        "  full_stock_selection(strategy='auto', quality_threshold=8)    # auto模式+提高质量门槛（减少候选数）\n"
-        "  full_stock_selection(strategy='value')                        # 仅价值策略\n"
-        "  full_stock_selection(strategy='oversold', quality_threshold=2) # 超跌策略，放宽质量门槛\n"
-        "  ⚠️  用户未指定策略时，默认用 auto 模式（四策略综合），覆盖面最广。\n"
-        "  ⚠️  review_top_n 保持默认0（=全部复核），不要随意限制。候选股过多时通过提高 quality_threshold 控制。\n\n"
-        "⚠️  stock_screener 是底层工具，只在用户明确要求'只做技术面粗筛、不需要新闻/财务/资金分析'时才单独调用。\n"
-        "    普通选股请求一律使用 full_stock_selection，不要用 stock_screener 代替。\n\n"
-
-        "【选股输出要求】\n"
-        "不要只给股票名单。每只候选至少要说明：\n"
-        "1. 综合决策：3×3矩阵结果（如'strong+A→全仓进攻'）、长线档位、仓位比例\n"
-        "2. 为什么入选（短线评分+长线评分的关键驱动因子）\n"
-        "3. 主要风险点\n"
-        "4. 量化资金是否活跃，以及这对追涨/低吸/分批下单意味着什么\n"
-        "5. 当前是否适合买入，还是只适合观察\n"
-        "6. 入场区间、止损位（注明止损规则来源：ATR/固定比例）、目标位\n"
-        "7. 持仓建议：被套/盈利/逢低的操作策略（按档位）\n\n"
-
-        "【决策原则】\n"
-        "市场环境决定能不能做，财报与新闻决定有没有逻辑，技术与量化资金决定现在能不能进，风险评估决定该不该下手以及仓位大小。\n"
-        "如果任何一层明显不成立，默认降级为观望。\n\n"
-    ),
+    instructions=_instructions,
 )
 
 # =====================================================
@@ -303,39 +89,39 @@ def _resolve_stock_candidates(query: str, limit: int = 10):
     conn = sf._get_db()
     try:
         if q.isdigit() and len(q) == 6:
-            return conn.execute(
+            return db.execute(conn,
                 """
                 SELECT code, name, suspended
                 FROM stocks
-                WHERE code = ?
+                WHERE code = %s
                 ORDER BY suspended ASC, code ASC
-                LIMIT ?
+                LIMIT %s
                 """,
                 (q, max(int(limit), 1)),
             ).fetchall()
 
-        exact_rows = conn.execute(
+        exact_rows = db.execute(conn,
             """
             SELECT code, name, suspended
             FROM stocks
-            WHERE name = ?
+            WHERE name = %s
             ORDER BY suspended ASC, code ASC
-            LIMIT ?
+            LIMIT %s
             """,
             (q, max(int(limit), 1)),
         ).fetchall()
-        like_rows = conn.execute(
+        like_rows = db.execute(conn,
             """
             SELECT code, name, suspended
             FROM stocks
-            WHERE name LIKE ?
+            WHERE name LIKE %s
             ORDER BY
-                CASE WHEN name = ? THEN 0
-                     WHEN name LIKE ? THEN 1
+                CASE WHEN name = %s THEN 0
+                     WHEN name LIKE %s THEN 1
                      ELSE 2 END,
                 suspended ASC,
                 code ASC
-            LIMIT ?
+            LIMIT %s
             """,
             (f"%{q}%", q, f"{q}%", max(int(limit), 1)),
         ).fetchall()
@@ -573,7 +359,10 @@ def full_stock_analysis(
     # ══════════════════════════════════════════════════
     sections = [
         f"Full Stock Analysis  {stock_name} ({stock_code})",
-        f"分析模式: {analysis_mode.upper()}",
+        f"分析模式: {analysis_mode.upper()}  "
+        f"报告时间: {cn_now().strftime('%Y-%m-%d %H:%M')}  "
+        f"数据截止: {last_trade_day()}  "
+        f"下一个交易日: {next_trade_day()}",
         "=" * 72,
         "",
         "[1] 股票解析",
@@ -651,6 +440,35 @@ def full_stock_analysis(
         "=" * 60,
         risk_result.risk_report,
     ])
+
+    # ── 建仓识别（四维度）──
+    accum_result = None
+    try:
+        kline_df = sf.load_stock_history(stock_code)
+        if not kline_df.empty and len(kline_df) >= 30:
+            mf_data = sf.load_stock_moneyflow(stock_code, days=60)
+            mg_trend = None
+            if capital_result:
+                mg_trend = getattr(capital_result.signals, "margin_trend", None)
+            # 获取流通市值用于资金阈值相对化
+            overview = sf.load_stock_overview(stock_code)
+            float_mv = overview.get("float_mv", 0) or 0
+            accum_result = qe.detect_accumulation(
+                df=kline_df,
+                moneyflow=mf_data if mf_data else None,
+                margin_trend=mg_trend,
+                northbound_adj=env["northbound_adj"],
+                float_mv=float_mv,
+            )
+            if accum_result:
+                sections.extend([
+                    "", "=" * 60,
+                    "【建仓识别】四维度分析",
+                    "=" * 60,
+                    accum_result["summary"],
+                ])
+    except Exception:
+        pass
 
     # ── 综合决策（短线×长线 3×3 矩阵）──
     if short_scorecard and long_scorecard:
@@ -947,7 +765,7 @@ def full_stock_selection(
                 return f"{code} 本地DB无K线数据"
             df = df.sort_values("date")
 
-            today_str = datetime.today().strftime("%Y-%m-%d")
+            today_str = cn_now().strftime("%Y-%m-%d")
             db_last = df.iloc[-1]["date"]
             db_last_str = db_last.strftime("%Y-%m-%d") if hasattr(db_last, "strftime") else str(db_last)[:10]
             source_tag = "local_db"
@@ -1005,35 +823,80 @@ def full_stock_selection(
         # 注: picks 已在第一阶段后批量更新过实时行情，item 中的 current/pct_chg 已是最新值
 
         # ═ 催化剂面 ═
-        cat = CatalystFace.analyze(stock_code=code, stock_name=name, local_only=True)
+        try:
+            cat = CatalystFace.analyze(stock_code=code, stock_name=name, local_only=True)
+        except Exception as _e:
+            from faces.face_catalyst import CatalystResult, CatalystSignals
+            cat = CatalystResult(signals=CatalystSignals(), stock_news_report=f"催化剂分析失败: {_e}",
+                                 announcements_report="", earnings_report="")
 
         # ═ 技术面 (短线) ═
-        tech = TechnicalFace.analyze(
-            stock_code=code,
-            analysis_days=analysis_days,
-            news_sentiment=env["combined_sentiment"],
-            monte_carlo_days=monte_carlo_days,
-            local_only=True,
-        )
+        try:
+            tech = TechnicalFace.analyze(
+                stock_code=code,
+                analysis_days=analysis_days,
+                news_sentiment=env["combined_sentiment"],
+                monte_carlo_days=monte_carlo_days,
+                local_only=True,
+            )
+        except Exception as _e:
+            from faces.face_technical import TechnicalResult, TechnicalSignals
+            tech = TechnicalResult(signals=TechnicalSignals(), kline_report=f"技术面分析失败: {_e}",
+                                   diagnosis_report="")
 
         # ═ 资金面 (短线) ═
-        cap = CapitalFace.analyze(
-            stock_code=code,
-            include_margin=include_margin_trading,
-            include_quant=include_quant_activity,
-            northbound_adj=env["northbound_adj"],
-        )
+        try:
+            cap = CapitalFace.analyze(
+                stock_code=code,
+                include_margin=include_margin_trading,
+                include_quant=include_quant_activity,
+                northbound_adj=env["northbound_adj"],
+                local_only=True,
+            )
+        except Exception as _e:
+            from faces.face_capital import CapitalResult, CapitalSignals
+            cap = CapitalResult(signals=CapitalSignals(), moneyflow_report=f"资金面分析失败: {_e}",
+                                margin_report="", quant_report="")
 
         # ═ 基本面 (长线) ═
-        funda = FundamentalFace.analyze(
-            stock_code=code,
-            include_valuation=True,
-            include_balance=True,
-            include_dividend=strategy in ("value",),
-        )
+        try:
+            funda = FundamentalFace.analyze(
+                stock_code=code,
+                include_valuation=True,
+                include_balance=True,
+                include_dividend=strategy in ("value",),
+                local_only=True,
+            )
+        except Exception as _e:
+            from faces.face_fundamental import FundamentalResult, FundamentalSignals
+            funda = FundamentalResult(signals=FundamentalSignals(), financial_report=f"基本面分析失败: {_e}",
+                                      valuation_report="", balance_report="", dividend_report="")
 
         # ═ 风控面 ═
-        risk = RiskFace.analyze(stock_code=code, analysis_days=analysis_days, local_only=True)
+        try:
+            risk = RiskFace.analyze(stock_code=code, analysis_days=analysis_days, local_only=True)
+        except Exception as _e:
+            from faces.face_risk import RiskResult, RiskSignals
+            risk = RiskResult(signals=RiskSignals(), risk_report=f"风控分析失败: {_e}")
+
+        # ═ 建仓识别 (四维) ═
+        accum_result = None
+        try:
+            kline_df = sf.load_stock_history(code)
+            if not kline_df.empty and len(kline_df) >= 30:
+                mf_data = sf.load_stock_moneyflow(code, days=60)
+                mg_trend = getattr(cap.signals, "margin_trend", None)
+                # 传入流通市值用于资金流向相对化
+                float_mv = item.get("float_mv", 0) or 0
+                accum_result = qe.detect_accumulation(
+                    df=kline_df,
+                    moneyflow=mf_data if mf_data else None,
+                    margin_trend=mg_trend,
+                    northbound_adj=env["northbound_adj"],
+                    float_mv=float_mv,
+                )
+        except Exception:
+            pass
 
         # ═ 评分卡 ═
         sc_short = Scorecard.compute_short(
@@ -1065,17 +928,25 @@ def full_stock_selection(
         long_s = sc_long.final_total
         tier_tag = combined.long_tier
         action_tag = combined.matrix_action
+        # 建仓信号标记
+        accum_tag = ""
+        if accum_result:
+            ac = accum_result["conclusion"]
+            if ac == "HIGH":
+                accum_tag = " 🔴建仓"
+            elif ac == "WATCH":
+                accum_tag = " 🟡观察"
         if isinstance(rt_chg, float):
             dash = (f"| {idx} | {name} ({code}) "
                     f"| 短{short_s:.0f}/长{long_s:.0f}({tier_tag}档) "
-                    f"| {action_tag} "
+                    f"| {action_tag}{accum_tag} "
                     f"| {combined.position_pct:.0f}% "
                     f"| {item.get('prob_up', 'N/A')} "
                     f"| {rt_price} ({rt_chg:+.2f}%) |")
         else:
             dash = (f"| {idx} | {name} ({code}) "
                     f"| 短{short_s:.0f}/长{long_s:.0f}({tier_tag}档) "
-                    f"| {action_tag} "
+                    f"| {action_tag}{accum_tag} "
                     f"| {combined.position_pct:.0f}% "
                     f"| {item.get('prob_up', 'N/A')} "
                     f"| {rt_price} |")
@@ -1099,9 +970,12 @@ def full_stock_selection(
         sec.append(Scorecard.format_report(sc_long))
         # 风控详情
         sec.append(risk.risk_report)
+        # 建仓识别
+        if accum_result:
+            sec.append(accum_result["summary"])
 
         return {"idx": idx, "dashboard": dash, "sections": sec,
-                "combined": combined}
+                "combined": combined, "accum": accum_result}
 
     # ── 所有候选股并行执行 ──
     review_results = []
@@ -1134,9 +1008,14 @@ def full_stock_selection(
         f"第一阶段通过质量门槛({quality_threshold:.1f})的候选股: {qualified_count} 只"
     )
 
+    _last_td = last_trade_day()
+    _next_td = next_trade_day()
     lines = [
         f"Full Stock Selection — {strategy_label} 策略",
         "=" * 72,
+        f"报告时间: {cn_now().strftime('%Y-%m-%d %H:%M')}  "
+        f"数据截止: {_last_td}  "
+        f"下一个交易日: {_next_td}",
         api_summary,
         "",
         "【1】环境感知层",
@@ -1148,13 +1027,37 @@ def full_stock_selection(
         "▌ 北向资金（沪深港通）" + (f"  情绪修正: {northbound_adj:+.2f}" if northbound_adj else ""),
         northbound_report,
         "",
+    ]
+
+    # ═══ Sector Rotation Context ═══
+    try:
+        import sector_rotation as sr
+        rotation = sr.sector_rotation_signal()
+        if rotation:
+            lines.extend([
+                "▌ 行业轮动信号",
+                f"  轮动阶段: {rotation.get('rotation_phase', 'N/A')}",
+            ])
+            overweight = rotation.get('overweight', [])[:3]
+            if overweight:
+                ow_text = ", ".join(s['sector'] for s in overweight)
+                lines.append(f"  推荐超配: {ow_text}")
+            underweight = rotation.get('underweight', [])[:3]
+            if underweight:
+                uw_text = ", ".join(s['sector'] for s in underweight)
+                lines.append(f"  推荐低配: {uw_text}")
+            lines.append("")
+    except Exception:
+        pass
+
+    lines.extend([
         "【2】第一阶段候选池（本地DB，0次网络请求）",
         screen_report,
         "",
         "【3】深度复核仪表盘（前 {0} 只全维度分析）".format(actual_review),
         "| # | 股票 | 短/长(档) | 决策 | 仓位 | P(上涨) | 实时价格 |",
         "|---|---|---|---|---:|---:|---:|",
-    ]
+    ])
     lines.extend(dashboard_rows)
     lines.extend([
         "",
@@ -1237,7 +1140,7 @@ def kline_data(
     Text summary of the most recent 20 K-line bars + indicator values.
     """
     if not start_date and recent_days:
-        start_date = (datetime.today() - timedelta(days=recent_days)).strftime("%Y-%m-%d")
+        start_date = (cn_now() - timedelta(days=recent_days)).strftime("%Y-%m-%d")
 
     try:
         df = df_mod.get_kline(
@@ -1447,7 +1350,7 @@ def stock_diagnosis(
     Detailed diagnosis report with composite score, per-dimension scores,
     Monte Carlo probabilities, support/resistance levels, and risk warnings.
     """
-    start = (datetime.today() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
+    start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
     data_source = "online"
     try:
@@ -1466,12 +1369,22 @@ def stock_diagnosis(
     if len(df) < 30:
         return f"ERROR: Insufficient data: only {len(df)} bars, at least 30 required"
 
+    # 尝试加载沪深300作为基准 (用于Beta/相对强弱计算)
+    benchmark_close = None
+    try:
+        bm_df = sf.load_stock_history("000300")  # 沪深300指数
+        if not bm_df.empty and len(bm_df) >= 60:
+            benchmark_close = bm_df["close"].values
+    except Exception:
+        pass
+
     try:
         result = qe.comprehensive_diagnosis(
             df,
             news_sentiment=news_sentiment,
             run_monte_carlo=True,
             mc_days=monte_carlo_days,
+            benchmark_close=benchmark_close,
         )
     except Exception as e:
         return f"ERROR: Diagnosis analysis failed: {e}"
@@ -1498,7 +1411,7 @@ def stock_diagnosis(
         f"  Position Advice : {decision['position_advice']}",
         f"  Holding Period  : {decision['holding_period']}",
         f"  Entry Style     : {decision['entry_style']}",
-        f"  Entry Zone      : {decision['entry_low']:.2f} ~ {decision['entry_high']:.2f}",
+        f"  Entry Zone      : {decision['entry_low']:.2f} ~ {decision['entry_high']:.2f}" if decision.get('entry_low') is not None else "  Entry Zone      : N/A",
         f"  Stop Loss       : {decision['stop_loss']:.2f}" if decision.get("stop_loss") is not None else "  Stop Loss       : N/A",
         f"  Take Profit     : {decision['take_profit']:.2f}" if decision.get("take_profit") is not None else "  Take Profit     : N/A",
         f"  Risk/Reward     : 1:{decision['risk_reward']:.2f}" if decision.get("risk_reward") is not None else "  Risk/Reward     : N/A",
@@ -1550,6 +1463,58 @@ def stock_diagnosis(
     if "hurst" in stats_detail:
         lines.append(f"\n  Hurst Exponent: {stats_detail['hurst']:.3f} -> {stats_detail.get('hurst_interp', '')}")
 
+    # ═════ ML Prediction Section (GradientBoosting) ═════
+    try:
+        import ml_predictor as mlp
+        ml_result = mlp.predict_stock(stock_code, df, horizon=5)
+        if ml_result and 'error' not in ml_result:
+            lines.extend([
+                "",
+                "=" * 55,
+                "ML Prediction (GradientBoosting):",
+                f"  Probability Up (5d): {ml_result['prob_up']:.1f}%",
+                f"  Probability Strong Up: {ml_result.get('prob_strong_up', 0):.1f}%",
+                f"  Predicted Signal: {ml_result.get('signal', 'N/A')}",
+                f"  Model Confidence: {ml_result.get('confidence', 0):.1f}%",
+                f"  Validation AUC: {ml_result.get('validation_auc', 0):.3f}",
+            ])
+            if ml_result.get('feature_importance'):
+                lines.append("  Top Features:")
+                for fname, fimp in list(ml_result['feature_importance'].items())[:5]:
+                    lines.append(f"    {fname}: {fimp:.3f}")
+    except Exception:
+        pass
+
+    # ═════ Factor Exposure Section ═════
+    try:
+        import factor_model as fm
+        fundamentals = {}
+        try:
+            overview = sf.load_stock_overview(stock_code)
+            if overview:
+                fundamentals = overview
+        except Exception:
+            pass
+
+        factors_raw = fm.compute_single_stock_factors(
+            stock_code, df, fundamentals,
+            benchmark_close=benchmark_close
+        )
+        if factors_raw:
+            lines.extend([
+                "",
+                "=" * 55,
+                "Factor Exposure Analysis:",
+            ])
+            # Show top positive and negative factor exposures
+            sorted_factors = sorted(factors_raw.items(), key=lambda x: abs(x[1]) if x[1] is not None else 0, reverse=True)
+            for fname, fval in sorted_factors[:8]:
+                if fval is not None:
+                    direction = "+" if fval > 0 else ""
+                    lines.append(f"  {fname:<20}: {direction}{fval:.2f}")
+    except Exception:
+        pass
+
     return "\n".join(lines)
 
 
@@ -1588,7 +1553,7 @@ def strategy_backtest(
     -------
     Full backtest report: CAGR, Sharpe ratio, max drawdown, win rate, profit factor, trade log, etc.
     """
-    start = (datetime.today() - timedelta(days=backtest_days)).strftime("%Y-%m-%d")
+    start = (cn_now() - timedelta(days=backtest_days)).strftime("%Y-%m-%d")
 
     try:
         df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="qfq")
@@ -1597,6 +1562,20 @@ def strategy_backtest(
 
     if len(df) < 60:
         return f"ERROR: Insufficient data: only {len(df)} bars, backtest requires at least 60"
+
+    # Resolve stock code to get canonical code and name for A-share-specific features
+    try:
+        resolved = resolve_stock(stock_code)
+        if not resolved or "error" in resolved:
+            # Fallback: use provided code without name
+            canonical_code = stock_code
+            stock_name = ""
+        else:
+            canonical_code = resolved.get("code", stock_code)
+            stock_name = resolved.get("name", "")
+    except Exception:
+        canonical_code = stock_code
+        stock_name = ""
 
     available = list(bt.STRATEGIES.keys())
     if strategy_name not in available:
@@ -1609,6 +1588,8 @@ def strategy_backtest(
             initial_capital=initial_capital,
             stop_loss=stop_loss_pct,
             take_profit=take_profit_pct,
+            code=canonical_code,           # NEW: Pass stock code for price limit detection
+            name=stock_name,               # NEW: Pass stock name for ST detection
         )
     except Exception as e:
         return f"ERROR: Backtest execution failed: {e}"
@@ -1647,7 +1628,7 @@ def risk_assessment(
     Complete risk report with VaR/CVaR, Kelly position, stop/take-profit levels,
     and stress test scenarios.
     """
-    start = (datetime.today() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
+    start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
     try:
         df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="qfq")
@@ -1933,7 +1914,7 @@ def earnings_analysis(
             start_dt = (
                 (datetime.strptime(oldest, "%Y-%m-%d") - timedelta(days=40)).strftime("%Y-%m-%d")
                 if oldest else
-                (datetime.today() - timedelta(days=600)).strftime("%Y-%m-%d")
+                (cn_now() - timedelta(days=600)).strftime("%Y-%m-%d")
             )
             kline_df = df_mod.get_kline(stock_code, period="daily",
                                     start=start_dt, adjust="none")
@@ -2025,7 +2006,7 @@ def market_news() -> str:
         from datetime import datetime
 
         sep = "═" * 56
-        now = datetime.now()
+        now = cn_now()
         lines = [
             sep,
             f"  市场环境报告   {now.strftime('%Y-%m-%d  %H:%M')}",
@@ -2530,6 +2511,317 @@ def valuation_quality(
         return "\n".join(lines)
     except Exception as e:
         return f"ERROR: 估值质量分析失败: {e}"
+
+
+# =====================================================
+# Tool 21: Portfolio Optimization
+# =====================================================
+
+@mcp.tool()
+def portfolio_optimize(
+    stock_codes: str,
+    method: str = "max_sharpe",
+    total_capital: float = 100000,
+) -> str:
+    """
+    Portfolio optimization for a set of stocks.
+
+    Args:
+        stock_codes: Comma-separated stock codes (e.g., "600519,000858,601318")
+        method: Optimization method - 'max_sharpe', 'min_variance', 'risk_parity', 'equal_weight'
+        total_capital: Total investment capital in CNY
+
+    Returns detailed portfolio allocation with weights, shares, risk decomposition.
+    """
+    try:
+        import portfolio_optimizer as po
+
+        codes = [c.strip() for c in stock_codes.split(",") if c.strip()]
+        if not codes:
+            return "ERROR: No valid stock codes provided"
+
+        if method not in ("max_sharpe", "min_variance", "risk_parity", "equal_weight"):
+            return f"ERROR: Unknown method '{method}'. Use: max_sharpe, min_variance, risk_parity, equal_weight"
+
+        # Load histories for all stocks
+        histories = {}
+        prices = {}
+        for code in codes:
+            h = sf.load_stock_history(code)
+            if not h.empty and len(h) >= 60:
+                histories[code] = h.tail(250).reset_index(drop=True)
+                prices[code] = float(h.iloc[-1]["close"])
+
+        valid_codes = list(histories.keys())
+        if len(valid_codes) < 2:
+            return "ERROR: Need at least 2 stocks with sufficient history (≥60 bars)"
+
+        lines = [
+            f"Portfolio Optimization — {method.upper()}",
+            "=" * 60,
+            f"Stock Codes: {', '.join(valid_codes)}",
+            f"Total Capital: {total_capital:,.0f} CNY",
+            f"Optimization Method: {method}",
+            "",
+        ]
+
+        # Estimate returns and covariance
+        mu = po.estimate_returns(histories, method="shrinkage")
+        cov = po.estimate_covariance(histories, method="ledoit_wolf")
+
+        # Run optimization
+        if method == "max_sharpe":
+            result = po.optimize_max_sharpe(mu, cov)
+        elif method == "min_variance":
+            result = po.optimize_min_variance(cov)
+        elif method == "risk_parity":
+            result = po.optimize_risk_parity(cov)
+        else:  # equal_weight
+            result = po.optimize_equal_weight(valid_codes)
+
+        if "error" in result:
+            return f"ERROR: Optimization failed: {result['error']}"
+
+        weights = result.get("weights", {})
+        lines.extend([
+            "【Allocation】",
+            f"  {'Stock':<10} {'Weight':>8} {'Capital':>12} {'Shares':>10}",
+            "-" * 42,
+        ])
+
+        for code in valid_codes:
+            w = weights.get(code, 0)
+            alloc = total_capital * w
+            price = prices.get(code, 0)
+            shares = int(alloc / (price * 100)) * 100 if price > 0 else 0  # A-share 100-lot
+            lines.append(f"  {code:<10} {w:>7.1%} {alloc:>12,.0f} {shares:>10}")
+
+        exp_ret = result.get("expected_return")
+        exp_vol = result.get("volatility")
+        sharpe = result.get("sharpe")
+        lines.extend([
+            "",
+            "【Performance Metrics】",
+            f"  Expected Annual Return: {exp_ret:.2%}" if exp_ret is not None else "  Expected Annual Return: N/A",
+            f"  Expected Annual Volatility: {exp_vol:.2%}" if exp_vol is not None else "  Expected Annual Volatility: N/A",
+            f"  Sharpe Ratio: {sharpe:.3f}" if sharpe is not None else "  Sharpe Ratio: N/A",
+        ])
+
+        # Risk decomposition
+        try:
+            decomp = po.portfolio_risk_decomposition(weights, cov)
+            if decomp and "contributions" in decomp:
+                lines.extend(["", "【Risk Contribution】"])
+                for code, pct in decomp["contributions"].items():
+                    lines.append(f"  {code:<10} {pct:>7.1%}")
+        except Exception:
+            pass
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: Portfolio optimization failed: {e}"
+
+
+# =====================================================
+# Tool 22: Sector Analysis & Rotation
+# =====================================================
+
+@mcp.tool()
+def sector_analysis() -> str:
+    """
+    Analyze sector rotation and momentum across all A-share sectors.
+
+    Returns sector rankings, rotation signals, overweight/underweight recommendations,
+    and current market cycle phase.
+    """
+    try:
+        import sector_rotation as sr
+
+        lines = [
+            "Sector Rotation Analysis",
+            "=" * 70,
+            f"Report Time: {cn_now().strftime('%Y-%m-%d %H:%M')}",
+            "",
+        ]
+
+        # Get sector rotation signal
+        rotation = sr.sector_rotation_signal()
+        if rotation:
+            lines.extend([
+                "【Rotation Phase】",
+                f"  Phase: {rotation.get('rotation_phase', 'N/A')}",
+                f"  Cycle Stage: {rotation.get('cycle_stage', 'N/A')}",
+                "",
+            ])
+
+            # Overweight sectors
+            overweight = rotation.get("overweight", [])
+            if overweight:
+                lines.append("【Overweight Sectors】")
+                for s in overweight[:5]:
+                    lines.append(
+                        f"  {s['sector']:<15} Momentum: {s.get('momentum', 'N/A'):>6}  "
+                        f"Return: {s.get('return', 'N/A'):>6}"
+                    )
+                lines.append("")
+
+            # Underweight sectors
+            underweight = rotation.get("underweight", [])
+            if underweight:
+                lines.append("【Underweight Sectors】")
+                for s in underweight[:5]:
+                    lines.append(
+                        f"  {s['sector']:<15} Momentum: {s.get('momentum', 'N/A'):>6}  "
+                        f"Return: {s.get('return', 'N/A'):>6}"
+                    )
+                lines.append("")
+
+            # Sector rankings
+            lines.append("【Sector Momentum Ranking (20d)】")
+            rankings = sr.sector_momentum_ranking(days=20)
+            lines.append(f"  {'Rank':<5} {'Sector':<15} {'Momentum':>10} {'Return':>8}")
+            lines.append("-" * 40)
+            for i, s in enumerate(rankings[:10], 1):
+                lines.append(
+                    f"  {i:<5} {s['sector']:<15} {s.get('momentum', 'N/A'):>10} "
+                    f"{s.get('return', 'N/A'):>8}"
+                )
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: Sector analysis failed: {e}"
+
+
+# =====================================================
+# Tool 23: Multi-Factor Analysis
+# =====================================================
+
+@mcp.tool()
+def factor_analysis(stock_code: str = "") -> str:
+    """
+    Multi-factor analysis. If stock_code is provided, shows factor exposure for that stock.
+    If empty, shows cross-sectional factor rankings for top stocks.
+
+    Args:
+        stock_code: Optional. Single stock code for factor exposure analysis.
+    """
+    try:
+        import factor_model as fm
+
+        lines = [
+            "Multi-Factor Analysis",
+            "=" * 70,
+            f"Report Time: {cn_now().strftime('%Y-%m-%d %H:%M')}",
+            "",
+        ]
+
+        if stock_code and stock_code.strip():
+            # Single stock factor exposure
+            stock_code = stock_code.strip()
+            lines.extend([
+                f"【Single Stock Factor Exposure】 {stock_code}",
+                "-" * 70,
+            ])
+
+            try:
+                df = sf.load_stock_history(stock_code)
+                if df is None or df.empty or len(df) < 30:
+                    return f"ERROR: Insufficient data for stock {stock_code}"
+
+                fundamentals = {}
+                try:
+                    overview = sf.load_stock_overview(stock_code)
+                    if overview:
+                        fundamentals = overview
+                except Exception:
+                    pass
+
+                # Load benchmark
+                benchmark_close = None
+                try:
+                    bm_df = sf.load_stock_history("000300")
+                    if not bm_df.empty and len(bm_df) >= 60:
+                        benchmark_close = bm_df["close"].values
+                except Exception:
+                    pass
+
+                factors = fm.compute_single_stock_factors(
+                    stock_code, df, fundamentals, benchmark_close=benchmark_close
+                )
+                if factors:
+                    lines.append(f"  {'Factor':<25} {'Exposure':>12} {'Score':>10}")
+                    lines.append("-" * 50)
+                    sorted_factors = sorted(
+                        factors.items(),
+                        key=lambda x: abs(x[1]) if x[1] is not None else 0,
+                        reverse=True,
+                    )
+                    for fname, fval in sorted_factors[:15]:
+                        if fval is not None:
+                            direction = "+" if fval > 0 else ""
+                            lines.append(f"  {fname:<25} {direction}{fval:>11.3f}")
+                else:
+                    lines.append("  No factor data available")
+            except Exception as e:
+                lines.append(f"  Error: {e}")
+
+        else:
+            # Cross-sectional factor rankings
+            lines.append("【Cross-Sectional Factor Rankings】 (Top stocks)")
+            lines.append("-" * 70)
+
+            try:
+                # Load all stocks and compute factors
+                conn = sf._get_db()
+                stocks = db.fetchall(conn,
+                    "SELECT code, name FROM stocks WHERE suspended = 0 LIMIT 100")
+
+                all_factors = []
+                for code, name in stocks[:30]:  # Top 30 for speed
+                    try:
+                        df = sf.load_stock_history(code)
+                        if df is None or df.empty or len(df) < 30:
+                            continue
+                        factors = fm.compute_single_stock_factors(code, df, {})
+                        if factors:
+                            all_factors.append({"code": code, "name": name, "factors": factors})
+                    except Exception:
+                        continue
+
+                if all_factors:
+                    # Show top factors
+                    all_factor_names = set()
+                    for item in all_factors:
+                        all_factor_names.update(item["factors"].keys())
+
+                    for factor_name in list(all_factor_names)[:5]:
+                        lines.append(f"\n【{factor_name}】 Top 5 Stocks")
+                        lines.append(f"  {'Code':<8} {'Name':<12} {'Value':>10}")
+                        lines.append("-" * 32)
+
+                        factor_data = [
+                            (
+                                item["code"],
+                                item["name"],
+                                item["factors"].get(factor_name),
+                            )
+                            for item in all_factors
+                            if factor_name in item["factors"]
+                        ]
+                        factor_data.sort(key=lambda x: abs(x[2]) if x[2] is not None else 0, reverse=True)
+
+                        for code, name, val in factor_data[:5]:
+                            if val is not None:
+                                direction = "+" if val > 0 else ""
+                                lines.append(f"  {code:<8} {name:<12} {direction}{val:>9.2f}")
+                else:
+                    lines.append("  No factor data available")
+            except Exception as e:
+                lines.append(f"  Error computing cross-sectional factors: {e}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"ERROR: Factor analysis failed: {e}"
 
 
 # =====================================================

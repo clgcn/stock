@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 
+from _http_utils import cn_now
+
 try:
     from curl_cffi import requests
     _USE_CURL = True
@@ -402,7 +404,7 @@ def get_quant_activity_report(code: str, tick_n: int = 1500) -> str:
     str  完整中文报告
     """
     from data_fetcher import get_realtime
-    now = datetime.now()
+    now = cn_now()
     sep = "─" * 52
 
     # ── 获取股票名称 ──

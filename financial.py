@@ -191,10 +191,10 @@ def get_balance_sheet(code: str) -> dict:
     r = rows[0]
     def _yi(v):
         try: return round(float(v) / 1e8, 2) if v else None
-        except: return None
+        except Exception: return None
     def _pct(a, b):
         try: return round(float(a) / float(b) * 100, 2) if a and b and float(b) != 0 else None
-        except: return None
+        except Exception: return None
 
     total_assets = _yi(r.get("TOTAL_ASSETS"))
     total_liab   = _yi(r.get("TOTAL_LIABILITIES"))
@@ -260,10 +260,10 @@ def get_dividend_history(code: str, years: int = 5) -> list:
 
     def _f(v, d=4):
         try: return round(float(v), d) if v else None
-        except: return None
+        except Exception: return None
     def _yi(v):
         try: return round(float(v) / 1e8, 2) if v else None
-        except: return None
+        except Exception: return None
 
     results = []
     for r in rows:

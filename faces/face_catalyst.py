@@ -23,6 +23,7 @@ from __future__ import annotations
 import sys
 import re
 from pathlib import Path
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional, List
 
@@ -30,6 +31,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from _http_utils import cn_now
 from announcements import (
     get_announcements, format_announcements,
     analyze_earnings_reaction, format_earnings_analysis,
@@ -171,6 +173,12 @@ class CatalystFace:
         else:
             score = 3.0
 
+        # 财报情绪修正: earnings_sentiment ∈ [-0.25, +0.25]
+        # 映射到 ±1.5 分的调整（满分10分中）
+        if signals.earnings_sentiment != 0:
+            adj = signals.earnings_sentiment * 6.0  # ±0.25 → ±1.5
+            score = max(0, min(10, score + adj))
+
         return [
             {"name": "催化剂强度", "score": round(score, 1), "weight": 0.25, "max": 10},
         ]
@@ -186,9 +194,9 @@ class CatalystFace:
         """
         vetos = []
         if signals.catalyst_type == "negative":
-            vetos.append((True, "利空公告当日", 1.0))
+            vetos.append((True, "利空公告当日", 1.0, "催化剂强度"))
         if signals.has_regulatory_issue:
-            vetos.append((True, "近期收到监管问询函", None))
+            vetos.append((True, "近期收到监管问询函", None, None))
         return vetos
 
     # ╔══════════════════════════════════════════════════╗
@@ -237,12 +245,11 @@ class CatalystFace:
 
             kline_df = None
             if earnings_anns:
-                from datetime import datetime, timedelta
                 oldest = earnings_anns[-1].get("date", "")
                 start_dt = (
                     (datetime.strptime(oldest, "%Y-%m-%d") - timedelta(days=40)).strftime("%Y-%m-%d")
                     if oldest else
-                    (datetime.today() - timedelta(days=600)).strftime("%Y-%m-%d")
+                    (cn_now() - timedelta(days=600)).strftime("%Y-%m-%d")
                 )
                 try:
                     kline_df = get_kline_prefer_db(stock_code, period="daily", start=start_dt,

@@ -130,6 +130,7 @@ class FundamentalFace:
         include_valuation: bool = True,
         include_balance: bool = True,
         include_dividend: bool = True,
+        local_only: bool = False,
     ) -> FundamentalResult:
         """
         执行完整基本面分析。
@@ -140,6 +141,7 @@ class FundamentalFace:
         include_valuation : bool 是否分析PEG+杜邦
         include_balance   : bool 是否分析资产负债
         include_dividend  : bool 是否分析分红历史
+        local_only        : bool True时从本地DB读取基础估值数据，跳过需要API的深度分析
         """
         signals = FundamentalSignals()
         fin_report = ""
@@ -147,26 +149,53 @@ class FundamentalFace:
         bal_report = ""
         div_report = ""
 
-        # ── 1. 财务数据 (PE/PB/ROE) ──
-        fin_data, fin_report = FundamentalFace._fetch_financial(stock_code)
-        if fin_data:
-            FundamentalFace._extract_financial(signals, fin_data)
+        if local_only:
+            # ── 本地模式: 从 stock_fundamentals 快照读取 PE/PB ──
+            try:
+                import slow_fetcher as sf
+                overview = sf.load_stock_overview(stock_code)
+                if overview:
+                    signals.pe_ttm = overview.get("pe_ttm")
+                    signals.pb = overview.get("pb")
+                    # ROE 近似 = 1/PE × 1/PB × 100 (仅作粗估)
+                    if signals.pe_ttm and signals.pb and signals.pe_ttm > 0:
+                        signals.roe = (signals.pb / signals.pe_ttm) * 100
+                    fin_report = (
+                        f"  [本地DB] PE(TTM): {signals.pe_ttm or 'N/A'}"
+                        f"  PB: {signals.pb or 'N/A'}"
+                        f"  ROE(估): {signals.roe:.1f}%" if signals.roe else
+                        f"  [本地DB] PE(TTM): {signals.pe_ttm or 'N/A'}"
+                        f"  PB: {signals.pb or 'N/A'}"
+                    )
+                else:
+                    fin_report = "  [本地DB] 无基本面快照数据"
+            except Exception as e:
+                fin_report = f"  [本地DB] 基本面读取失败: {e}"
+            # local_only 模式跳过 PEG/杜邦/负债/分红（需要API）
+            val_report = ""
+            bal_report = ""
+            div_report = ""
+        else:
+            # ── 1. 财务数据 (PE/PB/ROE) ──
+            fin_data, fin_report = FundamentalFace._fetch_financial(stock_code)
+            if fin_data:
+                FundamentalFace._extract_financial(signals, fin_data)
 
-        # ── 2. PEG + 杜邦分析 ──
-        if include_valuation:
-            val_report = FundamentalFace._fetch_valuation(stock_code, signals)
+            # ── 2. PEG + 杜邦分析 ──
+            if include_valuation:
+                val_report = FundamentalFace._fetch_valuation(stock_code, signals)
 
-        # ── 3. 资产负债 + 商誉 ──
-        if include_balance:
-            bal_data, bal_report = FundamentalFace._fetch_balance(stock_code)
-            if bal_data:
-                FundamentalFace._extract_balance(signals, bal_data)
+            # ── 3. 资产负债 + 商誉 ──
+            if include_balance:
+                bal_data, bal_report = FundamentalFace._fetch_balance(stock_code)
+                if bal_data:
+                    FundamentalFace._extract_balance(signals, bal_data)
 
-        # ── 4. 分红历史 ──
-        if include_dividend:
-            div_data, div_report = FundamentalFace._fetch_dividend(stock_code)
-            if div_data:
-                FundamentalFace._extract_dividend(signals, div_data)
+            # ── 4. 分红历史 ──
+            if include_dividend:
+                div_data, div_report = FundamentalFace._fetch_dividend(stock_code)
+                if div_data:
+                    FundamentalFace._extract_dividend(signals, div_data)
 
         return FundamentalResult(
             signals=signals,
@@ -204,13 +233,13 @@ class FundamentalFace:
         """
         vetos = []
         if signals.roe is not None and signals.roe < 8:
-            vetos.append((True, f"ROE={signals.roe:.1f}%<8%", 3.0))
+            vetos.append((True, f"ROE={signals.roe:.1f}%<8%", 3.0, "财务质量"))
         if signals.peg is not None and signals.peg > 2.0:
-            vetos.append((True, f"PEG={signals.peg:.2f}>2.0 高估警告", None))
+            vetos.append((True, f"PEG={signals.peg:.2f}>2.0 高估警告", None, None))
         if signals.goodwill_ratio is not None and signals.goodwill_ratio > 50:
-            vetos.append((True, f"商誉/净资产={signals.goodwill_ratio:.0f}%>50% 一票否决", 2.0))
+            vetos.append((True, f"商誉/净资产={signals.goodwill_ratio:.0f}%>50% 一票否决", 2.0, "负债商誉"))
         if not signals.no_fund_misuse:
-            vetos.append((True, "存在资金占用或实控人变更", 0))
+            vetos.append((True, "存在资金占用或实控人变更", 0, "分红治理"))
         return vetos
 
     # ╔══════════════════════════════════════════════════╗
@@ -425,7 +454,7 @@ class FundamentalFace:
         def _f(v, s="", fmt=".2f"):
             if v is None: return "N/A"
             try: return f"{v:{fmt}}{s}"
-            except: return str(v)
+            except Exception: return str(v)
         return "\n".join([
             f"财务指标 — {data.get('name', code)} ({code})",
             "-" * 40,

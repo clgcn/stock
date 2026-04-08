@@ -31,7 +31,6 @@ Mathematical Model Inventory:
 
 import numpy as np
 import pandas as pd
-from datetime import datetime
 from typing import Dict, List, Tuple, Optional
 
 
@@ -823,6 +822,672 @@ def analyze_statistics(df: pd.DataFrame) -> Dict:
 
 
 # =====================================================
+# 8b. Beta / 相对强弱 / Sortino / 下行风险分析
+# =====================================================
+
+def analyze_relative_strength(
+    df: pd.DataFrame,
+    benchmark_close: Optional[np.ndarray] = None,
+) -> Dict:
+    """
+    相对强弱与风险调整收益分析。
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        个股日K线 (需含 close 列)
+    benchmark_close : np.ndarray, optional
+        基准指数收盘价序列 (与 df 等长或更长)。
+        None 时跳过 Beta/相对动量计算，仅算 Sortino 等绝对指标。
+
+    Returns
+    -------
+    dict:
+        score      : float  综合评分 (-100 ~ +100)
+        details    : dict   所有计算明细
+    """
+    close = df["close"].values.astype(float)
+    n = len(close)
+    details: Dict = {}
+
+    if n < 30:
+        return {"score": 0, "details": {"error": "数据不足30天"}}
+
+    log_ret = np.log(close[1:] / close[:-1])
+    score = 0.0
+
+    # ── 1. Sortino Ratio (下行风险调整收益) ──
+    # 只惩罚下行波动，上行波动不算风险
+    mean_ret = np.mean(log_ret)
+    downside = log_ret[log_ret < 0]
+    downside_dev = np.std(downside, ddof=1) * np.sqrt(252) if len(downside) > 1 else 1e-10
+    ann_ret = mean_ret * 252
+    sortino = ann_ret / downside_dev if downside_dev > 0 else 0
+    details["sortino_ratio"] = round(sortino, 3)
+    details["downside_deviation_ann"] = round(downside_dev * 100, 2)
+
+    if sortino > 1.5:
+        score += 20
+        details["sortino_grade"] = "优秀(>1.5)"
+    elif sortino > 0.8:
+        score += 10
+        details["sortino_grade"] = "良好(>0.8)"
+    elif sortino > 0:
+        score += 0
+        details["sortino_grade"] = "一般(>0)"
+    else:
+        score -= 15
+        details["sortino_grade"] = "差(<0)"
+
+    # ── 2. 最大回撤 & 回撤恢复时间 ──
+    cum_max = np.maximum.accumulate(close)
+    drawdown = (close - cum_max) / cum_max
+    max_dd = float(np.min(drawdown))
+    max_dd_idx = int(np.argmin(drawdown))
+    details["max_drawdown_pct"] = round(max_dd * 100, 2)
+
+    # 回撤恢复时间: 从最大回撤点到恢复创新高需要多少天
+    recovery_days = None
+    if max_dd_idx < n - 1:
+        peak_val = cum_max[max_dd_idx]
+        for j in range(max_dd_idx + 1, n):
+            if close[j] >= peak_val:
+                recovery_days = j - max_dd_idx
+                break
+    details["recovery_days"] = recovery_days
+    details["recovery_interp"] = (
+        f"{recovery_days}天恢复" if recovery_days
+        else "尚未恢复" if max_dd < -0.05 else "回撤轻微"
+    )
+
+    if max_dd > -0.10:
+        score += 10
+    elif max_dd > -0.20:
+        score += 0
+    elif max_dd > -0.30:
+        score -= 10
+    else:
+        score -= 20
+
+    # ── 3. Calmar Ratio (年化收益 / 最大回撤) ──
+    calmar = ann_ret / abs(max_dd) if abs(max_dd) > 0.001 else 0
+    details["calmar_ratio"] = round(calmar, 3)
+
+    # ── 4. 相对动量 (1/3/6个月 vs 基准) ──
+    if benchmark_close is not None and len(benchmark_close) >= n:
+        bm = benchmark_close[-n:].astype(float)
+        bm_ret = np.log(bm[1:] / bm[:-1])
+
+        # Beta (60日滚动)
+        window_beta = min(60, len(log_ret))
+        stock_w = log_ret[-window_beta:]
+        bm_w = bm_ret[-window_beta:]
+        cov_mat = np.cov(stock_w, bm_w)
+        beta = cov_mat[0, 1] / cov_mat[1, 1] if cov_mat[1, 1] > 0 else 1.0
+        details["beta_60d"] = round(beta, 3)
+
+        # 特异性波动率 (idiosyncratic risk)
+        residual = stock_w - beta * bm_w
+        idio_vol = float(np.std(residual, ddof=1)) * np.sqrt(252) * 100
+        details["idiosyncratic_vol_ann"] = round(idio_vol, 2)
+
+        # Alpha (Jensen's Alpha)
+        rf_daily = 0.02 / 252  # 假设无风险利率2%
+        alpha = (np.mean(stock_w) - rf_daily) - beta * (np.mean(bm_w) - rf_daily)
+        details["alpha_daily"] = round(alpha * 10000, 2)  # 万分之几
+        details["alpha_ann_pct"] = round(alpha * 252 * 100, 2)
+
+        # 相对动量: 不同期限的超额收益
+        for label, days in [("1m", 20), ("3m", 60), ("6m", 120)]:
+            if n > days:
+                stock_period_ret = (close[-1] / close[-days - 1] - 1) * 100
+                bm_period_ret = (bm[-1] / bm[-days - 1] - 1) * 100
+                excess = stock_period_ret - bm_period_ret
+                details[f"relative_momentum_{label}"] = round(excess, 2)
+
+        # 相对强弱评分
+        rm_1m = details.get("relative_momentum_1m", 0)
+        rm_3m = details.get("relative_momentum_3m", 0)
+        if rm_1m > 5 and rm_3m > 10:
+            score += 15
+            details["relative_strength"] = "强势(短中期均跑赢)"
+        elif rm_1m > 0 and rm_3m > 0:
+            score += 5
+            details["relative_strength"] = "偏强(跑赢大盘)"
+        elif rm_1m < -5 and rm_3m < -10:
+            score -= 15
+            details["relative_strength"] = "弱势(短中期均跑输)"
+        else:
+            details["relative_strength"] = "中性"
+
+        # Beta评分: 牛市偏好高Beta，熊市偏好低Beta
+        # 这里给中性评分，由环境层调整
+        if beta > 1.5:
+            details["beta_interp"] = "高Beta(市场放大器)"
+        elif beta < 0.5:
+            details["beta_interp"] = "低Beta(防御性)"
+        else:
+            details["beta_interp"] = "中性Beta"
+    else:
+        details["beta_note"] = "无基准数据，跳过相对分析"
+
+    # ── 5. 上行/下行捕获率 ──
+    if benchmark_close is not None and len(benchmark_close) >= n:
+        bm = benchmark_close[-n:].astype(float)
+        bm_ret = np.log(bm[1:] / bm[:-1])
+        up_days = bm_ret > 0
+        down_days = bm_ret < 0
+        if np.sum(up_days) > 5 and np.sum(down_days) > 5:
+            up_capture = np.mean(log_ret[up_days]) / np.mean(bm_ret[up_days])
+            down_capture = np.mean(log_ret[down_days]) / np.mean(bm_ret[down_days])
+            details["upside_capture"] = round(up_capture, 3)
+            details["downside_capture"] = round(down_capture, 3)
+            # 理想: 上行捕获>1, 下行捕获<1
+            if up_capture > 1.0 and down_capture < 1.0:
+                score += 10
+                details["capture_quality"] = "优质(涨多跌少)"
+            elif up_capture < 0.8 and down_capture > 1.2:
+                score -= 10
+                details["capture_quality"] = "差(涨少跌多)"
+
+    score = float(np.clip(score, -100, 100))
+    return {"score": round(score, 1), "details": details}
+
+
+# =====================================================
+# 8c. 行业相对估值 & 板块轮动信号
+# =====================================================
+
+def analyze_sector_relative(
+    pe_ttm: Optional[float] = None,
+    pb: Optional[float] = None,
+    sector_pe_median: Optional[float] = None,
+    sector_pb_median: Optional[float] = None,
+    sector_avg_pct_chg_20d: Optional[float] = None,
+    stock_pct_chg_20d: Optional[float] = None,
+    sector_name: str = "",
+) -> Dict:
+    """
+    行业相对估值与板块轮动分析。
+
+    Parameters
+    ----------
+    pe_ttm, pb            : 个股估值
+    sector_pe_median, sector_pb_median : 行业中位数估值
+    sector_avg_pct_chg_20d : 板块20日平均涨跌幅
+    stock_pct_chg_20d      : 个股20日涨跌幅
+    sector_name            : 所属板块名称
+
+    Returns
+    -------
+    dict with score, details
+    """
+    details: Dict = {"sector_name": sector_name}
+    score = 0.0
+
+    # ── 1. PE 相对估值 ──
+    if pe_ttm and sector_pe_median and sector_pe_median > 0:
+        pe_ratio = pe_ttm / sector_pe_median
+        details["pe_vs_sector"] = round(pe_ratio, 3)
+        if pe_ratio < 0.7:
+            score += 15
+            details["pe_relative"] = "显著低估(PE低于行业30%)"
+        elif pe_ratio < 0.9:
+            score += 5
+            details["pe_relative"] = "轻度低估"
+        elif pe_ratio > 1.5:
+            score -= 15
+            details["pe_relative"] = "显著高估(PE高于行业50%)"
+        elif pe_ratio > 1.2:
+            score -= 5
+            details["pe_relative"] = "轻度高估"
+        else:
+            details["pe_relative"] = "接近行业中位数"
+
+    # ── 2. PB 相对估值 ──
+    if pb and sector_pb_median and sector_pb_median > 0:
+        pb_ratio = pb / sector_pb_median
+        details["pb_vs_sector"] = round(pb_ratio, 3)
+        if pb_ratio < 0.6:
+            score += 10
+            details["pb_relative"] = "PB显著低于行业"
+        elif pb_ratio > 1.5:
+            score -= 10
+            details["pb_relative"] = "PB显著高于行业"
+
+    # ── 3. 板块轮动信号 ──
+    if sector_avg_pct_chg_20d is not None and stock_pct_chg_20d is not None:
+        # 个股 vs 板块
+        excess = stock_pct_chg_20d - sector_avg_pct_chg_20d
+        details["stock_vs_sector_20d"] = round(excess, 2)
+
+        if sector_avg_pct_chg_20d > 3:
+            details["sector_momentum"] = "板块上行(轮动利好)"
+            if excess > 0:
+                score += 10
+                details["sector_position"] = "板块龙头(跑赢板块)"
+            else:
+                score += 3
+                details["sector_position"] = "板块跟随(跑输板块)"
+        elif sector_avg_pct_chg_20d < -3:
+            details["sector_momentum"] = "板块下行(轮动利空)"
+            if excess > 0:
+                score += 5
+                details["sector_position"] = "逆势抗跌"
+            else:
+                score -= 10
+                details["sector_position"] = "随板块下跌"
+        else:
+            details["sector_momentum"] = "板块平稳"
+
+    score = float(np.clip(score, -100, 100))
+    return {"score": round(score, 1), "details": details}
+
+
+# =====================================================
+# 8d. 财务质量深度分析 (应计异常/营运效率/ROIC)
+# =====================================================
+
+def analyze_financial_quality(
+    total_assets: Optional[float] = None,
+    net_assets: Optional[float] = None,
+    revenue: Optional[float] = None,
+    net_profit: Optional[float] = None,
+    operating_cashflow: Optional[float] = None,
+    accounts_receivable: Optional[float] = None,
+    inventory: Optional[float] = None,
+    accounts_payable: Optional[float] = None,
+    prev_receivable: Optional[float] = None,
+    prev_inventory: Optional[float] = None,
+    prev_payable: Optional[float] = None,
+    total_debt: Optional[float] = None,
+    cash_and_equivalents: Optional[float] = None,
+    ebit: Optional[float] = None,
+    tax_rate: float = 0.25,
+) -> Dict:
+    """
+    财务质量深度分析——超越简单PE/PB的应计质量和营运效率。
+
+    计算因子:
+      1. 应计比率 (Accrual Ratio): 检测盈余操纵
+      2. 现金利润比 (Cash/Earnings): 利润含金量
+      3. 应收账款周转率: 收款效率
+      4. 存货周转率: 去库存效率
+      5. 现金转换周期 (CCC): 运营资金效率
+      6. ROIC (已投资本回报): 真实盈利能力
+      7. 净负债率: 杠杆安全
+    """
+    details: Dict = {}
+    score = 0.0
+
+    # ── 1. 应计比率 ──
+    # Accrual = (Δ应收 + Δ存货 - Δ应付) / 总资产
+    # 越高 → 利润越多来自应计而非现金 → 质量越差
+    if (total_assets and total_assets > 0
+            and prev_receivable is not None and accounts_receivable is not None
+            and prev_inventory is not None and inventory is not None
+            and prev_payable is not None and accounts_payable is not None):
+        delta_ar = accounts_receivable - prev_receivable
+        delta_inv = inventory - prev_inventory
+        delta_ap = accounts_payable - prev_payable
+        accrual = (delta_ar + delta_inv - delta_ap) / total_assets
+        details["accrual_ratio"] = round(accrual * 100, 3)
+        if accrual < 0.02:
+            score += 10
+            details["accrual_quality"] = "优(应计低，利润含金量高)"
+        elif accrual < 0.05:
+            score += 3
+            details["accrual_quality"] = "一般"
+        elif accrual > 0.10:
+            score -= 15
+            details["accrual_quality"] = "差(应计过高，盈余操纵风险)"
+        else:
+            score -= 5
+            details["accrual_quality"] = "偏高"
+
+    # ── 2. 现金利润比 ──
+    if operating_cashflow is not None and net_profit and net_profit > 0:
+        cash_earnings = operating_cashflow / net_profit
+        details["cash_earnings_ratio"] = round(cash_earnings, 3)
+        if cash_earnings > 1.0:
+            score += 10
+            details["cash_quality"] = "优(经营现金流>净利润)"
+        elif cash_earnings > 0.7:
+            score += 3
+            details["cash_quality"] = "良好"
+        elif cash_earnings < 0.3:
+            score -= 15
+            details["cash_quality"] = "差(利润含金量低，警惕)"
+        else:
+            score -= 5
+            details["cash_quality"] = "偏低"
+
+    # ── 3. 应收账款周转率 ──
+    if revenue and accounts_receivable and accounts_receivable > 0:
+        ar_turnover = revenue / accounts_receivable
+        dso = 365 / ar_turnover if ar_turnover > 0 else 999
+        details["ar_turnover"] = round(ar_turnover, 2)
+        details["dso_days"] = round(dso, 1)
+        if dso < 60:
+            score += 5
+        elif dso > 180:
+            score -= 10
+            details["dso_warning"] = "应收账款回收过慢(>180天)"
+
+    # ── 4. 存货周转率 ──
+    if revenue and inventory and inventory > 0:
+        inv_turnover = revenue / inventory
+        dio = 365 / inv_turnover if inv_turnover > 0 else 999
+        details["inventory_turnover"] = round(inv_turnover, 2)
+        details["dio_days"] = round(dio, 1)
+        if dio < 60:
+            score += 5
+        elif dio > 200:
+            score -= 5
+            details["dio_warning"] = "存货周转过慢(>200天)"
+
+    # ── 5. 现金转换周期 (CCC = DSO + DIO - DPO) ──
+    dso_val = details.get("dso_days")
+    dio_val = details.get("dio_days")
+    if dso_val and dio_val and revenue and accounts_payable and accounts_payable > 0:
+        dpo = 365 / (revenue / accounts_payable) if accounts_payable > 0 else 0
+        details["dpo_days"] = round(dpo, 1)
+        ccc = dso_val + dio_val - dpo
+        details["cash_conversion_cycle"] = round(ccc, 1)
+        if ccc < 30:
+            score += 5
+            details["ccc_quality"] = "优秀(资金周转快)"
+        elif ccc > 150:
+            score -= 10
+            details["ccc_quality"] = "差(资金占用严重)"
+
+    # ── 6. ROIC (投入资本回报率) ──
+    # ROIC = NOPAT / Invested Capital
+    # NOPAT = EBIT × (1 - tax_rate)
+    # Invested Capital = Total Debt + Equity - Cash
+    if (ebit is not None and net_assets and total_debt is not None
+            and cash_and_equivalents is not None):
+        nopat = ebit * (1 - tax_rate)
+        invested_capital = total_debt + net_assets - cash_and_equivalents
+        if invested_capital > 0:
+            roic = nopat / invested_capital * 100
+            details["roic_pct"] = round(roic, 2)
+            if roic > 15:
+                score += 15
+                details["roic_quality"] = "优秀(>15%，强护城河)"
+            elif roic > 10:
+                score += 8
+                details["roic_quality"] = "良好(>10%)"
+            elif roic > 0:
+                score += 0
+                details["roic_quality"] = "一般"
+            else:
+                score -= 15
+                details["roic_quality"] = "差(ROIC为负)"
+
+    # ── 7. 净负债率 ──
+    if total_debt is not None and cash_and_equivalents is not None and net_assets and net_assets > 0:
+        net_debt_ratio = (total_debt - cash_and_equivalents) / net_assets * 100
+        details["net_debt_ratio_pct"] = round(net_debt_ratio, 2)
+        if net_debt_ratio < 0:
+            score += 5
+            details["leverage"] = "净现金(无净负债)"
+        elif net_debt_ratio < 50:
+            score += 0
+            details["leverage"] = "杠杆适中"
+        elif net_debt_ratio > 100:
+            score -= 10
+            details["leverage"] = "高杠杆(净负债>净资产)"
+
+    score = float(np.clip(score, -100, 100))
+    return {"score": round(score, 1), "details": details}
+
+
+# =====================================================
+# 8e. GARCH 波动率预测 & 波动率聚集检测
+# =====================================================
+
+def analyze_volatility_regime(df: pd.DataFrame, forecast_days: int = 5) -> Dict:
+    """
+    基于简化 GARCH(1,1) 的波动率体制分析。
+
+    不依赖 scipy/arch 库，使用手动迭代实现。
+    检测: 波动率聚集、体制切换、未来波动率预测。
+
+    Parameters
+    ----------
+    df : pd.DataFrame  (需含 close 列)
+    forecast_days : int  预测天数
+
+    Returns
+    -------
+    dict with score, details
+    """
+    close = df["close"].values.astype(float)
+    n = len(close)
+    details: Dict = {}
+
+    if n < 60:
+        return {"score": 0, "details": {"error": "数据不足60天"}}
+
+    log_ret = np.log(close[1:] / close[:-1])
+    T = len(log_ret)
+
+    # ── 1. 简化 GARCH(1,1) 参数估计 ──
+    # σ²_t = ω + α·ε²_{t-1} + β·σ²_{t-1}
+    # 使用经验参数 (适合A股日频): ω=0.00001, α=0.08, β=0.90
+    omega = 0.00001
+    alpha = 0.08
+    beta_g = 0.90
+
+    sigma2 = np.zeros(T)
+    sigma2[0] = np.var(log_ret[:20]) if T >= 20 else np.var(log_ret)
+    for t in range(1, T):
+        sigma2[t] = omega + alpha * log_ret[t - 1] ** 2 + beta_g * sigma2[t - 1]
+
+    current_vol = np.sqrt(sigma2[-1]) * np.sqrt(252) * 100  # 年化%
+    avg_vol = np.sqrt(np.mean(sigma2)) * np.sqrt(252) * 100
+    details["garch_current_vol_ann"] = round(current_vol, 2)
+    details["garch_avg_vol_ann"] = round(avg_vol, 2)
+
+    # ── 2. 波动率预测 (未来N天) ──
+    long_run_var = omega / (1 - alpha - beta_g) if (1 - alpha - beta_g) > 0 else sigma2[-1]
+    forecast_var = sigma2[-1]
+    forecast_vols = []
+    for _ in range(forecast_days):
+        forecast_var = omega + (alpha + beta_g) * forecast_var
+        forecast_vols.append(np.sqrt(forecast_var) * np.sqrt(252) * 100)
+    details["forecast_vol_5d"] = round(forecast_vols[-1], 2) if forecast_vols else 0
+    details["long_run_vol_ann"] = round(np.sqrt(long_run_var) * np.sqrt(252) * 100, 2)
+
+    # ── 3. 波动率体制判断 ──
+    vol_ratio = current_vol / avg_vol if avg_vol > 0 else 1
+    details["vol_regime_ratio"] = round(vol_ratio, 3)
+    if vol_ratio > 1.5:
+        details["vol_regime"] = "高波动体制(当前>>平均)"
+        regime_score = -20
+    elif vol_ratio > 1.2:
+        details["vol_regime"] = "波动率升高"
+        regime_score = -10
+    elif vol_ratio < 0.7:
+        details["vol_regime"] = "低波动体制(压缩中，可能爆发)"
+        regime_score = 5  # 低波动后常有突破
+    else:
+        details["vol_regime"] = "正常波动"
+        regime_score = 0
+
+    # ── 4. 波动率聚集强度 ──
+    # 自相关: |ε²_{t}| 与 |ε²_{t-1}| 的相关系数
+    abs_ret = np.abs(log_ret)
+    if T > 5:
+        cluster_corr = np.corrcoef(abs_ret[1:], abs_ret[:-1])[0, 1]
+        details["volatility_clustering"] = round(cluster_corr, 3)
+        if cluster_corr > 0.3:
+            details["clustering_interp"] = "强聚集(大波动后还有大波动)"
+        elif cluster_corr > 0.15:
+            details["clustering_interp"] = "中等聚集"
+        else:
+            details["clustering_interp"] = "弱聚集(波动较随机)"
+
+    score = float(np.clip(regime_score, -100, 100))
+    return {"score": round(score, 1), "details": details}
+
+
+# =====================================================
+# 8f. 多时间级共振 & 缺口分析
+# =====================================================
+
+def analyze_timeframe_harmony(df: pd.DataFrame) -> Dict:
+    """
+    多时间级共振分析 — 日/周/月线趋势一致性。
+
+    原理: 当短期(5日)、中期(20日)、长期(60日)趋势方向一致时，
+    信号可靠度大幅提升。这是通达信/同花顺等专业软件的核心功能。
+
+    同时检测缺口(跳空)形态:
+      - 突破缺口(伴随放量): 趋势确认
+      - 竭尽缺口(高位放量): 反转警告
+      - 普通缺口: 通常被回补
+
+    Parameters
+    ----------
+    df : pd.DataFrame  (需含 open/high/low/close/volume 列)
+
+    Returns
+    -------
+    dict with score, details
+    """
+    close = df["close"].values.astype(float)
+    high = df["high"].values.astype(float)
+    low = df["low"].values.astype(float)
+    opn = df["open"].values.astype(float)
+    volume = df["volume"].values.astype(float)
+    n = len(close)
+    details: Dict = {}
+    score = 0.0
+
+    if n < 60:
+        return {"score": 0, "details": {"error": "数据不足60天"}}
+
+    # ── 1. 多时间级趋势判断 ──
+    # 用线性回归斜率判断不同周期的趋势方向
+    def trend_direction(series, window):
+        if len(series) < window:
+            return 0, 0
+        seg = series[-window:]
+        slope, _, r2 = linear_regression(seg)
+        daily_pct = slope / np.mean(seg) * 100 if np.mean(seg) > 0 else 0
+        return daily_pct, r2
+
+    short_slope, short_r2 = trend_direction(close, 5)    # 周线级
+    mid_slope, mid_r2 = trend_direction(close, 20)        # 月线级
+    long_slope, long_r2 = trend_direction(close, 60)      # 季线级
+
+    details["trend_5d_slope"] = round(short_slope, 4)
+    details["trend_20d_slope"] = round(mid_slope, 4)
+    details["trend_60d_slope"] = round(long_slope, 4)
+
+    # 判断方向: >0.03%/日为上行, <-0.03%为下行, 否则横盘
+    def classify(slope):
+        if slope > 0.03:
+            return "up"
+        elif slope < -0.03:
+            return "down"
+        return "flat"
+
+    s_dir = classify(short_slope)
+    m_dir = classify(mid_slope)
+    l_dir = classify(long_slope)
+    details["tf_short"] = s_dir
+    details["tf_mid"] = m_dir
+    details["tf_long"] = l_dir
+
+    # 共振评分
+    directions = [s_dir, m_dir, l_dir]
+    if directions.count("up") == 3:
+        score += 25
+        details["timeframe_harmony"] = "三线共振上行(强多头)"
+    elif directions.count("down") == 3:
+        score -= 25
+        details["timeframe_harmony"] = "三线共振下行(强空头)"
+    elif directions.count("up") == 2:
+        score += 10
+        details["timeframe_harmony"] = "双线上行(偏多)"
+    elif directions.count("down") == 2:
+        score -= 10
+        details["timeframe_harmony"] = "双线下行(偏空)"
+    elif s_dir == "up" and l_dir == "down":
+        score += 0
+        details["timeframe_harmony"] = "短多长空(反弹中)"
+    elif s_dir == "down" and l_dir == "up":
+        score -= 5
+        details["timeframe_harmony"] = "短空长多(回调中)"
+    else:
+        details["timeframe_harmony"] = "方向混合(观望)"
+
+    # 共振强度 = R²的平均值 (趋势明确度)
+    avg_r2 = (short_r2 + mid_r2 + long_r2) / 3
+    details["trend_clarity"] = round(avg_r2, 3)
+
+    # ── 2. 缺口分析 (Gap Analysis) ──
+    gaps = []
+    avg_vol = np.mean(volume[-20:]) if n >= 20 else np.mean(volume)
+
+    for i in range(-min(20, n - 1), 0):
+        # 向上跳空: 今日Low > 昨日High
+        if low[i] > high[i - 1]:
+            gap_pct = (low[i] - high[i - 1]) / high[i - 1] * 100
+            vol_surge = volume[i] / avg_vol if avg_vol > 0 else 1
+            gap_type = "突破缺口" if vol_surge > 1.5 else "普通缺口"
+            gaps.append({"dir": "up", "pct": round(gap_pct, 2),
+                         "type": gap_type, "vol_ratio": round(vol_surge, 2)})
+        # 向下跳空: 今日High < 昨日Low
+        elif high[i] < low[i - 1]:
+            gap_pct = (low[i - 1] - high[i]) / low[i - 1] * 100
+            vol_surge = volume[i] / avg_vol if avg_vol > 0 else 1
+            gap_type = "恐慌缺口" if vol_surge > 1.5 else "普通缺口"
+            gaps.append({"dir": "down", "pct": round(gap_pct, 2),
+                         "type": gap_type, "vol_ratio": round(vol_surge, 2)})
+
+    details["recent_gaps"] = gaps
+    details["gap_count"] = len(gaps)
+
+    # 缺口评分
+    for g in gaps:
+        if g["dir"] == "up" and g["type"] == "突破缺口":
+            score += 8
+        elif g["dir"] == "down" and g["type"] == "恐慌缺口":
+            score -= 12
+
+    # ── 3. K线实体/影线比分析 ──
+    if n >= 10:
+        recent_bodies = []
+        recent_wicks = []
+        for i in range(-10, 0):
+            body = abs(close[i] - opn[i])
+            upper_wick = high[i] - max(close[i], opn[i])
+            lower_wick = min(close[i], opn[i]) - low[i]
+            total_range = high[i] - low[i]
+            if total_range > 0:
+                recent_bodies.append(body / total_range)
+                recent_wicks.append((upper_wick + lower_wick) / total_range)
+
+        if recent_bodies:
+            avg_body_ratio = np.mean(recent_bodies)
+            details["avg_body_ratio"] = round(avg_body_ratio, 3)
+            if avg_body_ratio > 0.7:
+                details["candle_character"] = "实体大(趋势明确)"
+            elif avg_body_ratio < 0.3:
+                details["candle_character"] = "影线长(犹豫不决)"
+                score -= 5
+            else:
+                details["candle_character"] = "均衡"
+
+    score = float(np.clip(score, -100, 100))
+    return {"score": round(score, 1), "details": details}
+
+
+# =====================================================
 # 9. KDJ + K线形态识别（涨停/缩量回调/吞没/锤子线）
 # =====================================================
 
@@ -1250,6 +1915,7 @@ def comprehensive_diagnosis(
     news_sentiment: float = 0.0,
     run_monte_carlo: bool = True,
     mc_days: int = 20,
+    benchmark_close: Optional[np.ndarray] = None,
 ) -> Dict:
     """
     Comprehensive diagnosis scoring.
@@ -1283,6 +1949,11 @@ def comprehensive_diagnosis(
     sr      = analyze_support_resistance(df)
     stats   = analyze_statistics(df)
 
+    # -- 新增维度: 相对强弱 / 多时间级共振 / GARCH波动率 --
+    rel_str = analyze_relative_strength(df, benchmark_close=benchmark_close)
+    tf_harm = analyze_timeframe_harmony(df)
+    vol_reg = analyze_volatility_regime(df)
+
     # -- 自适应权重：根据 Hurst 指数动态调整各维度权重 --
     hurst_val = stats["details"].get("hurst", 0.5)
     w = _get_adaptive_weights(hurst_val)
@@ -1295,6 +1966,12 @@ def comprehensive_diagnosis(
         "volume":          {"score": volume["score"],   "weight": w["volume"],             "label": "量价 Volume-Price"},
         "support_resistance": {"score": sr["score"],   "weight": w["support_resistance"], "label": "支撑阻力 S/R"},
         "statistics":      {"score": stats["score"],   "weight": w["statistics"],         "label": "统计特征 Stats"},
+        "relative_strength": {"score": rel_str["score"], "weight": 0.0, "label": "相对强弱 RS",
+                              "details": rel_str.get("details", {})},
+        "timeframe_harmony": {"score": tf_harm["score"], "weight": 0.0, "label": "多时间级共振 TF",
+                              "details": tf_harm.get("details", {})},
+        "volatility_regime": {"score": vol_reg["score"], "weight": 0.0, "label": "波动率体制 GARCH",
+                              "details": vol_reg.get("details", {})},
     }
 
     # -- 加权总分 --
@@ -1305,7 +1982,15 @@ def comprehensive_diagnosis(
     if news_sentiment != 0:
         factors["news"] = {"score": news_adj, "weight": 0.0, "label": "新闻情绪 News(adj)"}
 
-    total = np.clip(weighted_sum + news_adj, -100, 100)
+    # -- 新增维度辅助修正 (weight=0, 但作为±调整) --
+    # 多时间级共振: 三线同方向时 ±5, 双线 ±2
+    tf_adj = tf_harm["score"] * 0.2  # 25*0.2=5, 10*0.2=2
+    # 波动率体制: 高波动时惩罚, 低波动时中性
+    vol_reg_adj = vol_reg["score"] * 0.15  # -20*0.15=-3
+    # 相对强弱: 跑赢/跑输大盘
+    rs_adj = rel_str["score"] * 0.10  # 15*0.1=1.5
+
+    total = np.clip(weighted_sum + news_adj + tf_adj + vol_reg_adj + rs_adj, -100, 100)
 
     # ── 多条件买卖核查清单 ──────────────────────────────────────
     rsi_val         = momentum["details"].get("rsi_14", 50)
@@ -1399,8 +2084,9 @@ def comprehensive_diagnosis(
 
     # -- Risk warnings --
     warnings = []
-    if vol["risk_level"] in ("extreme", "high"):
-        warnings.append(f"WARNING: Volatility {vol['risk_level']} (HV {vol['current_hv']:.0f}%), manage position size")
+    if vol.get("risk_level") in ("extreme", "high"):
+        _hv = vol.get('current_hv', 0)
+        warnings.append(f"WARNING: Volatility {vol['risk_level']} (HV {_hv:.0f}%), manage position size")
     if "rsi_divergence" in momentum["details"]:
         warnings.append(f"WARNING: RSI {momentum['details']['rsi_divergence']}")
     if "vol_divergence" in volume["details"]:
@@ -1444,26 +2130,62 @@ def comprehensive_diagnosis(
         f"综合得分: {total:.0f}/100  │  信号: {signal_cn.get(signal, signal)}  │  置信度: {confidence}",
         f"市场状态: {market_regime}",
         "",
-        f"趋势: {trend['direction']} ({trend['strength']})  得分={trend['score']:.0f}",
-        f"动量: 得分={momentum['score']:.0f}   RSI={momentum['details'].get('rsi_14', 'N/A')}",
-        f"波动: {vol['risk_level']}   HV={vol['current_hv']:.0f}%",
-        f"均值回归: {mr['signal']}  得分={mr['score']:.0f}",
+        f"趋势: {trend.get('direction', 'N/A')} ({trend.get('strength', 'N/A')})  得分={trend.get('score', 0):.0f}",
+        f"动量: 得分={momentum.get('score', 0):.0f}   RSI={momentum.get('details', {}).get('rsi_14', 'N/A')}",
+        f"波动: {vol.get('risk_level', 'N/A')}   HV={vol.get('current_hv', 0):.0f}%",
+        f"均值回归: {mr.get('signal', 'N/A')}  得分={mr.get('score', 0):.0f}",
         f"量价关系: {volume['details'].get('obv_signal', 'N/A')}",
     ]
+
+    # 新增维度摘要
+    tf_detail = tf_harm.get("details", {})
+    vol_reg_detail = vol_reg.get("details", {})
+    rs_detail = rel_str.get("details", {})
+    summary_lines.extend([
+        f"多时间级: {tf_detail.get('timeframe_harmony', 'N/A')}  "
+        f"(5d={tf_detail.get('tf_short','?')}/20d={tf_detail.get('tf_mid','?')}/60d={tf_detail.get('tf_long','?')})",
+        f"波动体制: {vol_reg_detail.get('vol_regime', 'N/A')}  "
+        f"GARCH年化={vol_reg_detail.get('garch_current_vol_ann', 'N/A')}%  "
+        f"预测5日={vol_reg_detail.get('forecast_vol_5d', 'N/A')}%",
+        f"Sortino: {rs_detail.get('sortino_ratio', 'N/A')}  "
+        f"最大回撤: {rs_detail.get('max_drawdown_pct', 'N/A')}%  "
+        f"Calmar: {rs_detail.get('calmar_ratio', 'N/A')}",
+    ])
+    if rs_detail.get("relative_strength"):
+        summary_lines.append(
+            f"相对强弱: {rs_detail['relative_strength']}  "
+            f"Beta={rs_detail.get('beta_60d', 'N/A')}  "
+            f"Alpha年化={rs_detail.get('alpha_ann_pct', 'N/A')}%"
+        )
+    if tf_detail.get("recent_gaps"):
+        gaps = tf_detail["recent_gaps"]
+        gap_strs = [f"{'↑' if g['dir']=='up' else '↓'}{g['pct']}%({g['type']})" for g in gaps[:3]]
+        summary_lines.append(f"近期缺口: {', '.join(gap_strs)}")
 
     if sr["supports"]:
         summary_lines.append(f"Support Levels: {sr['supports'][:3]}")
     if sr["resistances"]:
         summary_lines.append(f"Resistance Levels: {sr['resistances'][:3]}")
 
-    if mc_result:
+    if mc_result and "error" not in mc_result:
+        _mc_prob_up = mc_result.get('prob_up')
+        _mc_prob_down = mc_result.get('prob_down')
+        _mc_exp_ret = mc_result.get('expected_return')
+        _mc_ret_5 = mc_result.get('return_5th')
+        _mc_ret_95 = mc_result.get('return_95th')
+        _mc_p5 = mc_result.get('price_5th')
+        _mc_p95 = mc_result.get('price_95th')
         summary_lines.extend([
             "",
             f"Monte Carlo ({mc_days} days, {mc_result.get('n_simulations', 5000)} simulations):",
-            f"  Up probability {mc_result['prob_up']:.0f}%  Down probability {mc_result['prob_down']:.0f}%",
-            f"  Expected return {mc_result['expected_return']:+.1f}%",
-            f"  95% confidence interval [{mc_result['return_5th']:+.1f}%, {mc_result['return_95th']:+.1f}%]",
-            f"  Price range [{mc_result['price_5th']:.2f}, {mc_result['price_95th']:.2f}]",
+            f"  Up probability {_mc_prob_up:.0f}%  Down probability {_mc_prob_down:.0f}%"
+            if _mc_prob_up is not None and _mc_prob_down is not None else "  Probability data unavailable",
+            f"  Expected return {_mc_exp_ret:+.1f}%"
+            if _mc_exp_ret is not None else "  Expected return N/A",
+            f"  95% confidence interval [{_mc_ret_5:+.1f}%, {_mc_ret_95:+.1f}%]"
+            if _mc_ret_5 is not None and _mc_ret_95 is not None else "  95% CI N/A",
+            f"  Price range [{_mc_p5:.2f}, {_mc_p95:.2f}]"
+            if _mc_p5 is not None and _mc_p95 is not None else "  Price range N/A",
         ])
 
     if warnings:
@@ -1518,7 +2240,564 @@ def comprehensive_diagnosis(
         "volume_detail":      volume,
         "support_resistance_detail": sr,
         "statistics_detail":  stats,
+        "relative_strength_detail": rel_str,
+        "timeframe_harmony_detail": tf_harm,
+        "volatility_regime_detail": vol_reg,
         "monte_carlo":    mc_result,
         "risk_warnings":  warnings,
         "summary":        "\n".join(summary_lines),
+    }
+
+
+# =====================================================
+# 11. 低位建仓识别 — 四维信号同时成立
+# =====================================================
+#
+# 维度一: 价格形态 (kline)
+#   横盘或缓慢阴跌 / 区间反复震荡3-8周 / 振幅收窄(<3%) /
+#   下跌时有支撑(不破MA) / MA20走平或微降
+#
+# 维度二: 资金特征 (moneyflow)
+#   每日净流出小且稳定(散户卖出) / 大单净流出<0.2亿/天 /
+#   20日累计净流出-1~-3亿 / 偶发单日大单净流入(试盘) /
+#   流出量逐周递减(筹码趋稳)
+#
+# 维度三: 量能结构 (kline)
+#   总体缩量(换手率1-3%) / 下跌日量小,上涨日量稍大 /
+#   量价背离:价跌但量不放大 / 偶有温和放量后迅速回落(压价吸筹)
+#
+# 维度四: 筹码与情绪 (多源)
+#   融资余额缓慢回升 / 股价处于近1年低30%分位 /
+#   北向资金无大额净卖出 / 市场情绪冷淡(无人关注)
+#
+# 四维同时满足 → 高置信度建仓信号
+# 三维满足     → 加入观察池等待确认
+# 任一维度反向 → 排除
+
+
+def detect_accumulation(
+    df: pd.DataFrame,
+    moneyflow: Optional[list] = None,
+    margin_trend: Optional[str] = None,
+    northbound_adj: float = 0.0,
+    turnover_col: str = "turnover",
+    float_mv: float = 0.0,
+) -> Dict:
+    """
+    低位建仓四维识别。
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        日K线数据, 必须包含 date/open/high/low/close/volume 列,
+        可选 turnover(换手率) 列。按日期升序排列。
+    moneyflow : list of dict, optional
+        资金流向数据 (来自 DB 或 API)。
+        每条: {date, main_net, main_net_pct, super_net, big_net, ...}
+        按日期降序（最新在前）。None 时维度二跳过。
+    margin_trend : str, optional
+        融资余额趋势: "up" / "flat" / "down"。None 时不参与评分。
+    northbound_adj : float
+        北向资金修正值（正=放量，负=缩量）
+    turnover_col : str
+        换手率列名
+    float_mv : float
+        流通市值（亿元），用于资金流向阈值的相对化计算。
+        0 或未传时使用默认绝对阈值。
+
+    Returns
+    -------
+    dict:
+        dim1_price    : {score, max, signals, desc}
+        dim2_money    : {score, max, signals, desc}
+        dim3_volume   : {score, max, signals, desc}
+        dim4_sentiment: {score, max, signals, desc}
+        total_score   : float   四维总分(0-100)
+        total_max     : int     满分
+        dimensions_met: int     满足阈值的维度数(0-4)
+        conclusion    : str     "HIGH" / "WATCH" / "NONE"
+        price_info    : dict    支撑/阻力/入场区间/止损
+        summary       : str     中文摘要
+    """
+    close = df["close"].values.astype(float)
+    high = df["high"].values.astype(float)
+    low = df["low"].values.astype(float)
+    volume = df["volume"].values.astype(float)
+    n = len(close)
+
+    # NaN 保护: 剔除尾部连续 NaN，确保核心数据可用
+    if n > 0 and (np.isnan(close[-1]) or close[-1] <= 0):
+        # 数据质量不足，返回空结果
+        return {
+            "dim1_price": {"score": 0, "max": 25, "signals": ["数据含NaN"]},
+            "dim2_money": {"score": 0, "max": 25, "signals": []},
+            "dim3_volume": {"score": 0, "max": 25, "signals": []},
+            "dim4_sentiment": {"score": 0, "max": 25, "signals": []},
+            "total_score": 0, "total_max": 100, "dimensions_met": 0,
+            "conclusion": "NONE", "exclusions": [],
+            "price_info": {}, "summary": "数据质量不足，无法进行建仓识别",
+        }
+    # 将 NaN 替换为前值（前向填充）
+    for arr in [close, high, low, volume]:
+        mask = np.isnan(arr)
+        if mask.any():
+            for i in range(1, len(arr)):
+                if mask[i]:
+                    arr[i] = arr[i - 1]
+
+    has_turnover = turnover_col in df.columns
+    turnover = df[turnover_col].values.astype(float) if has_turnover else None
+    if turnover is not None:
+        np.nan_to_num(turnover, copy=False, nan=0.0)
+
+    # ══════════════════════════════════════════════
+    # 维度一: 价格形态 (满分 25)
+    # ══════════════════════════════════════════════
+    d1_score = 0
+    d1_max = 25
+    d1_signals = []
+
+    if n >= 30:
+        # ── 1a. 横盘/缓慢阴跌 检测 ──
+        # 用最近 40 天的线性回归斜率判断（斜率接近0=横盘，微负=缓跌）
+        window = min(40, n)
+        slope, intercept, r2 = linear_regression(close[-window:])
+        # 归一化斜率: 每日变化占价格的百分比
+        daily_pct = slope / np.mean(close[-window:]) * 100 if np.mean(close[-window:]) > 0 else 0
+
+        if -0.15 <= daily_pct <= 0.05:
+            d1_score += 7
+            d1_signals.append(f"横盘整理(斜率{daily_pct:+.3f}%/日)")
+        elif -0.30 <= daily_pct < -0.15:
+            d1_score += 4
+            d1_signals.append(f"缓慢阴跌(斜率{daily_pct:+.3f}%/日)")
+        elif daily_pct < -0.30:
+            d1_signals.append(f"下跌过快(斜率{daily_pct:+.3f}%/日) ✗")
+
+        # ── 1b. 振幅收窄 ──
+        # 最近 20 天的平均日振幅
+        if n >= 20:
+            daily_range = (high[-20:] - low[-20:]) / close[-20:] * 100
+            avg_range = np.mean(daily_range)
+            if avg_range < 3.0:
+                d1_score += 6
+                d1_signals.append(f"振幅收窄({avg_range:.1f}% < 3%)")
+            elif avg_range < 4.5:
+                d1_score += 3
+                d1_signals.append(f"振幅适中({avg_range:.1f}%)")
+            else:
+                d1_signals.append(f"振幅偏大({avg_range:.1f}%) ✗")
+
+        # ── 1c. MA20 走平或微降 ──
+        if n >= 25:
+            ma20 = np.convolve(close, np.ones(20)/20, mode="valid")
+            if len(ma20) >= 5:
+                ma20_recent = ma20[-5:]
+                ma20_slope, _, _ = linear_regression(ma20_recent)
+                ma20_pct = ma20_slope / ma20_recent[0] * 100 if ma20_recent[0] > 0 else 0
+                if -0.10 <= ma20_pct <= 0.05:
+                    d1_score += 6
+                    d1_signals.append(f"MA20走平({ma20_pct:+.3f}%/日)")
+                elif -0.20 <= ma20_pct < -0.10:
+                    d1_score += 3
+                    d1_signals.append(f"MA20微降({ma20_pct:+.3f}%/日)")
+                else:
+                    d1_signals.append(f"MA20偏陡({ma20_pct:+.3f}%/日) ✗")
+
+        # ── 1d. 下跌时有支撑 ──
+        # 最近 20 天的最低价 vs MA20，不跌破MA20太多
+        if n >= 25 and len(ma20) >= 1:
+            recent_low = np.min(low[-20:])
+            current_ma20 = ma20[-1]
+            breach_pct = (recent_low - current_ma20) / current_ma20 * 100 if current_ma20 > 0 else 0
+            if breach_pct >= -2.0:
+                d1_score += 6
+                d1_signals.append(f"跌有支撑(最低距MA20 {breach_pct:+.1f}%)")
+            elif breach_pct >= -5.0:
+                d1_score += 3
+                d1_signals.append(f"支撑尚可(最低距MA20 {breach_pct:+.1f}%)")
+            else:
+                d1_signals.append(f"破位明显(最低距MA20 {breach_pct:+.1f}%) ✗")
+
+    # ══════════════════════════════════════════════
+    # 维度二: 资金特征 (满分 25)
+    # ══════════════════════════════════════════════
+    d2_score = 0
+    d2_max = 25
+    d2_signals = []
+
+    if moneyflow and len(moneyflow) >= 5:
+        # moneyflow 按日期降序(最新在前)
+        mf = moneyflow
+
+        # ── 根据流通市值动态调整阈值 ──
+        # float_mv 单位: 亿元。阈值 = 流通市值 × 百分比
+        # 小盘(<50亿): daily ~0.1%, big ~0.1%, cum20 ~-1.5%, probe >0.05%
+        # 中盘(50~300亿): daily ~0.04%, big ~0.04%, cum20 ~-0.6%, probe >0.02%
+        # 大盘(>300亿): daily ~0.01%, big ~0.015%, cum20 ~-0.2%, probe >0.005%
+        if float_mv and float_mv > 0:
+            _mv = float(float_mv)
+            th_daily_lo = -_mv * 0.001     # 日均净流出下限
+            th_daily_hi = _mv * 0.0003     # 日均净流入上限
+            th_daily_warn = -_mv * 0.003   # 日均流出警告
+            th_big_ok = _mv * 0.001        # 大单可控
+            th_big_warn = _mv * 0.003      # 大单偏大
+            th_cum_lo = -_mv * 0.015       # 20日累计吸筹下限
+            th_cum_hi = -_mv * 0.003       # 20日累计吸筹上限
+            th_cum_balance = _mv * 0.003   # 接近平衡
+            th_cum_warn = -_mv * 0.03      # 流出偏多
+            th_probe = _mv * 0.0005        # 试盘阈值
+            _mv_tag = f"[相对市值{_mv:.0f}亿]"
+        else:
+            # 降级为绝对阈值（兼容无市值数据的场景）
+            th_daily_lo = -0.2
+            th_daily_hi = 0.05
+            th_daily_warn = -0.5
+            th_big_ok = 0.2
+            th_big_warn = 0.5
+            th_cum_lo = -3.0
+            th_cum_hi = -0.5
+            th_cum_balance = 0.5
+            th_cum_warn = -5.0
+            th_probe = 0.1
+            _mv_tag = "[绝对值]"
+
+        # ── 2a. 每日净流出小且稳定 ──
+        recent_10 = mf[:min(10, len(mf))]
+        daily_nets = [d.get("main_net", 0) or 0 for d in recent_10]
+        avg_daily_net = np.mean(daily_nets) if daily_nets else 0
+        if th_daily_lo <= avg_daily_net <= th_daily_hi:
+            d2_score += 5
+            d2_signals.append(f"日均净流{avg_daily_net:+.2f}亿(小额稳定){_mv_tag}")
+        elif th_daily_warn <= avg_daily_net < th_daily_lo:
+            d2_score += 2
+            d2_signals.append(f"日均净流{avg_daily_net:+.2f}亿(流出偏多)")
+        else:
+            d2_signals.append(f"日均净流{avg_daily_net:+.2f}亿 ✗")
+
+        # ── 2b. 大单控盘度 ──
+        big_nets = [abs(d.get("main_net", 0) or 0) for d in recent_10]
+        max_big_outflow = max(big_nets) if big_nets else 0
+        if max_big_outflow < th_big_ok:
+            d2_score += 5
+            d2_signals.append(f"大单可控(最大{max_big_outflow:.2f}亿)")
+        elif max_big_outflow < th_big_warn:
+            d2_score += 2
+            d2_signals.append(f"大单偏大(最大{max_big_outflow:.2f}亿)")
+        else:
+            d2_signals.append(f"大单流出过大({max_big_outflow:.2f}亿) ✗")
+
+        # ── 2c. 20日累计净流 ──
+        recent_20 = mf[:min(20, len(mf))]
+        cum_20 = sum(d.get("main_net", 0) or 0 for d in recent_20)
+        if th_cum_lo <= cum_20 <= th_cum_hi:
+            d2_score += 5
+            d2_signals.append(f"20日累计{cum_20:+.2f}亿(典型吸筹区间)")
+        elif th_cum_hi < cum_20 <= th_cum_balance:
+            d2_score += 3
+            d2_signals.append(f"20日累计{cum_20:+.2f}亿(接近平衡)")
+        elif th_cum_warn <= cum_20 < th_cum_lo:
+            d2_score += 1
+            d2_signals.append(f"20日累计{cum_20:+.2f}亿(流出偏多)")
+        else:
+            d2_signals.append(f"20日累计{cum_20:+.2f}亿 ✗")
+
+        # ── 2d. 偶发单日大单净流入(试盘) ──
+        if len(mf) >= 10:
+            inflow_days = [d for d in recent_10 if (d.get("main_net", 0) or 0) > th_probe]
+            if 1 <= len(inflow_days) <= 3:
+                d2_score += 5
+                d2_signals.append(f"{len(inflow_days)}天出现大单试盘")
+            elif len(inflow_days) == 0:
+                d2_score += 2
+                d2_signals.append("无明显试盘(可能更早期)")
+            else:
+                d2_signals.append(f"大单流入天数过多({len(inflow_days)}天) ✗")
+
+        # ── 2e. 流出量逐周递减(筹码趋稳) ──
+        if len(mf) >= 20:
+            week1 = sum(abs(d.get("main_net", 0) or 0) for d in mf[:5])
+            week2 = sum(abs(d.get("main_net", 0) or 0) for d in mf[5:10])
+            week3 = sum(abs(d.get("main_net", 0) or 0) for d in mf[10:15])
+            week4 = sum(abs(d.get("main_net", 0) or 0) for d in mf[15:20])
+            # 最近一周 < 前一周 < 更早 → 递减
+            if week1 < week2 and week2 < week3:
+                d2_score += 5
+                d2_signals.append(f"流出量逐周递减({week1:.1f}<{week2:.1f}<{week3:.1f})")
+            elif week1 < week2:
+                d2_score += 3
+                d2_signals.append(f"近两周流出收窄({week1:.1f}<{week2:.1f})")
+            else:
+                d2_signals.append(f"流出未收窄({week1:.1f}>={week2:.1f}) ✗")
+    else:
+        d2_signals.append("无资金流向数据(需先运行 --moneyflow 拉取)")
+
+    # ══════════════════════════════════════════════
+    # 维度三: 量能结构 (满分 25)
+    # ══════════════════════════════════════════════
+    d3_score = 0
+    d3_max = 25
+    d3_signals = []
+
+    if n >= 20:
+        # ── 3a. 总体缩量(换手率1-3%) ──
+        if has_turnover and turnover is not None:
+            avg_turnover = np.mean(turnover[-20:])
+            if 1.0 <= avg_turnover <= 3.0:
+                d3_score += 7
+                d3_signals.append(f"缩量换手{avg_turnover:.1f}%(1-3%区间)")
+            elif 0.5 <= avg_turnover < 1.0:
+                d3_score += 4
+                d3_signals.append(f"极低换手{avg_turnover:.1f}%(偏冷)")
+            elif 3.0 < avg_turnover <= 5.0:
+                d3_score += 3
+                d3_signals.append(f"换手偏高{avg_turnover:.1f}%")
+            else:
+                d3_signals.append(f"换手率{avg_turnover:.1f}% ✗")
+        else:
+            # 没有换手率数据时用成交量相对比来粗估
+            vol_recent = np.mean(volume[-20:])
+            vol_early = np.mean(volume[-60:-20]) if n >= 60 else vol_recent
+            ratio = vol_recent / vol_early if vol_early > 0 else 1
+            if 0.4 <= ratio <= 0.8:
+                d3_score += 5
+                d3_signals.append(f"成交量萎缩(近期/远期={ratio:.2f})")
+            elif ratio < 0.4:
+                d3_score += 3
+                d3_signals.append(f"极度缩量(比值{ratio:.2f})")
+            else:
+                d3_signals.append(f"成交量未明显缩量(比值{ratio:.2f}) ✗")
+
+        # ── 3b. 阴日量小，阳日量稍大 ──
+        returns_20 = np.diff(close[-21:]) / close[-21:-1]
+        vol_20 = volume[-20:]
+        up_mask = returns_20 > 0
+        down_mask = returns_20 < 0
+        if np.sum(up_mask) > 0 and np.sum(down_mask) > 0:
+            avg_up_vol = np.mean(vol_20[up_mask])
+            avg_down_vol = np.mean(vol_20[down_mask])
+            ratio = avg_up_vol / avg_down_vol if avg_down_vol > 0 else 1
+            if ratio > 1.1:
+                d3_score += 6
+                d3_signals.append(f"阳日量>阴日量(比{ratio:.2f})")
+            elif ratio > 0.9:
+                d3_score += 3
+                d3_signals.append(f"阴阳日量接近(比{ratio:.2f})")
+            else:
+                d3_signals.append(f"阴日量反而更大(比{ratio:.2f}) ✗")
+
+        # ── 3c. 量价背离: 价跌但量不放大 ──
+        if n >= 30:
+            price_chg_20 = (close[-1] - close[-20]) / close[-20] * 100
+            vol_chg_20 = (np.mean(volume[-5:]) - np.mean(volume[-20:])) / np.mean(volume[-20:]) * 100 if np.mean(volume[-20:]) > 0 else 0
+            if price_chg_20 < -2 and vol_chg_20 < 10:
+                d3_score += 6
+                d3_signals.append(f"量价背离(价{price_chg_20:+.1f}%,量{vol_chg_20:+.1f}%)")
+            elif price_chg_20 < 0 and vol_chg_20 < 5:
+                d3_score += 3
+                d3_signals.append(f"温和背离(价{price_chg_20:+.1f}%,量{vol_chg_20:+.1f}%)")
+            else:
+                d3_signals.append(f"无明显背离(价{price_chg_20:+.1f}%,量{vol_chg_20:+.1f}%)")
+
+        # ── 3d. 偶有温和放量后迅速回落(压价吸筹) ──
+        if n >= 20:
+            vol_ma = np.mean(volume[-20:])
+            spike_count = 0
+            for i in range(-15, -1):
+                # 某日放量 > 均量1.5倍，次日缩回 < 均量1.2倍
+                if volume[i] > vol_ma * 1.5 and volume[i+1] < vol_ma * 1.2:
+                    spike_count += 1
+            if 1 <= spike_count <= 3:
+                d3_score += 6
+                d3_signals.append(f"检测到{spike_count}次放量后缩量(吸筹特征)")
+            elif spike_count == 0:
+                d3_score += 2
+                d3_signals.append("无明显放量回落")
+            else:
+                d3_signals.append(f"放量过于频繁({spike_count}次) ✗")
+
+    # ══════════════════════════════════════════════
+    # 维度四: 筹码与情绪 (满分 25)
+    # ══════════════════════════════════════════════
+    d4_score = 0
+    d4_max = 25
+    d4_signals = []
+
+    # ── 4a. 股价处于近1年低30%分位 ──
+    if n >= 60:
+        lookback_1y = min(250, n)
+        high_1y = np.max(high[-lookback_1y:])
+        low_1y = np.min(low[-lookback_1y:])
+        percentile = (close[-1] - low_1y) / (high_1y - low_1y) * 100 if (high_1y - low_1y) > 0 else 50
+        if percentile <= 30:
+            d4_score += 8
+            d4_signals.append(f"价格分位{percentile:.0f}%(低于30%)")
+        elif percentile <= 50:
+            d4_score += 4
+            d4_signals.append(f"价格分位{percentile:.0f}%(中低位)")
+        else:
+            d4_signals.append(f"价格分位{percentile:.0f}%(偏高位) ✗")
+
+    # ── 4b. 融资余额缓慢回升 ──
+    if margin_trend == "up":
+        d4_score += 6
+        d4_signals.append("融资余额回升(聪明钱进场)")
+    elif margin_trend == "flat":
+        d4_score += 3
+        d4_signals.append("融资余额持平")
+    elif margin_trend == "down":
+        d4_signals.append("融资余额下降 ✗")
+    else:
+        d4_signals.append("无融资融券数据")
+
+    # ── 4c. 北向资金无大额净卖出 ──
+    if northbound_adj >= 0:
+        d4_score += 5
+        d4_signals.append(f"北向资金正常(修正{northbound_adj:+.2f})")
+    elif northbound_adj > -0.05:
+        d4_score += 3
+        d4_signals.append(f"北向资金微缩(修正{northbound_adj:+.2f})")
+    else:
+        d4_signals.append(f"北向资金明显缩量(修正{northbound_adj:+.2f}) ✗")
+
+    # ── 4d. 市场情绪冷淡(无人关注) — 用换手率极低来代理 ──
+    if has_turnover and turnover is not None and n >= 10:
+        recent_turnover = np.mean(turnover[-10:])
+        if recent_turnover < 2.0:
+            d4_score += 6
+            d4_signals.append(f"冷门低关注(换手{recent_turnover:.1f}%)")
+        elif recent_turnover < 4.0:
+            d4_score += 3
+            d4_signals.append(f"关注度适中(换手{recent_turnover:.1f}%)")
+        else:
+            d4_signals.append(f"关注度偏高(换手{recent_turnover:.1f}%) ✗")
+    else:
+        d4_score += 2  # 无数据时给个中性分
+        d4_signals.append("无换手率数据")
+
+    # ══════════════════════════════════════════════
+    # 综合评定
+    # ══════════════════════════════════════════════
+    total_score = d1_score + d2_score + d3_score + d4_score
+    total_max = d1_max + d2_max + d3_max + d4_max
+
+    # 每个维度达到 60% 视为"满足"
+    dims_met = 0
+    if d1_score >= d1_max * 0.6:
+        dims_met += 1
+    if d2_score >= d2_max * 0.6:
+        dims_met += 1
+    if d3_score >= d3_max * 0.6:
+        dims_met += 1
+    if d4_score >= d4_max * 0.6:
+        dims_met += 1
+
+    if dims_met >= 4:
+        conclusion = "HIGH"
+    elif dims_met >= 3:
+        conclusion = "WATCH"
+    else:
+        conclusion = "NONE"
+
+    conclusion_labels = {
+        "HIGH": "高置信度建仓信号 — 四维同时满足",
+        "WATCH": "加入观察池 — 三维满足，等待确认",
+        "NONE": "暂不符合建仓条件",
+    }
+
+    # ══════════════════════════════════════════════
+    # 计算关键价位（支撑/阻力/建议入场区间）
+    # ══════════════════════════════════════════════
+    current_price = float(close[-1]) if n > 0 else 0.0
+
+    # 支撑位: 近30日最低点 与 MA20 取较低者
+    support_price = 0.0
+    if n >= 20:
+        ma20_val = float(np.mean(close[-20:]))
+        recent_low = float(np.min(low[-30:])) if n >= 30 else float(np.min(low[-20:]))
+        support_price = round(min(ma20_val, recent_low), 2)
+
+    # 阻力位: 近30日最高点 与 MA60 取较高者
+    resistance_price = 0.0
+    if n >= 20:
+        recent_high = float(np.max(high[-30:])) if n >= 30 else float(np.max(high[-20:]))
+        ma60_val = float(np.mean(close[-60:])) if n >= 60 else float(np.mean(close[-20:]))
+        resistance_price = round(max(recent_high, ma60_val), 2)
+
+    # 建议入场区间: 支撑位 ~ 支撑位+幅度的30%
+    entry_low = support_price
+    entry_high = round(support_price + (resistance_price - support_price) * 0.3, 2) if resistance_price > support_price else support_price
+
+    # 止损位: 支撑位下方3%
+    stop_loss = round(support_price * 0.97, 2) if support_price > 0 else 0.0
+
+    price_info = {
+        "current_price": current_price,
+        "support_price": support_price,
+        "resistance_price": resistance_price,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "stop_loss": stop_loss,
+    }
+
+    # ══════════════════════════════════════════════
+    # 中文摘要
+    # ══════════════════════════════════════════════
+    lines = [
+        "┌─────────────────────────────────┐",
+        "│     低位建仓识别 · 四维分析       │",
+        "└─────────────────────────────────┘",
+        "",
+        f"  维度一 价格形态:  {d1_score:>2}/{d1_max}  {'✓' if d1_score >= d1_max * 0.6 else '✗'}",
+    ]
+    for s in d1_signals:
+        lines.append(f"    · {s}")
+    lines.append(f"  维度二 资金特征:  {d2_score:>2}/{d2_max}  {'✓' if d2_score >= d2_max * 0.6 else '✗'}")
+    for s in d2_signals:
+        lines.append(f"    · {s}")
+    lines.append(f"  维度三 量能结构:  {d3_score:>2}/{d3_max}  {'✓' if d3_score >= d3_max * 0.6 else '✗'}")
+    for s in d3_signals:
+        lines.append(f"    · {s}")
+    lines.append(f"  维度四 筹码情绪:  {d4_score:>2}/{d4_max}  {'✓' if d4_score >= d4_max * 0.6 else '✗'}")
+    for s in d4_signals:
+        lines.append(f"    · {s}")
+    lines.extend([
+        "",
+        f"  总分: {total_score}/{total_max}  满足维度: {dims_met}/4",
+        f"  结论: {conclusion_labels.get(conclusion, conclusion)}",
+    ])
+
+    # 排除信号（任一维度出现反向信号）
+    exclusions = []
+    for sig_list in [d1_signals, d2_signals, d3_signals, d4_signals]:
+        for s in sig_list:
+            if "✗" in s and ("过快" in s or "过大" in s or "破位" in s or "过于频繁" in s):
+                exclusions.append(s.replace(" ✗", ""))
+    if exclusions:
+        lines.append("  ⚠ 排除信号:")
+        for e in exclusions:
+            lines.append(f"    ✗ {e}")
+
+    # 价位信息
+    if support_price > 0:
+        lines.extend([
+            "",
+            "  ── 关键价位 ──",
+            f"  当前价: {current_price:.2f}    支撑位: {support_price:.2f}    阻力位: {resistance_price:.2f}",
+            f"  建议入场区间: {entry_low:.2f} ~ {entry_high:.2f}",
+            f"  建议止损位: {stop_loss:.2f} (支撑下方3%)",
+        ])
+
+    return {
+        "dim1_price":    {"score": d1_score, "max": d1_max, "signals": d1_signals},
+        "dim2_money":    {"score": d2_score, "max": d2_max, "signals": d2_signals},
+        "dim3_volume":   {"score": d3_score, "max": d3_max, "signals": d3_signals},
+        "dim4_sentiment": {"score": d4_score, "max": d4_max, "signals": d4_signals},
+        "total_score":    total_score,
+        "total_max":      total_max,
+        "dimensions_met": dims_met,
+        "conclusion":     conclusion,
+        "exclusions":     exclusions,
+        "price_info":     price_info,
+        "summary":        "\n".join(lines),
     }

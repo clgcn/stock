@@ -27,6 +27,7 @@ import pandas as pd
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
+from _http_utils import cn_now
 from data_fetcher import get_kline
 import quant_engine as qe
 
@@ -537,7 +538,7 @@ def _load_kline(code: str, analysis_days: int = 120,
       网络请求会导致触发 API 限速，筛选耗时剧增。
       本地 DB 数据由 slow_fetcher 定期同步写入，筛选前应确保 DB 已有数据。
     """
-    start = (datetime.today() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
+    start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
     # ── 优先读本地 DB ──
     try:

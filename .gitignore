@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.egg
+
+# Secrets
+.env
+
+# Database (too large for git, persisted via GitHub Release)
+data/stocks.db
+data/stocks.db-shm
+data/stocks.db-wal
+a_share.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Data files (JSON imports)
+data/*.json
+data/rescue.sql

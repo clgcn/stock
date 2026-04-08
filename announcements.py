@@ -12,7 +12,7 @@
   _EARNINGS_KEYWORDS, _COLUMN_LABEL
 """
 
-from _http_utils import _get
+from _http_utils import _get, cn_now, cn_today
 from datetime import datetime, timedelta
 
 
@@ -114,7 +114,7 @@ def format_announcements(code: str, anns: list[dict], name: str = "") -> str:
     title_str = f"{name}（{code}）" if name else code
     lines = [
         f"【公告查询】{title_str}",
-        f"  查询时间: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"  查询时间: {cn_now().strftime('%Y-%m-%d %H:%M')}",
         "─" * 50,
     ]
 
@@ -122,7 +122,7 @@ def format_announcements(code: str, anns: list[dict], name: str = "") -> str:
         lines.append("  暂无近期公告数据")
         return "\n".join(lines)
 
-    today = datetime.today().date()
+    today = cn_today()
     recent_days = 30
     earnings_recent = [
         a for a in anns
@@ -274,7 +274,7 @@ def format_earnings_analysis(
     lines = [
         "═" * 56,
         f"  财报深度分析  {name}（{code}）",
-        f"  {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        f"  {cn_now().strftime('%Y-%m-%d %H:%M')}",
         "═" * 56,
     ]
 

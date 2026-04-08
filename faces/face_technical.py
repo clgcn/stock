@@ -29,6 +29,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from _http_utils import cn_now
 from data_fetcher import get_kline, get_kline_prefer_db, add_indicators
 import quant_engine as qe
 
@@ -258,11 +259,11 @@ class TechnicalFace:
         """
         vetos = []
         if signals.rsi is not None and signals.rsi > 85:
-            vetos.append((True, f"RSI={signals.rsi:.0f}>85 超买", 3.0))
+            vetos.append((True, f"RSI={signals.rsi:.0f}>85 超买", 3.0, "技术形态共振"))
         if signals.ma_alignment == "bearish":
-            vetos.append((True, "均线空头排列", 3.0))
+            vetos.append((True, "均线空头排列", 3.0, "技术形态共振"))
         if signals.diagnosis_total_score is not None and signals.diagnosis_total_score < -40:
-            vetos.append((True, f"量化诊断评分={signals.diagnosis_total_score:.0f}，极弱", None))
+            vetos.append((True, f"量化诊断评分={signals.diagnosis_total_score:.0f}，极弱", None, None))
         return vetos
 
     # ╔══════════════════════════════════════════════════╗
@@ -278,7 +279,7 @@ class TechnicalFace:
 
         Returns: (df_raw, df_with_indicators, error_msg)
         """
-        start = (datetime.today() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
+        start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
         try:
             df = get_kline_prefer_db(stock_code, period="daily", start=start,
                                       adjust="qfq", local_only=local_only)
