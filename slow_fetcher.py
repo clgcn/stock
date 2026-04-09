@@ -1195,10 +1195,16 @@ def fetch_history_batch(
                     stored, mode_str, len(remaining) - i - 1,
                 )
             except _KlineEmpty:
-                # 服务端确认无数据
-                # 仅在交易日才标记停牌，避免周末/节假日误标全市场
-                if is_trade_day(cn_today()):
-                    log.warning("  [%d/%d] %s %s  服务端确认无数据，标记为停牌",
+                # 服务端返回空数据 —— 需要区分「真正停牌」和「数据未就绪」
+                #
+                # 增量拉取时 beg >= 今天，东财数据可能还没更新，返回空是正常的
+                # 只有 **全量拉取**（beg=None, 拉1年）还拿不到数据，才能确认停牌
+                is_incremental = beg is not None
+                if is_incremental:
+                    log.info("  [%d/%d] %s %s  增量区间无新数据，跳过（不标记停牌）",
+                             i + 1, len(batch), code, name)
+                elif is_trade_day(cn_today()):
+                    log.warning("  [%d/%d] %s %s  全量拉取无数据，标记为停牌",
                                i + 1, len(batch), code, name)
                     db.execute(conn,
                         "UPDATE stocks SET suspended = 1 WHERE code = ?",

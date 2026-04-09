@@ -2828,5 +2828,10 @@ def factor_analysis(stock_code: str = "") -> str:
 # Start
 # =====================================================
 
-if __name__ == "__main__":
+def main():
+    """Entry point for uvx / pyproject.toml console_scripts."""
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
