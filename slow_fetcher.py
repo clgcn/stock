@@ -94,10 +94,15 @@ USER_AGENTS = [
 
 # ── 数据库 ────────────────────────────────────────────────────
 
+_schema_initialized = False
+
 def _get_db():
     """Open a ready-to-use database connection."""
+    global _schema_initialized
     conn = db.get_conn()
-    db.init_schema(conn)
+    if not _schema_initialized:
+        db.init_schema(conn)
+        _schema_initialized = True
     return conn
 
 
@@ -1753,13 +1758,30 @@ def load_stock_history(code: str) -> pd.DataFrame:
         conn.close()
 
 
-def load_all_history() -> pd.DataFrame:
-    """读取全部股票的日 K 线历史 (大表)。"""
+def load_all_history(lookback_days: int = 250, columns: str = None) -> pd.DataFrame:
+    """读取全部股票的日 K 线历史。
+
+    Parameters
+    ----------
+    lookback_days : int
+        只拉最近 N 天数据（默认250，约一年交易日）。传 0 不限制。
+    columns : str or None
+        需要的列，逗号分隔，如 "code,date,close,pct_chg,volume"。
+        None = 全部列（兼容旧调用）。
+    """
     conn = _get_db()
     try:
-        df = db.read_sql(
-            "SELECT * FROM stock_history WHERE close IS NOT NULL ORDER BY code, date",
-            conn)
+        col_expr = columns if columns else "*"
+        if lookback_days and lookback_days > 0:
+            # 交易日约占自然日 70%，乘 1.5 保证覆盖
+            cutoff = (datetime.now() - timedelta(days=int(lookback_days * 1.5))).strftime("%Y-%m-%d")
+            df = db.read_sql(
+                f"SELECT {col_expr} FROM stock_history WHERE close IS NOT NULL AND date >= ? ORDER BY code, date",
+                conn, params=(cutoff,))
+        else:
+            df = db.read_sql(
+                f"SELECT {col_expr} FROM stock_history WHERE close IS NOT NULL ORDER BY code, date",
+                conn)
         for col in ["open", "close", "high", "low", "volume", "amount",
                      "amplitude", "pct_chg", "change", "turnover"]:
             if col in df.columns:

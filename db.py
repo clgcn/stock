@@ -68,8 +68,12 @@ def get_conn():
             "DATABASE_URL not set. Create a .env file with "
             "DATABASE_URL=postgresql://user:pass@host:port/dbname?sslmode=require"
         )
-    conn = psycopg2.connect(DATABASE_URL)
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
     conn.autocommit = False
+    # 单条查询最长 120 秒，防止大查询卡死 MCP server
+    cur = conn.cursor()
+    cur.execute("SET statement_timeout = '120s'")
+    cur.close()
     return conn
 
 
@@ -250,10 +254,14 @@ def init_schema(conn=None):
             )
         """)
 
-        # Index for faster lookups by code
+        # Index for faster lookups by code and date range
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_stock_history_code
             ON stock_history (code)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_history_date
+            ON stock_history (date)
         """)
 
         # stock_fundamentals table - PE, PB, market cap

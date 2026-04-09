@@ -110,7 +110,11 @@ def build_historical_profiles(lookback_days: int = 240,
 
     try:
         from slow_fetcher import load_all_history
-        history = load_all_history()
+        # 只拉需要的列和天数，大幅减少从 PostgreSQL 传输的数据量
+        history = load_all_history(
+            lookback_days=lookback_days,
+            columns="code, date, close, pct_chg, volume",
+        )
     except Exception as e:
         logger.warning("Historical profile build failed: %s", e)
         return pd.DataFrame()
@@ -525,6 +529,51 @@ def filter_custom(df: pd.DataFrame,
 # 3. Stage 2: Deep Quantitative Scan
 # =====================================================
 
+# ── 批量 K 线预加载缓存（减少逐股查询） ──
+_KLINE_BATCH_CACHE: Dict[str, pd.DataFrame] = {}
+
+
+def _batch_preload_klines(codes: list, analysis_days: int = 120):
+    """
+    一次性从 PostgreSQL 批量加载多只股票的 K 线数据到内存缓存。
+    将 N 次逐股查询合并为 1 次 SQL IN 查询，大幅减少网络往返。
+    """
+    global _KLINE_BATCH_CACHE
+    _KLINE_BATCH_CACHE.clear()
+
+    if not codes:
+        return
+
+    start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
+    try:
+        import db as _db
+        conn = _db.get_conn()
+        try:
+            placeholders = ",".join(["%s"] * len(codes))
+            sql = (
+                f"SELECT * FROM stock_history "
+                f"WHERE code IN ({placeholders}) AND close IS NOT NULL AND date >= %s "
+                f"ORDER BY code, date"
+            )
+            df = pd.read_sql_query(sql, conn, params=(*codes, start))
+            # 类型转换
+            for col in ["open", "close", "high", "low", "volume", "amount",
+                         "amplitude", "pct_chg", "change", "turnover"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors="coerce")
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"])
+            # 按 code 分组存入缓存
+            for code, group in df.groupby("code"):
+                _KLINE_BATCH_CACHE[code] = group.copy()
+            logger.info("Batch preloaded klines for %d/%d stocks (%d rows)",
+                        len(_KLINE_BATCH_CACHE), len(codes), len(df))
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning("Batch kline preload failed: %s", e)
+
+
 def _load_kline(code: str, analysis_days: int = 120,
                 local_only: bool = False) -> Optional[pd.DataFrame]:
     """
@@ -540,7 +589,14 @@ def _load_kline(code: str, analysis_days: int = 120,
     """
     start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
-    # ── 优先读本地 DB ──
+    # ── 优先从批量缓存读取（deep_scan 预加载）──
+    if code in _KLINE_BATCH_CACHE:
+        df = _KLINE_BATCH_CACHE[code]
+        if not df.empty and len(df) >= 30:
+            df.attrs["code"] = code
+            return df
+
+    # ── 回退：逐股读本地 DB ──
     try:
         from slow_fetcher import load_stock_history
         df = load_stock_history(code)
@@ -587,6 +643,11 @@ def deep_scan(candidates: pd.DataFrame,
     scan_list = candidates
     market_regime = assess_market_regime()
     skipped_no_data = 0
+
+    # ── 批量预加载所有候选股 K 线（1次查询代替N次）──
+    if local_only:
+        all_codes = scan_list["code"].tolist()
+        _batch_preload_klines(all_codes, analysis_days)
 
     for i, (_, row) in enumerate(scan_list.iterrows()):
         code = row["code"]
