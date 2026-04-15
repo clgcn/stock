@@ -219,9 +219,195 @@ def format_northbound_report(flow_data: list) -> str:
 # 2. 主力资金流向（个股大单净流入）
 # ──────────────────────────────────────────
 
+def _tencent_symbol(code: str) -> str:
+    code = str(code).strip().upper().replace("SH", "").replace("SZ", "")
+    if code.startswith(("60", "68", "51", "11")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
+def _get_moneyflow_eastmoney(code: str, days: int) -> list:
+    """从东方财富拉取主力资金流向（含详细分级）。"""
+    secid = _get_secid(code)
+    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
+    params = {
+        "lmt":    days,
+        "klt":    101,
+        "secid":  secid,
+        "fields1": "f1,f2,f3,f7",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
+        "_":      int(time.time() * 1000),
+    }
+    eastmoney_throttle.acquire()
+    resp = _get(url, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+
+    klines = ((data.get("data") or {}).get("klines") or [])
+    if not klines:
+        raise ValueError(f"东财未返回 {code} 资金流向数据")
+
+    def _yi(v):
+        try: return round(float(v) / 1e8, 4)
+        except Exception: return None
+    def _pct(v):
+        try: return round(float(v), 2)
+        except Exception: return None
+    def _f(v):
+        try: return round(float(v), 2)
+        except Exception: return None
+
+    # 东财 fflow daykline 字段实际顺序 (f51..f65):
+    #   [0]=date
+    #   [1]=main_net  [2]=small_net  [3]=mid_net  [4]=big_net  [5]=super_net   (单位: 元)
+    #   [6]=main_pct  [7]=small_pct  [8]=mid_pct  [9]=big_pct  [10]=super_pct  (单位: %)
+    #   [11]=close (元)  [12]=pct_chg (%)  [13]=?  [14]=?
+    results = []
+    for line in klines[-days:]:
+        parts = line.split(",")
+        if len(parts) < 13:
+            continue
+        results.append({
+            "date":         parts[0],
+            "close":        _f(parts[11]),
+            "pct_chg":      _pct(parts[12]),
+            "main_net":     _yi(parts[1]),
+            "small_net":    _yi(parts[2]),
+            "mid_net":      _yi(parts[3]),
+            "big_net":      _yi(parts[4]),
+            "super_net":    _yi(parts[5]),
+            "main_net_pct": _pct(parts[6]),
+        })
+    return results
+
+
+def _xueqiu_symbol(code: str) -> str:
+    """600519 → SH600519, 000001 → SZ000001 (大写前缀, 与雪球一致)"""
+    code = str(code).strip().upper().replace("SH", "").replace("SZ", "")
+    if code.startswith(("60", "68", "51", "11")):
+        return f"SH{code}"
+    return f"SZ{code}"
+
+
+# ── 雪球 cookie 缓存 ──────────────────────────────────────────
+# 雪球所有 v5 API 都要求请求带 xq_a_token cookie, 否则返回 400003 鉴权失败。
+# token 通过访问 xueqiu.com 首页自动 set-cookie 拿到, 有效期约 24 小时。
+_XUEQIU_SESSION = None
+_XUEQIU_COOKIE_TS = 0
+_XUEQIU_COOKIE_TTL = 3600 * 12   # 12 小时复用
+
+
+def _get_xueqiu_session():
+    """获取已带 cookie 的 requests session, 12 小时复用一次。"""
+    global _XUEQIU_SESSION, _XUEQIU_COOKIE_TS
+    now = time.time()
+    if _XUEQIU_SESSION is not None and now - _XUEQIU_COOKIE_TS < _XUEQIU_COOKIE_TTL:
+        return _XUEQIU_SESSION
+
+    try:
+        from curl_cffi import requests as _xq_requests
+        sess = _xq_requests.Session(impersonate="chrome")
+    except ImportError:
+        import requests as _xq_requests
+        sess = _xq_requests.Session()
+
+    sess.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+        ),
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://xueqiu.com/",
+        "Origin": "https://xueqiu.com",
+    })
+    # 访问首页拿 xq_a_token 等 cookie
+    sess.get("https://xueqiu.com/", timeout=15)
+    _XUEQIU_SESSION = sess
+    _XUEQIU_COOKIE_TS = now
+    return sess
+
+
+def _get_moneyflow_xueqiu(code: str, days: int) -> list:
+    """从雪球拉取主力资金流向（fallback 数据源, 字段完整）。
+
+    端点: stock.xueqiu.com/v5/stock/capital/assort.json
+    返回字段对齐东财分级:
+      main_net_inflows  → main_net (主力 = 超大单 + 大单)
+      super_net_inflows → super_net
+      large_net_inflows → big_net
+      medium_net_inflows → mid_net
+      small_net_inflows → small_net
+    单位: 元
+    """
+    sym = _xueqiu_symbol(code)
+    sess = _get_xueqiu_session()
+
+    url = "https://stock.xueqiu.com/v5/stock/capital/assort.json"
+    params = {"symbol": sym, "count": max(days, 30)}
+    try:
+        resp = sess.get(url, params=params, timeout=15)
+    except Exception as e:
+        raise ConnectionError(f"雪球请求失败: {e}")
+    resp.raise_for_status()
+    payload = resp.json()
+
+    if payload.get("error_code") not in (0, "0", None):
+        # 鉴权失败时清缓存重试一次
+        global _XUEQIU_SESSION
+        _XUEQIU_SESSION = None
+        raise ValueError(
+            f"雪球返回 error_code={payload.get('error_code')}: {payload.get('error_description')}"
+        )
+
+    items = (payload.get("data") or {}).get("items") or []
+    if not items:
+        raise ValueError(f"雪球未返回 {code} 资金流向数据")
+
+    def _yi(v):
+        try: return round(float(v) / 1e8, 4)
+        except Exception: return None
+    def _f(v):
+        try: return round(float(v), 2)
+        except Exception: return None
+    def _pct(v):
+        try: return round(float(v), 2)
+        except Exception: return None
+
+    results = []
+    # 雪球默认升序, 取最近 days 条
+    for it in items[-days:]:
+        ts = it.get("timestamp")
+        if ts:
+            # 毫秒时间戳 → YYYY-MM-DD（北京时间）
+            from datetime import datetime as _dt, timezone, timedelta as _td
+            date_str = (_dt.fromtimestamp(int(ts) / 1000, tz=timezone.utc)
+                          .astimezone(timezone(_td(hours=8)))
+                          .strftime("%Y-%m-%d"))
+        else:
+            date_str = ""
+        results.append({
+            "date":         date_str,
+            "close":        _f(it.get("close")),
+            "pct_chg":      _pct(it.get("percent")),
+            "main_net":     _yi(it.get("main_net_inflows")),
+            "super_net":    _yi(it.get("super_net_inflows")),
+            "big_net":      _yi(it.get("large_net_inflows")),
+            "mid_net":      _yi(it.get("medium_net_inflows")),
+            "small_net":    _yi(it.get("small_net_inflows")),
+            "main_net_pct": _pct(it.get("main_inflows_ratio")),
+        })
+    if not results:
+        raise ValueError(f"雪球返回 {code} 数据但解析为空")
+    return results
+
+
 def get_moneyflow(code: str, days: int = 10) -> list:
     """
     获取个股主力资金流向（大单净流入/净卖出）。
+
+    数据源: 雪球优先 → 东财回退 (东财在 GitHub Actions 出口 IP 上偶有封锁)
+            雪球字段对齐东财, 完整提供 main/super/big/mid/small 分级
 
     Parameters
     ----------
@@ -233,54 +419,19 @@ def get_moneyflow(code: str, days: int = 10) -> list:
     list of dict，每条包含:
         date, main_net, main_net_pct, super_net, big_net, mid_net, small_net, close, pct_chg
     """
-    secid = _get_secid(code)
-    url = "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get"
-    params = {
-        "lmt":    days,
-        "klt":    101,
-        "secid":  secid,
-        "fields1": "f1,f2,f3,f7",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65",
-        "_":      int(time.time() * 1000),
-    }
+    last_err = None
     try:
-        eastmoney_throttle.acquire()
-        resp = _get(url, params=params)
-        resp.raise_for_status()
-        data = resp.json()
+        return _get_moneyflow_xueqiu(code, days)
     except Exception as e:
-        raise ConnectionError(f"主力资金流向请求失败: {e}")
+        last_err = e
+        _log.debug("Xueqiu moneyflow failed for %s: %s, falling back to Eastmoney", code, e)
 
-    klines = ((data.get("data") or {}).get("klines") or [])
-    if not klines:
-        raise ValueError(f"未获取到 {code} 的主力资金流向数据")
-
-    results = []
-    for line in klines[-days:]:
-        parts = line.split(",")
-        if len(parts) < 15:
-            continue
-        def _yi(v):
-            try: return round(float(v) / 1e8, 4)
-            except Exception: return None
-        def _pct(v):
-            try: return round(float(v), 2)
-            except Exception: return None
-        def _f(v):
-            try: return round(float(v), 2)
-            except Exception: return None
-        results.append({
-            "date":         parts[0],
-            "close":        _f(parts[1]),
-            "pct_chg":      _pct(parts[2]),
-            "main_net":     _yi(parts[3]),
-            "small_net":    _yi(parts[4]),
-            "mid_net":      _yi(parts[5]),
-            "super_net":    _yi(parts[7]),
-            "big_net":      _yi(parts[9]),
-            "main_net_pct": _pct(parts[11]),
-        })
-    return results
+    try:
+        return _get_moneyflow_eastmoney(code, days)
+    except Exception as e:
+        raise ConnectionError(
+            f"主力资金流向请求失败 (雪球: {last_err}; 东财: {e})"
+        )
 
 
 def format_moneyflow_report(flow_data: list) -> str:

@@ -761,14 +761,29 @@ def _parse_tencent_quote_line(line: str) -> dict:
                 f"{timestamp[8:10]}:{timestamp[10:12]}:{timestamp[12:14]}"
             )
 
+    pe_ttm = _safe_float(fields[39])
+    pb = _safe_float(fields[46])
+    total_mv = _safe_float(fields[45])
+    float_mv = _safe_float(fields[44])
+    current_price = _safe_float(fields[3])
+
+    # 顺手把 float_shares 写入 data_fetcher 缓存, 省去 K线阶段每只重新请求 qt.gtimg.cn
+    # float_shares(股) = float_mv(亿) × 1e8 / 当前价
+    if float_mv and current_price and current_price > 0:
+        try:
+            from data_fetcher import prime_float_shares
+            prime_float_shares(code, float_mv * 1e8 / current_price)
+        except Exception:
+            pass  # 缓存预热失败不影响主流程
+
     return {
         "code": code,
         "name": fields[1].strip(),
         "trade_date": trade_date,
-        "pe_ttm": _safe_float(fields[39]),
-        "pb": _safe_float(fields[46]),
-        "total_mv": _safe_float(fields[45]),
-        "float_mv": _safe_float(fields[44]),
+        "pe_ttm": pe_ttm,
+        "pb": pb,
+        "total_mv": total_mv,
+        "float_mv": float_mv,
         "updated_at": updated_at or cn_now().strftime("%Y-%m-%d %H:%M:%S"),
         "source": "tencent",
     }
@@ -796,83 +811,58 @@ class _KlineNetError(Exception):
 
 
 def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
-    """从东财拉取单只股票的日 K 线，返回原始行列表。
+    """拉取单只股票的日 K 线，返回原始行列表（CSV 字符串格式，兼容 _store_kline）。
+
     beg: 起始日期字符串 YYYYMMDD，优先于 days 参数。
-    内置: 全局限流器 + 重试 + 指数退避。
+
+    数据源: 走 data_fetcher.get_kline (腾讯优先 → 东财回退)
+    保留 _KlineEmpty / _KlineNetError 语义供 fetch_history_batch 区分停牌 vs 网络故障。
 
     Raises:
         _KlineEmpty    — 服务端确认无数据（可安全标记停牌）
         _KlineNetError — 网络故障（不应标记停牌）
     """
+    import pandas as _pd
+    from data_fetcher import get_kline
+
+    # YYYYMMDD → YYYY-MM-DD
+    if beg:
+        start = f"{beg[:4]}-{beg[4:6]}-{beg[6:8]}"
+    else:
+        start = (cn_now() - timedelta(days=days)).strftime("%Y-%m-%d")
+
     try:
-        from curl_cffi import requests as _requests
-        use_cffi = True
-    except ImportError:
-        import requests as _requests
-        use_cffi = False
+        df = get_kline(code, period="daily", start=start, adjust="qfq", limit=500)
+    except ValueError as e:
+        # data_fetcher 对"空数据"抛 ValueError → 视为停牌候选
+        raise _KlineEmpty(f"{code}: {e}")
+    except Exception as e:
+        # 其他异常（ConnectionError、超时等）→ 视为网络故障，不标停牌
+        raise _KlineNetError(f"{code}: {e}")
 
-    if beg is None:
-        beg = (cn_now() - timedelta(days=days)).strftime("%Y%m%d")
-    end = cn_now().strftime("%Y%m%d")
-    NO_PROXY = {"http": None, "https": None}
+    if df is None or df.empty:
+        raise _KlineEmpty(f"{code}: empty dataframe")
 
-    secid = _get_secid(code)
-    params = {
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "lmt": 500, "klt": 101, "fqt": 1,
-        "secid": secid, "beg": beg, "end": end,
-        "_": int(time.time() * 1000),
-    }
-    headers = {
-        "User-Agent": random.choice(USER_AGENTS),
-        "Referer": "https://quote.eastmoney.com/",
-        "Accept": "application/json, text/plain, */*",
-    }
-
-    last_err = None
-    got_empty_response = False   # 服务端返回了 JSON 但 klines 为空
-
-    for attempt in range(_KLINE_MAX_RETRIES):
-        try:
-            # 全局限流: 排队拿令牌再发请求
-            if _throttle is not None:
-                _throttle.acquire()
-
-            if use_cffi:
-                resp = _requests.get(KLINE_URL, params=params, headers=headers,
-                                      timeout=20, impersonate="chrome")
+    # 转回东财 CSV 行格式以兼容现有 _store_kline 解析逻辑
+    # 顺序: date,open,close,high,low,volume,amount,amplitude,pct_chg,change,turnover
+    cols = ["date", "open", "close", "high", "low", "volume",
+            "amount", "amplitude", "pct_chg", "change", "turnover"]
+    raw_lines = []
+    for _, row in df.iterrows():
+        date_v = row.get("date")
+        if hasattr(date_v, "strftime"):
+            date_str = date_v.strftime("%Y-%m-%d")
+        else:
+            date_str = str(date_v)[:10]
+        parts = [date_str]
+        for c in cols[1:]:
+            v = row.get(c)
+            if v is None or (isinstance(v, float) and _pd.isna(v)) or _pd.isna(v):
+                parts.append("")
             else:
-                resp = _requests.get(KLINE_URL, params=params, headers=headers,
-                                      timeout=20, proxies=NO_PROXY)
-            resp.raise_for_status()
-            data = resp.json()
-            klines_data = data.get("data") or {}
-            raw = klines_data.get("klines") or []
-            if raw:
-                return raw
-            # 服务端正常响应但没有 klines → 真正的空数据
-            got_empty_response = True
-            raise ValueError(f"Empty kline response for {code}")
-        except (ValueError,) as e:
-            # ValueError 是我们自己抛的"空数据"，不需要重试
-            if got_empty_response:
-                raise _KlineEmpty(str(e))
-            last_err = e
-        except Exception as e:
-            last_err = e
-            if attempt < _KLINE_MAX_RETRIES - 1:
-                wait = _KLINE_BACKOFF_BASE * (2 ** attempt)
-                log.debug("Kline retry %d/%d for %s after %.1fs: %s",
-                          attempt + 1, _KLINE_MAX_RETRIES, code, wait, e)
-                time.sleep(wait)
-                # 刷新时间戳避免缓存
-                params["_"] = int(time.time() * 1000)
-                headers["User-Agent"] = random.choice(USER_AGENTS)
-
-    log.warning("Kline failed for %s after %d retries: %s",
-                code, _KLINE_MAX_RETRIES, last_err)
-    raise _KlineNetError(f"{code}: {last_err}")
+                parts.append(str(v))
+        raw_lines.append(",".join(parts))
+    return raw_lines
 
 
 def _store_kline(conn,code: str, raw_lines: list) -> int:

@@ -13,6 +13,9 @@
 """
 
 from _http_utils import _get, _get_secid, _sina_prefix, eastmoney_throttle, kline_cache, cn_now, cn_today
+import logging
+
+_log = logging.getLogger(__name__)
 
 import pandas as pd
 import numpy as np
@@ -45,11 +48,245 @@ ADJUST_MAP = {
 
 
 # ──────────────────────────────────────────
-# 1. K-line Data (东方财富 + 重试退避)
+# 1. K-line Data (腾讯优先 + 东财兜底 + 重试退避)
 # ──────────────────────────────────────────
 
 _KLINE_MAX_RETRIES = 3
 _KLINE_BACKOFF_BASE = 1.5  # 秒: 1.5, 3.0, 6.0
+
+# 腾讯 period 映射
+_TENCENT_PERIOD_MAP = {
+    "daily": "day", "weekly": "week", "monthly": "month",
+    # 分钟级腾讯也支持，但走另一个 endpoint，暂不映射，分钟级回退东财
+}
+
+# 腾讯 adjust 映射
+_TENCENT_FQT_MAP = {
+    "qfq": "qfq",
+    "hfq": "hfq",
+    "none": "",
+}
+
+
+def _tencent_prefix(code: str) -> str:
+    """股票代码 → 腾讯前缀 (sh/sz)，与新浪一致"""
+    code = str(code).strip().upper().replace("SH", "").replace("SZ", "")
+    if code.startswith(("60", "68", "51", "11")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
+# ── 流通股本缓存（用于换手率反算）──
+# key: code, value: (float_shares, timestamp)
+# 流通股本变化极慢（只有增发/回购才变），缓存 24 小时足够
+_FLOAT_SHARES_CACHE = {}
+_FLOAT_SHARES_TTL = 86400  # 1 day
+
+
+def prime_float_shares(code: str, float_shares: float) -> None:
+    """从外部预热流通股本缓存（避免 _get_float_shares_tencent 重复请求 qt.gtimg.cn）。
+
+    典型用法: slow_fetcher 在批量拉取 Tencent fundamentals 时已拿到 float_mv 和 price,
+    顺手算出 float_shares 写入此缓存, 后续 K 线换手率换算可以直接命中。
+
+    Args:
+        code: 股票代码 (如 "600519", 不带前缀)
+        float_shares: 流通股本（股数, 不是亿股）
+    """
+    if float_shares and float_shares > 0:
+        # 用 hash 代码标准化, 去掉可能的 sh/sz 前缀
+        norm = str(code).strip().upper().replace("SH", "").replace("SZ", "")
+        _FLOAT_SHARES_CACHE[norm] = (float(float_shares), time.time())
+
+
+def _get_float_shares_tencent(code: str) -> float:
+    """
+    从腾讯实时行情反算流通股本（用于计算换手率）。
+
+    腾讯 qt 返回字段约定（"~" 分隔）:
+      [3]  当前价格
+      [44] 流通市值 (单位: 亿)
+      [45] 总市值   (单位: 亿)
+
+    流通股本 = 流通市值(亿) × 1e8 / 当前价格
+
+    Returns:
+        float: 流通股本（股），失败返回 None
+    """
+    cached = _FLOAT_SHARES_CACHE.get(code)
+    if cached and (time.time() - cached[1]) < _FLOAT_SHARES_TTL:
+        return cached[0]
+
+    sym = _tencent_prefix(code)
+    url = f"http://qt.gtimg.cn/q={sym}"
+    try:
+        resp = _get(url)
+        resp.raise_for_status()
+        # 腾讯 qt 返回 GBK 编码
+        text = resp.content.decode("gbk", errors="ignore")
+
+        m = re.search(r'v_\w+="([^"]+)"', text)
+        if not m:
+            return None
+        fields = m.group(1).split("~")
+        if len(fields) < 46:
+            return None
+
+        current_price = float(fields[3] or 0)
+        float_mv_yi = float(fields[44] or 0)  # 流通市值, 亿
+        if current_price <= 0 or float_mv_yi <= 0:
+            return None
+
+        float_shares = float_mv_yi * 1e8 / current_price
+        _FLOAT_SHARES_CACHE[code] = (float_shares, time.time())
+        return float_shares
+    except Exception as e:
+        _log.debug("Failed to fetch float_shares for %s: %s", code, e)
+        return None
+
+
+def _get_kline_tencent(
+    code: str, period: str, start: str, end: str,
+    adjust: str, limit: int,
+) -> pd.DataFrame:
+    """
+    从腾讯财经获取 K 线。
+
+    Endpoint: http://web.ifzq.gtimg.cn/appstock/app/fqkline/get
+    优势: 对境外 IP 友好, 字段稳定, 无鉴权
+    返回字段: [date, open, close, high, low, volume]  (6 列, 比东财少 amount/amplitude/pct_chg/change/turnover)
+    """
+    tperiod = _TENCENT_PERIOD_MAP.get(period)
+    if tperiod is None:
+        raise ValueError(f"Tencent kline does not support period={period}")
+
+    fqt = _TENCENT_FQT_MAP.get(adjust, "qfq")
+    sym = _tencent_prefix(code)
+
+    # 腾讯 param 格式: code,period,start,end,limit,fq
+    # start/end 用 YYYY-MM-DD; 留空为字符串 ""
+    s = start if start else ""
+    e = end if end else ""
+    param = f"{sym},{tperiod},{s},{e},{limit},{fqt}"
+
+    # 复权 endpoint: appstock/app/fqkline/get; 不复权: kline/kline
+    # 注意: 不要传 _var 参数, 否则会返回 JSONP 格式无法用 .json() 解析
+    if fqt:
+        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+    else:
+        url = "https://web.ifzq.gtimg.cn/appstock/app/kline/kline"
+
+    resp = _get(url, params={"param": param})
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("code") != 0:
+        raise ValueError(f"Tencent returned code={data.get('code')} for {code}: {data.get('msg')}")
+
+    block = data.get("data", {}).get(sym, {}) or {}
+    # 复权数据 key 形如 qfqday/hfqday, 原始为 day/week/month
+    if fqt:
+        data_key = f"{fqt}{tperiod}"
+    else:
+        data_key = tperiod
+    raw = block.get(data_key) or block.get(tperiod) or []
+    if not raw:
+        raise ValueError(f"No Tencent K-line data for {code} (empty response)")
+
+    # 腾讯返回每行: [date, open, close, high, low, volume, ...] (后面可能还有 amount 等扩展字段)
+    cols_full = ["date", "open", "close", "high", "low", "volume", "amount"]
+    rows = []
+    for line in raw:
+        row = list(line[:7]) + [None] * (7 - len(line))
+        rows.append(row)
+    df = pd.DataFrame(rows, columns=cols_full)
+
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ["open", "close", "high", "low", "volume", "amount"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # 自动检测 amount 单位（腾讯有时用元，有时用万元）
+    # 理论值: amount(元) ≈ volume(手) × 100 × close(元)
+    # 用最近一个有效行做对比，差距 > 100 倍则认为是万元，乘 10000 转为元
+    if df["amount"].notna().any() and df["volume"].notna().any():
+        try:
+            sample = df.dropna(subset=["amount", "volume", "close"]).tail(1).iloc[0]
+            expected = sample["volume"] * 100 * sample["close"]
+            actual = sample["amount"]
+            if expected > 0 and actual > 0:
+                ratio = expected / actual
+                if 5000 <= ratio <= 50000:
+                    # amount 是万元，转为元
+                    df["amount"] = df["amount"] * 10000
+        except Exception:
+            pass
+
+    # 腾讯 fqkline 端点通常只返回 6 列, amount 缺失时用 VWAP 近似计算
+    # amount(元) ≈ volume(手) × 100 × (high+low+close)/3
+    # 误差 < 1%, 对筛选/换手率换算足够
+    if df["amount"].isna().all():
+        typical_price = (df["high"] + df["low"] + df["close"]) / 3
+        df["amount"] = (df["volume"] * 100 * typical_price).round(2)
+
+    # 补全东财风格的派生列
+    df["change"] = df["close"].diff()
+    df["pct_chg"] = (df["change"] / df["close"].shift(1) * 100).round(4)
+    df["amplitude"] = ((df["high"] - df["low"]) / df["close"].shift(1) * 100).round(4)
+
+    # 换手率 = 成交量(股) / 流通股本(股) × 100
+    # 腾讯 K 线 volume 单位是"手"(1手=100股), 流通股本从 qt.gtimg.cn 反算
+    float_shares = _get_float_shares_tencent(code)
+    if float_shares and float_shares > 0:
+        df["turnover"] = (df["volume"] * 100 / float_shares * 100).round(4)
+    else:
+        df["turnover"] = pd.NA
+
+    df = df.sort_values("date").reset_index(drop=True)
+    df.attrs["code"] = code
+    df.attrs["period"] = period
+    df.attrs["source"] = "tencent"
+    return df
+
+
+def _get_kline_eastmoney(
+    code: str, period: str, beg: str, ened: str,
+    klt: int, fqt: int, limit: int,
+) -> pd.DataFrame:
+    """从东方财富获取 K 线（fallback 数据源）"""
+    secid = _get_secid(code)
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "lmt": limit, "klt": klt, "fqt": fqt, "secid": secid,
+        "beg": beg, "end": ened, "_": int(time.time() * 1000),
+    }
+
+    eastmoney_throttle.acquire()
+    resp = _get(url, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+
+    klines = data.get("data", {}) or {}
+    raw = klines.get("klines") or []
+    if not raw:
+        raise ValueError(f"No K-line data for {code} (empty response)")
+
+    cols = ["date", "open", "close", "high", "low",
+            "volume", "amount", "amplitude", "pct_chg", "change", "turnover"]
+    rows = [line.split(",") for line in raw]
+    df = pd.DataFrame(rows, columns=cols)
+
+    df["date"] = pd.to_datetime(df["date"])
+    for c in cols[1:]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df = df.sort_values("date").reset_index(drop=True)
+    df.attrs["code"] = code
+    df.attrs["name"] = klines.get("name", code)
+    df.attrs["period"] = period
+    df.attrs["source"] = "eastmoney"
+    return df
 
 
 def get_kline(
@@ -62,19 +299,23 @@ def get_kline(
     _skip_cache: bool = False,
 ) -> pd.DataFrame:
     """
-    Fetch K-line (candlestick) data from Eastmoney.
+    Fetch K-line (candlestick) data.
 
-    内置三层保护:
+    数据源策略:
+      日/周/月 K线: 腾讯优先 (web.ifzq.gtimg.cn) → 失败回退东财 (push2his.eastmoney.com)
+      分钟级:     直接走东财 (腾讯分钟级走另一个 endpoint, 暂未实现)
+
+    保护机制:
       1) 内存缓存 — 同一进程内相同参数 5 分钟内不重复请求
-      2) 全局令牌桶限流 — 控制所有东财请求 ≤ 2 QPS，并发排队
-      3) 重试 + 指数退避 — 万一触发限流也能自动恢复
+      2) 全局令牌桶限流 — 控制东财请求 ≤ 2 QPS
+      3) 重试 + 指数退避
 
     Args:
         code    Stock code, e.g. "600519", "000858"
         period  Period: daily/weekly/monthly/1m/5m/15m/30m/60m
-        start   Start date "YYYY-MM-DD" (if empty, fetch latest `limit` bars)
+        start   Start date "YYYY-MM-DD"
         end     End date "YYYY-MM-DD"
-        adjust  Adjustment: qfq (forward) / hfq (backward) / none
+        adjust  Adjustment: qfq / hfq / none
         limit   Max number of bars
 
     Returns:
@@ -83,9 +324,10 @@ def get_kline(
     """
     klt = PERIOD_MAP.get(period, 101)
     fqt = ADJUST_MAP.get(adjust, 1)
-    secid = _get_secid(code)
 
-    beg = start.replace("-", "") if start else "19900101"
+    # 东财: 当指定 beg+end 范围时, lmt 会失效返回区间全部数据
+    # 因此当用户没传 start 时, beg 设为 0 让 lmt 生效（拉最近 N 根）
+    beg = start.replace("-", "") if start else "0"
     ened = end.replace("-", "") if end else cn_now().strftime("%Y%m%d")
 
     # ── 缓存检查 ──
@@ -95,57 +337,40 @@ def get_kline(
         if cached is not None:
             return cached.copy()
 
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = {
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "lmt": limit, "klt": klt, "fqt": fqt, "secid": secid,
-        "beg": beg, "end": ened, "_": int(time.time() * 1000),
-    }
+    use_tencent = period in _TENCENT_PERIOD_MAP
 
     last_err = None
     for attempt in range(_KLINE_MAX_RETRIES):
+        # ── 主源: 腾讯 (日/周/月) ──
+        if use_tencent:
+            try:
+                df = _get_kline_tencent(code, period, start, end, adjust, limit)
+                # 用户未指定 start 时只保留最近 limit 根
+                if not start and len(df) > limit:
+                    df = df.tail(limit).reset_index(drop=True)
+                kline_cache.put(cache_key, df)
+                return df
+            except Exception as e:
+                last_err = e
+                _log.debug("Tencent kline failed for %s (attempt %d): %s", code, attempt + 1, e)
+
+        # ── 备源: 东财 ──
         try:
-            # ── 限流: 排队等令牌 ──
-            eastmoney_throttle.acquire()
-
-            resp = _get(url, params=params)
-            resp.raise_for_status()
-            data = resp.json()
-
-            klines = data.get("data", {}) or {}
-            raw = klines.get("klines") or []
-            if not raw:
-                raise ValueError(f"No K-line data for {code} (empty response)")
-
-            cols = ["date", "open", "close", "high", "low",
-                    "volume", "amount", "amplitude", "pct_chg", "change", "turnover"]
-            rows = [line.split(",") for line in raw]
-            df = pd.DataFrame(rows, columns=cols)
-
-            df["date"] = pd.to_datetime(df["date"])
-            for c in cols[1:]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-
-            df = df.sort_values("date").reset_index(drop=True)
-            df.attrs["code"] = code
-            df.attrs["name"] = klines.get("name", code)
-            df.attrs["period"] = period
-
-            # ── 写入缓存 ──
+            df = _get_kline_eastmoney(code, period, beg, ened, klt, fqt, limit)
+            if not start and len(df) > limit:
+                df = df.tail(limit).reset_index(drop=True)
             kline_cache.put(cache_key, df)
             return df
-
         except Exception as e:
             last_err = e
-            if attempt < _KLINE_MAX_RETRIES - 1:
-                wait = _KLINE_BACKOFF_BASE * (2 ** attempt)
-                time.sleep(wait)
-                # 刷新时间戳避免服务端缓存
-                params["_"] = int(time.time() * 1000)
+            _log.debug("Eastmoney kline failed for %s (attempt %d): %s", code, attempt + 1, e)
+
+        if attempt < _KLINE_MAX_RETRIES - 1:
+            wait = _KLINE_BACKOFF_BASE * (2 ** attempt)
+            time.sleep(wait)
 
     raise ConnectionError(
-        f"K-line request failed for {code} after {_KLINE_MAX_RETRIES} retries: {last_err}"
+        f"K-line request failed for {code} after {_KLINE_MAX_RETRIES} retries (both Tencent and Eastmoney): {last_err}"
     )
 
 
