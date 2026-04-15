@@ -333,6 +333,7 @@ def refresh_fundamentals_snapshot(interval: float = 10.0,
         rows = db.fetchall(conn,
             "SELECT code, name FROM stocks "
             "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
+            "AND name NOT LIKE '%退%' "
             "ORDER BY code")
         total_expected = len(rows)
         stored_total = 0
@@ -1113,10 +1114,19 @@ def fetch_history_batch(
         conn = _get_db()
 
     try:
+        # ── 维护: 把名字带「退」的股票主动标记停牌, 避免反复浪费重试 ──
+        marked = db.execute(conn,
+            "UPDATE stocks SET suspended = 1 "
+            "WHERE suspended = 0 AND name LIKE '%退%'").rowcount
+        if marked:
+            conn.commit()
+            log.info("名字含「退」的退市股 %d 只已自动标记停牌", marked)
+
         # 所有已入库、未停牌、非ST的股票代码
         all_codes = [r[0] for r in db.fetchall(conn,
             "SELECT code FROM stocks "
             "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
+            "AND name NOT LIKE '%退%' "
             "ORDER BY code")]
 
         if not all_codes:
@@ -1210,10 +1220,40 @@ def fetch_history_batch(
                     log.info("  [%d/%d] %s %s  非交易日无数据，跳过（不标记停牌）",
                             i + 1, len(batch), code, name)
             except _KlineNetError as e:
-                # 网络故障 → 不标记停牌，下次重试
-                log.warning("  [%d/%d] %s %s  网络失败，跳过（不标记停牌）: %s",
-                           i + 1, len(batch), code, name, e)
-                errors.append(f"{code}: 网络失败 {e}")
+                # 网络故障判定:
+                #   真网络抖动 → 全批次很多只一起挂, 下次重试即可
+                #   单只退市/停牌 → 服务端对特定代码 TCP reset (curl 56), 但同批其他只正常
+                #
+                # 启发式: 该股 stale 超过 7 天 (数据早过时) + 错误是 connection-close 类型
+                #        → 判定退市, 主动标记停牌, 避免反复浪费重试
+                err_msg = str(e).lower()
+                is_conn_close = any(k in err_msg for k in (
+                    "curl: (56)", "connection closed", "connection reset",
+                    "remote end closed", "econnreset",
+                ))
+                is_stale = False
+                if last_date:
+                    try:
+                        stale_days = (datetime.strptime(latest_trading_day, "%Y-%m-%d")
+                                      - datetime.strptime(last_date, "%Y-%m-%d")).days
+                        is_stale = stale_days > 7
+                    except Exception:
+                        pass
+
+                if is_conn_close and is_stale and is_trade_day(cn_today()):
+                    log.warning(
+                        "  [%d/%d] %s %s  数据已 stale %s~%s + 两源 TCP reset, 判定退市标记停牌",
+                        i + 1, len(batch), code, name, last_date, latest_trading_day,
+                    )
+                    db.execute(conn,
+                        "UPDATE stocks SET suspended = 1 WHERE code = ?",
+                        (code,),
+                    )
+                    conn.commit()
+                else:
+                    log.warning("  [%d/%d] %s %s  网络失败，跳过（不标记停牌）: %s",
+                               i + 1, len(batch), code, name, e)
+                    errors.append(f"{code}: 网络失败 {e}")
             except Exception as e:
                 log.error("  [%d/%d] %s %s  未知错误: %s",
                          i + 1, len(batch), code, name, e)
@@ -1296,6 +1336,7 @@ def fetch_moneyflow_batch(
         all_codes = [r[0] for r in db.fetchall(conn,
             "SELECT code FROM stocks "
             "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
+            "AND name NOT LIKE '%退%' "
             "ORDER BY code")]
 
         if not all_codes:
