@@ -1606,11 +1606,12 @@ def full_daily_update(batch_size: int = 50,
                       moneyflow_auto: bool = True,
                       max_minutes: float = 0) -> dict:
     """
-    一键全量收盘更新 = daily_close_update + moneyflow。
+    一键全量收盘更新 = daily_close_update + moneyflow + institutional。
 
-    合并了两步操作：
+    合并了三步操作：
       1) Fundamentals 快照 + K线增量 (原 --daily-close-update)
       2) 主力资金流向 (原 --moneyflow --moneyflow-auto)
+      3) 机构持仓 (季度级, 已完成则跳过)
 
     适合收盘后一条命令跑完所有数据更新:
       python slow_fetcher.py --full-update --batch 50 --interval 5
@@ -1652,7 +1653,7 @@ def full_daily_update(batch_size: int = 50,
     _deadline = _start_ts + max_minutes * 60 if max_minutes > 0 else 0
 
     # ── Phase 1: Fundamentals + K线 ──
-    log.info("═══ Phase 1/2: Fundamentals + K线增量 ═══")
+    log.info("═══ Phase 1/3: Fundamentals + K线增量 ═══")
     # 给 Phase 1 分配剩余时间
     _remaining_min = ((_deadline - _time.monotonic()) / 60) if _deadline else 0
     daily_result = daily_close_update(
@@ -1671,19 +1672,20 @@ def full_daily_update(batch_size: int = 50,
 
     # ── 时间墙检查: Phase 1 耗尽时间则跳过 Phase 2 ──
     if _deadline and _time.monotonic() >= _deadline:
-        log.warning("⏱️  Phase 1 用完了全部时间，Phase 2 资金流向将在下次运行时执行")
+        log.warning("⏱️  Phase 1 用完了全部时间，Phase 2/3 将在下次运行时执行")
         return {
             "target_trade_date": daily_result.get("target_trade_date"),
             "snapshot": daily_result.get("snapshot"),
             "history": daily_result.get("history"),
             "moneyflow": {"fetched": 0, "rounds": 0, "errors": [], "done": False},
+            "institutional": {"fetched": 0, "rounds": 0, "errors": [], "done": False},
             "done": False,
             "time_expired": True,
             "elapsed_minutes": round((_time.monotonic() - _start_ts) / 60, 1),
         }
 
     # ── Phase 2: 资金流向 ──
-    log.info("═══ Phase 2/2: 主力资金流向 ═══")
+    log.info("═══ Phase 2/3: 主力资金流向 ═══")
     mf_rounds = 0
     mf_total_fetched = 0
     mf_errors = []
@@ -1723,6 +1725,57 @@ def full_daily_update(batch_size: int = 50,
             mf_done = True
             break
 
+    # ── Phase 3: 机构持仓 (季度级, 已完成则秒过) ──
+    inst_result = {"fetched": 0, "rounds": 0, "errors": [], "done": False}
+    inst_time_expired = False
+
+    if _deadline and _time.monotonic() >= _deadline:
+        log.warning("⏱️  Phase 2 用完了全部时间，Phase 3 机构持仓将在下次运行时执行")
+        inst_time_expired = True
+    else:
+        log.info("═══ Phase 3/3: 机构持仓 (季度) ═══")
+        try:
+            from institutional import fetch_institutional_batch
+            inst_rounds = 0
+            inst_total_fetched = 0
+            inst_errors = []
+            inst_done = False
+
+            while True:
+                if _deadline and _time.monotonic() >= _deadline:
+                    log.warning("⏱️  机构持仓达到时间限制，优雅退出")
+                    inst_time_expired = True
+                    break
+
+                inst_rounds += 1
+                ir = fetch_institutional_batch(
+                    batch_size=batch_size,
+                    interval=max(interval, 2.0),
+                )
+                inst_total_fetched += ir.get("fetched", 0)
+                inst_errors.extend(ir.get("errors", []))
+
+                log.info("机构持仓第 %d 轮: 本轮 %d 只, 累计 %d 只, 剩余 %d 只",
+                         inst_rounds, ir.get("fetched", 0),
+                         inst_total_fetched, ir.get("remaining", 0))
+
+                if ir.get("done"):
+                    inst_done = True
+                    break
+                if ir.get("fetched", 0) == 0:
+                    inst_done = True
+                    break
+
+            inst_result = {
+                "fetched": inst_total_fetched,
+                "rounds": inst_rounds,
+                "errors": inst_errors,
+                "done": inst_done,
+            }
+        except Exception as e:
+            log.warning("机构持仓阶段出错: %s", e)
+            inst_result = {"fetched": 0, "rounds": 0, "errors": [str(e)], "done": False}
+
     elapsed_min = (_time.monotonic() - _start_ts) / 60
     return {
         "target_trade_date": daily_result.get("target_trade_date"),
@@ -1734,8 +1787,9 @@ def full_daily_update(batch_size: int = 50,
             "errors": mf_errors,
             "done": mf_done,
         },
-        "done": daily_result.get("done", False) and mf_done,
-        "time_expired": daily_result.get("time_expired", False) or mf_time_expired,
+        "institutional": inst_result,
+        "done": daily_result.get("done", False) and mf_done and inst_result.get("done", False),
+        "time_expired": daily_result.get("time_expired", False) or mf_time_expired or inst_time_expired,
         "elapsed_minutes": round(elapsed_min, 1),
     }
 
@@ -2790,6 +2844,14 @@ def main():
     parser.add_argument("--reset-moneyflow", action="store_true",
                         help="重置资金流向拉取进度")
 
+    # 机构持仓模式 (季度)
+    parser.add_argument("--institutional", action="store_true",
+                        help="拉取机构持仓数据: 基金重仓股 + 十大流通股东 (季度更新)")
+    parser.add_argument("--institutional-query", type=str, metavar="CODE",
+                        help="查询某只股票的机构持仓报告")
+    parser.add_argument("--reset-institutional", action="store_true",
+                        help="重置机构持仓数据")
+
     # 实时分析模式
     parser.add_argument("--analyze", type=str, metavar="CODE",
                         help="分析单只股票 (本地历史+线上实时)")
@@ -2825,6 +2887,57 @@ def main():
 
     if args.reset_moneyflow:
         reset_moneyflow_progress()
+        return
+
+    if args.reset_institutional:
+        conn = _get_db()
+        try:
+            db.execute(conn, "DELETE FROM fund_holdings")
+            db.execute(conn, "DELETE FROM stock_top_holders")
+            conn.commit()
+            log.info("机构持仓数据已重置")
+        finally:
+            conn.close()
+        return
+
+    if args.institutional_query:
+        from institutional import format_institutional_report
+        print(format_institutional_report(args.institutional_query))
+        return
+
+    if args.institutional:
+        from institutional import fetch_institutional_batch
+        import time as _time
+        _start_ts = _time.monotonic()
+        _deadline = _start_ts + args.max_minutes * 60 if args.max_minutes > 0 else 0
+        total_fetched = 0
+        rounds = 0
+        while True:
+            if _deadline and _time.monotonic() >= _deadline:
+                elapsed = (_time.monotonic() - _start_ts) / 60
+                log.warning("⏱️  已运行 %.0f 分钟，达到 max_minutes 限制，优雅退出。", elapsed)
+                break
+            rounds += 1
+            result = fetch_institutional_batch(
+                batch_size=args.batch,
+                interval=max(float(args.interval), 2.0),
+            )
+            total_fetched += result.get("fetched", 0)
+            remaining = result.get("remaining", 0)
+            errs = result.get("errors", [])
+            print(
+                f"第 {rounds} 轮: 本轮 {result.get('fetched', 0)} 只, "
+                f"累计 {total_fetched} 只, 剩余 {remaining} 只"
+                f"{f', 错误 {len(errs)}' if errs else ''}"
+            )
+            if errs:
+                for e in errs[:3]:
+                    print(f"  {e}")
+            if result.get("done"):
+                print(f"\n✅ 全市场机构持仓更新完成! 共 {total_fetched} 只")
+                break
+            if result.get("fetched", 0) == 0:
+                break
         return
 
     if args.moneyflow or args.moneyflow_auto:
@@ -2916,6 +3029,7 @@ def main():
         snap = result.get("snapshot", {})
         hist = result.get("history", {})
         mf = result.get("moneyflow", {})
+        inst = result.get("institutional", {})
 
         # Fundamentals 行
         if snap.get("already_complete"):
@@ -2935,14 +3049,22 @@ def main():
             f"{'  ✓ 全部完成' if mf.get('done') else '  (未完成，下次继续)'}"
         )
 
+        # Institutional 行
+        inst_line = (
+            f"  机构持仓: {inst.get('fetched', 0)} 只, {inst.get('rounds', 0)} 轮"
+            f"{'  ✓ 当季已完成' if inst.get('done') else '  (未完成，下次继续)'}"
+        )
+
         print(
             f"\n═══ 全量更新完成 ═══\n"
             f"  目标交易日: {result.get('target_trade_date')}\n"
             f"{fund_line}\n"
             f"{hist_line}\n"
             f"{mf_line}\n"
+            f"{inst_line}\n"
         )
-        for label, section in [("Fundamentals", snap), ("History", hist), ("Moneyflow", mf)]:
+        for label, section in [("Fundamentals", snap), ("History", hist),
+                                ("Moneyflow", mf), ("Institutional", inst)]:
             errs = section.get("errors", [])
             if errs:
                 print(f"  {label} errors: {errs[:3]}")

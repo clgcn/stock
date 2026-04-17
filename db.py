@@ -309,6 +309,51 @@ def init_schema(conn=None):
             ON stock_moneyflow (code)
         """)
 
+        # fund_holdings table - 基金持仓（哪些基金持有某只股票）
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS fund_holdings (
+                code TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                fund_code TEXT NOT NULL,
+                fund_name TEXT,
+                hold_shares DOUBLE PRECISION,
+                hold_mv DOUBLE PRECISION,
+                nav_pct DOUBLE PRECISION,
+                float_pct DOUBLE PRECISION,
+                updated_at TEXT,
+                PRIMARY KEY (code, report_date, fund_code)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fund_holdings_code
+            ON fund_holdings (code)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_fund_holdings_report_date
+            ON fund_holdings (report_date)
+        """)
+
+        # stock_top_holders table - 十大流通股东
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_top_holders (
+                code TEXT NOT NULL,
+                report_date TEXT NOT NULL,
+                rank INTEGER NOT NULL,
+                holder_name TEXT,
+                holder_type TEXT,
+                hold_shares DOUBLE PRECISION,
+                hold_pct DOUBLE PRECISION,
+                change_shares DOUBLE PRECISION,
+                change_type TEXT,
+                updated_at TEXT,
+                PRIMARY KEY (code, report_date, rank)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_top_holders_code
+            ON stock_top_holders (code)
+        """)
+
         # meta table - Configuration key-value store
         cur.execute("""
             CREATE TABLE IF NOT EXISTS meta (

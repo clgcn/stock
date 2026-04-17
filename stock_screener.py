@@ -30,6 +30,7 @@ from datetime import datetime, timedelta
 from _http_utils import cn_now
 from data_fetcher import get_kline
 import quant_engine as qe
+import db
 
 logger = logging.getLogger(__name__)
 
@@ -992,6 +993,39 @@ def screen_stocks(
                 "stage1_score": round(row.get("stage1_score", row.get("fast_score", 0)), 1),
                 "entry_quality_score": row.get("stage1_score", 0),
             })
+
+    # ── 机构共识度加分 (本地 DB, 0 次网络) ──
+    # 对最终候选股查询 fund_holdings + stock_top_holders 表,
+    # 加分映射: institutional_score(0~100) × 0.15 → 最多 +15 分到 entry_quality_score
+    try:
+        from institutional import institutional_score as _inst_score
+        _inst_conn = db.get_conn() if results else None
+        for r in results:
+            try:
+                iscore = _inst_score(r["code"], conn=_inst_conn)
+                r["institutional_score"] = iscore["score"]
+                r["institutional_detail"] = iscore["detail"]
+                r["fund_count"] = iscore["fund_count"]
+                r["smart_money_types"] = iscore["smart_money_types"]
+                # 加分到综合质量分
+                bonus = round(iscore["score"] * 0.15, 2)
+                r["entry_quality_score"] = round(
+                    (r.get("entry_quality_score") or 0) + bonus, 1)
+            except Exception:
+                r["institutional_score"] = 0
+                r["institutional_detail"] = "无数据"
+                r["fund_count"] = 0
+                r["smart_money_types"] = []
+        if _inst_conn:
+            _inst_conn.close()
+        # 加分后重新排序
+        results = sorted(
+            results,
+            key=lambda x: x.get("entry_quality_score") or 0,
+            reverse=True,
+        )
+    except ImportError:
+        logger.debug("institutional module not available, skipping scoring")
 
     return {
         "strategy": strategy,
