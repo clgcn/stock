@@ -12,6 +12,7 @@ dependencies = [
     "mcp",
     "psycopg2-binary",
     "python-dotenv",
+    "akshare",
 ]
 
 [project.scripts]
@@ -41,6 +42,7 @@ only-include = [
     "quant_detector.py",
     "slow_fetcher.py",
     "factor_model.py",
+    "institutional.py",
     "portfolio_optimizer.py",
     "ml_predictor.py",
     "sector_rotation.py",
