@@ -2825,6 +2825,81 @@ def factor_analysis(stock_code: str = "") -> str:
 
 
 # =====================================================
+# Tool: Institutional Holdings (机构持仓 + 十大流通股东)
+# =====================================================
+
+@mcp.tool()
+def institutional_holdings(stock_code: str) -> str:
+    """
+    Query institutional holdings and top 10 circulating shareholders for an A-share stock.
+
+    Returns:
+    - Top 10 circulating shareholders (name, type, holding %, change direction)
+    - Fund holdings (which mutual funds hold this stock, holding amount, % of NAV)
+    - Institutional consensus score (0-100): fund count + smart money + holder changes
+
+    Data source: AKShare (Sina Finance + East Money), updated quarterly.
+    Use this tool when asked about: 机构持仓, 基金持仓, 十大股东, 十大流通股东,
+    institutional holdings, fund holdings, major shareholders, smart money.
+
+    Args:
+        stock_code: Stock code (e.g. "600498") or name (e.g. "烽火通信")
+    """
+    try:
+        code = _resolve_stock_unique(stock_code)
+
+        # Try to generate report from DB first
+        try:
+            from institutional import format_institutional_report, institutional_score
+            report = format_institutional_report(code)
+
+            # Check if there's actual data (not just "暂无")
+            score_data = institutional_score(code)
+            if score_data.get("fund_count", 0) > 0 or len(score_data.get("smart_money_types", [])) > 0:
+                return report
+        except Exception:
+            pass
+
+        # No data in DB — fetch live and store
+        from institutional import (
+            get_fund_holdings, get_top_holders,
+            store_fund_holdings, store_top_holders,
+            format_institutional_report,
+        )
+
+        conn = sf._get_db()
+        db.init_schema(conn)
+
+        lines = [f"正在拉取 {code} 的机构持仓数据...", ""]
+        errors = []
+
+        try:
+            holdings = get_fund_holdings(code)
+            n1 = store_fund_holdings(conn, code, holdings)
+            lines.append(f"基金持仓: {n1} 条 (报告期 {holdings.get('report_date', '?')})")
+        except Exception as e:
+            errors.append(f"基金持仓拉取失败: {e}")
+
+        try:
+            holders = get_top_holders(code)
+            n2 = store_top_holders(conn, code, holders)
+            lines.append(f"十大股东: {n2} 条 (报告期 {holders.get('report_date', '?')})")
+        except Exception as e:
+            errors.append(f"十大股东拉取失败: {e}")
+
+        if errors:
+            lines.extend(["", "⚠️ 部分数据拉取失败:"] + errors)
+
+        lines.extend(["", "=" * 55, ""])
+        lines.append(format_institutional_report(code, conn=conn))
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"ERROR: Institutional holdings query failed: {e}"
+
+
+# =====================================================
 # Start
 # =====================================================
 
