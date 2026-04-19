@@ -11,6 +11,7 @@ name: A股每日数据更新
 #
 #   数据库: Azure PostgreSQL
 #   假日策略: 非交易日全部跳过, 开盘日增量自动补齐缺失天数
+#   例外: workflow_dispatch 选 institutional 模式时, 季度数据不受交易日限制
 # ════════════════════════════════════════════════════════════════
 
 on:
@@ -31,6 +32,7 @@ on:
           - full-update
           - daily-close-update
           - moneyflow
+          - institutional
       batch_size:
         description: '每轮拉取股票数'
         required: false
@@ -81,6 +83,7 @@ jobs:
         run: python db.py
 
       # ── 4. 判断今天是否交易日 ──
+      #   institutional 模式是季度数据, 不受交易日限制, 自动放行
       - name: Check trade day
         id: trade_check
         run: |
@@ -92,6 +95,8 @@ jobs:
           today = cn_today()
           is_td = is_trade_day(today)
           force = os.environ.get("FORCE_RUN", "false") == "true"
+          mode = os.environ.get("MODE", "full-update")
+          quarterly = mode == "institutional"
 
           if is_td:
               print(f"✅ {today} 是交易日")
@@ -99,12 +104,16 @@ jobs:
               ltd = last_trade_day(today)
               print(f"❌ {today} 不是交易日 (最近交易日: {ltd})")
 
-          should_run = "true" if (is_td or force) else "false"
+          if quarterly and not is_td:
+              print(f"ℹ️  模式 {mode} 为季度数据, 自动放行")
+
+          should_run = "true" if (is_td or force or quarterly) else "false"
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"should_run={should_run}\n")
           PYEOF
         env:
           FORCE_RUN: ${{ github.event.inputs.force_run || 'false' }}
+          MODE: ${{ github.event.inputs.mode || 'full-update' }}
 
       # ── 5. 核心: 全量更新 (带时间墙, 断点续传) ──
       - name: Run update
@@ -130,6 +139,12 @@ jobs:
           elif [ "$MODE" = "moneyflow" ]; then
             python slow_fetcher.py \
               --moneyflow --moneyflow-auto \
+              --batch "$BATCH" \
+              --interval "$INTERVAL" \
+              --max-minutes "$MAX_MIN"
+          elif [ "$MODE" = "institutional" ]; then
+            python slow_fetcher.py \
+              --institutional \
               --batch "$BATCH" \
               --interval "$INTERVAL" \
               --max-minutes "$MAX_MIN"

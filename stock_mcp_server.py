@@ -2848,55 +2848,98 @@ def institutional_holdings(stock_code: str) -> str:
     try:
         code = _resolve_stock_unique(stock_code)
 
-        # Try to generate report from DB first
-        try:
-            from institutional import format_institutional_report, institutional_score
-            report = format_institutional_report(code)
-
-            # Check if there's actual data (not just "暂无")
-            score_data = institutional_score(code)
-            if score_data.get("fund_count", 0) > 0 or len(score_data.get("smart_money_types", [])) > 0:
-                return report
-        except Exception:
-            pass
-
-        # No data in DB — fetch live and store
         from institutional import (
             get_fund_holdings, get_top_holders,
             store_fund_holdings, store_top_holders,
-            format_institutional_report,
+            format_institutional_report, institutional_score,
+            _classify_holder_type,
         )
 
-        conn = sf._get_db()
-        db.init_schema(conn)
+        # ── 1. 尝试从数据库读取已有数据 ──
+        try:
+            score_data = institutional_score(code)
+            if score_data.get("fund_count", 0) > 0 or len(score_data.get("smart_money_types", [])) > 0:
+                return format_institutional_report(code)
+        except Exception:
+            pass
 
-        lines = [f"正在拉取 {code} 的机构持仓数据...", ""]
+        # ── 2. 数据库无数据, 实时拉取 ──
+        holdings = None
+        holders = None
         errors = []
 
         try:
             holdings = get_fund_holdings(code)
-            n1 = store_fund_holdings(conn, code, holdings)
-            lines.append(f"基金持仓: {n1} 条 (报告期 {holdings.get('report_date', '?')})")
         except Exception as e:
-            errors.append(f"基金持仓拉取失败: {e}")
+            errors.append(f"基金持仓: {e}")
 
         try:
             holders = get_top_holders(code)
-            n2 = store_top_holders(conn, code, holders)
-            lines.append(f"十大股东: {n2} 条 (报告期 {holders.get('report_date', '?')})")
         except Exception as e:
-            errors.append(f"十大股东拉取失败: {e}")
+            errors.append(f"十大股东: {e}")
+
+        # ── 3. 尝试入库 (失败不影响报告输出) ──
+        try:
+            conn = sf._get_db()
+            db.init_schema(conn)
+            if holdings and holdings.get("items"):
+                store_fund_holdings(conn, code, holdings)
+            if holders and holders.get("items"):
+                store_top_holders(conn, code, holders)
+        except Exception as e:
+            errors.append(f"入库: {e}")
+
+        # ── 4. 尝试从 DB 生成报告 ──
+        try:
+            report = format_institutional_report(code)
+            if "暂无" not in report:
+                if errors:
+                    report += f"\n\n⚠️ 部分环节有警告: {'; '.join(errors)}"
+                return report
+        except Exception:
+            pass
+
+        # ── 5. DB 报告失败, 直接用内存数据拼文本 ──
+        lines = [f"机构持仓报告: {code}", "=" * 55, ""]
+
+        if holders and holders.get("items"):
+            lines.append(f"十大流通股东 (报告期 {holders.get('report_date', '?')}):")
+            lines.append(f"  {'排名':<4} {'股东名称':<24} {'类型':<8} {'占比':>6} {'变动':>8}")
+            lines.append("-" * 55)
+            type_names = {
+                "fund": "基金", "social_security": "社保", "qfii": "QFII",
+                "insurance": "险资", "broker": "券商", "private": "私募",
+                "connect": "港股通", "individual": "个人", "unknown": "-",
+            }
+            for it in holders["items"]:
+                pct_str = f"{it['hold_pct']:.2f}%" if it.get("hold_pct") else "-"
+                type_str = type_names.get(it.get("holder_type", ""), "-")
+                lines.append(
+                    f"  {it.get('rank',''):<4} {it.get('holder_name','')[:22]:<24} "
+                    f"{type_str:<8} {pct_str:>6} {it.get('change_type','-'):>8}"
+                )
+            lines.append("")
+
+        if holdings and holdings.get("items"):
+            lines.append(f"基金持仓 (共{holdings.get('total_count', 0)}只, "
+                         f"报告期 {holdings.get('report_date', '?')}):")
+            for it in holdings["items"][:10]:
+                mv_str = f"{it['hold_mv']/1e8:.2f}亿" if it.get("hold_mv") else "-"
+                nav_str = f"{it['nav_pct']:.2f}%" if it.get("nav_pct") else "-"
+                lines.append(f"  {it.get('fund_name','')[:26]:<28} {nav_str:>6} {mv_str:>12}")
+            lines.append("")
+
+        if not holders and not holdings:
+            lines.append("未能获取到机构持仓数据。")
 
         if errors:
-            lines.extend(["", "⚠️ 部分数据拉取失败:"] + errors)
-
-        lines.extend(["", "=" * 55, ""])
-        lines.append(format_institutional_report(code, conn=conn))
+            lines.extend(["", f"⚠️ {'; '.join(errors)}"])
 
         return "\n".join(lines)
 
     except Exception as e:
-        return f"ERROR: Institutional holdings query failed: {e}"
+        import traceback
+        return f"ERROR: {e}\n\n{traceback.format_exc()}"
 
 
 # =====================================================
