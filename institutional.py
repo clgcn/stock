@@ -90,16 +90,23 @@ def get_fund_holdings(code: str, **_kwargs) -> dict:
     report_date = str(latest_date)[:10]
 
     def _f(v):
+        if isinstance(v, (dict, list, set)):
+            return None
         try:
             return round(float(v), 4)
         except (TypeError, ValueError):
             return None
 
+    def _s(v):
+        if isinstance(v, (dict, list, set)):
+            return str(v)
+        return str(v) if v is not None else ""
+
     items = []
     for _, row in latest.iterrows():
         items.append({
-            "fund_code": str(row.get("基金代码") or ""),
-            "fund_name": str(row.get("基金名称") or ""),
+            "fund_code": _s(row.get("基金代码")),
+            "fund_name": _s(row.get("基金名称")),
             "hold_shares": _f(row.get("持仓数量")),
             "hold_mv": _f(row.get("持股市值")),
             "nav_pct": _f(row.get("占净值比例")),
@@ -274,6 +281,16 @@ def get_top_holders(code: str) -> dict:
 # 3. 数据入库
 # ══════════════════════════════════════════════════════════════
 
+def _db_safe(v):
+    """确保值可以被 psycopg2 适配。dict/list/set 等非标量转为字符串。"""
+    if v is None:
+        return None
+    if isinstance(v, (dict, list, set, tuple)):
+        import json
+        return json.dumps(v, ensure_ascii=False)
+    return v
+
+
 def store_fund_holdings(conn, code: str, holdings: dict) -> int:
     """将基金持仓数据写入 fund_holdings 表。返回入库条数。"""
     report_date = holdings.get("report_date", "")
@@ -293,12 +310,12 @@ def store_fund_holdings(conn, code: str, holdings: dict) -> int:
         if not fund_code:
             continue
         db.execute(conn, sql, (
-            code, report_date, fund_code,
-            it.get("fund_name"),
-            it.get("hold_shares"),
-            it.get("hold_mv"),
-            it.get("nav_pct"),
-            it.get("float_pct"),
+            code, report_date, _db_safe(fund_code),
+            _db_safe(it.get("fund_name")),
+            _db_safe(it.get("hold_shares")),
+            _db_safe(it.get("hold_mv")),
+            _db_safe(it.get("nav_pct")),
+            _db_safe(it.get("float_pct")),
             now_str,
         ))
         count += 1
@@ -322,13 +339,13 @@ def store_top_holders(conn, code: str, holders: dict) -> int:
     count = 0
     for it in holders.get("items", []):
         db.execute(conn, sql, (
-            code, report_date, it.get("rank", 0),
-            it.get("holder_name"),
-            it.get("holder_type"),
-            it.get("hold_shares"),
-            it.get("hold_pct"),
-            it.get("change_shares"),
-            it.get("change_type"),
+            code, report_date, _db_safe(it.get("rank", 0)),
+            _db_safe(it.get("holder_name")),
+            _db_safe(it.get("holder_type")),
+            _db_safe(it.get("hold_shares")),
+            _db_safe(it.get("hold_pct")),
+            _db_safe(it.get("change_shares")),
+            _db_safe(it.get("change_type")),
             now_str,
         ))
         count += 1
