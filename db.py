@@ -354,6 +354,58 @@ def init_schema(conn=None):
             ON stock_top_holders (code)
         """)
 
+        # stock_lhb_stat table - 龙虎榜近期统计（近实时机构动向）
+        # 数据源: ak.stock_lhb_stock_statistic_em(symbol="近一月"/"近三月"/...)
+        # 更新频率: 每交易日收盘后拉一次, 一次覆盖全市场
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_lhb_stat (
+                code TEXT NOT NULL,
+                period TEXT NOT NULL,
+                last_lhb_date TEXT,
+                lhb_count INTEGER,
+                lhb_net_amt DOUBLE PRECISION,
+                inst_buy_count INTEGER,
+                inst_sell_count INTEGER,
+                inst_net_amt DOUBLE PRECISION,
+                inst_buy_total DOUBLE PRECISION,
+                inst_sell_total DOUBLE PRECISION,
+                updated_at TEXT,
+                PRIMARY KEY (code, period)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_lhb_stat_code
+            ON stock_lhb_stat (code)
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_lhb_stat_updated_at
+            ON stock_lhb_stat (updated_at)
+        """)
+
+        # stock_dzjy_stat table - 大宗交易近期统计（近实时机构动向第三个维度）
+        # 数据源: ak.stock_dzjy_hygtj(symbol="近一月"/"近三月"/...)
+        # 溢价交易 = 机构愿意更高价接盘 (看多信号)
+        # 折价交易 = 持有人愿意打折出货 (中性偏弱)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS stock_dzjy_stat (
+                code TEXT NOT NULL,
+                period TEXT NOT NULL,
+                last_dzjy_date TEXT,
+                total_count INTEGER,
+                premium_count INTEGER,
+                discount_count INTEGER,
+                total_amt DOUBLE PRECISION,
+                avg_premium_rate DOUBLE PRECISION,
+                amt_to_float DOUBLE PRECISION,
+                updated_at TEXT,
+                PRIMARY KEY (code, period)
+            )
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_stock_dzjy_stat_code
+            ON stock_dzjy_stat (code)
+        """)
+
         # meta table - Configuration key-value store
         cur.execute("""
             CREATE TABLE IF NOT EXISTS meta (

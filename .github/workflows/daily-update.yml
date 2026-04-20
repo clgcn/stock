@@ -33,6 +33,8 @@ on:
           - daily-close-update
           - moneyflow
           - institutional
+          - lhb-snapshot
+          - dzjy-snapshot
       batch_size:
         description: '每轮拉取股票数'
         required: false
@@ -148,6 +150,10 @@ jobs:
               --batch "$BATCH" \
               --interval "$INTERVAL" \
               --max-minutes "$MAX_MIN"
+          elif [ "$MODE" = "lhb-snapshot" ]; then
+            python slow_fetcher.py --lhb-snapshot
+          elif [ "$MODE" = "dzjy-snapshot" ]; then
+            python slow_fetcher.py --dzjy-snapshot
           else
             python slow_fetcher.py \
               --full-update \

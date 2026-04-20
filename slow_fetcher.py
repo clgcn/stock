@@ -1725,6 +1725,28 @@ def full_daily_update(batch_size: int = 50,
             mf_done = True
             break
 
+    # ── Phase 2.5: 龙虎榜 + 大宗交易快照 (日频, 一次覆盖全市场, 各 ~5秒) ──
+    lhb_result = {"fetched": 0, "stored": 0, "err": None}
+    dzjy_result = {"fetched": 0, "stored": 0, "err": None}
+    if not (_deadline and _time.monotonic() >= _deadline):
+        log.info("═══ Phase 2.5: 龙虎榜 + 大宗交易快照 ═══")
+        try:
+            from institutional import refresh_lhb_stat
+            lhb_result = refresh_lhb_stat(period="近一月")
+            log.info("  龙虎榜: 抓取 %d 只, 入库 %d 条",
+                     lhb_result.get("fetched", 0), lhb_result.get("stored", 0))
+        except Exception as e:
+            log.warning("  龙虎榜快照失败: %s", e)
+            lhb_result = {"fetched": 0, "stored": 0, "err": str(e)}
+        try:
+            from institutional import refresh_dzjy_stat
+            dzjy_result = refresh_dzjy_stat(period="近一月")
+            log.info("  大宗交易: 抓取 %d 只, 入库 %d 条",
+                     dzjy_result.get("fetched", 0), dzjy_result.get("stored", 0))
+        except Exception as e:
+            log.warning("  大宗交易快照失败: %s", e)
+            dzjy_result = {"fetched": 0, "stored": 0, "err": str(e)}
+
     # ── Phase 3: 机构持仓 (季度级, 已完成则秒过) ──
     inst_result = {"fetched": 0, "rounds": 0, "errors": [], "done": False}
     inst_time_expired = False
@@ -1787,6 +1809,8 @@ def full_daily_update(batch_size: int = 50,
             "errors": mf_errors,
             "done": mf_done,
         },
+        "lhb_snapshot": lhb_result,
+        "dzjy_snapshot": dzjy_result,
         "institutional": inst_result,
         "done": daily_result.get("done", False) and mf_done and inst_result.get("done", False),
         "time_expired": daily_result.get("time_expired", False) or mf_time_expired or inst_time_expired,
@@ -2852,6 +2876,14 @@ def main():
     parser.add_argument("--reset-institutional", action="store_true",
                         help="重置机构持仓数据")
 
+    # 龙虎榜 + 大宗交易快照 (日频, 近实时机构动向)
+    parser.add_argument("--lhb-snapshot", action="store_true",
+                        help="抓取全市场龙虎榜快照 → stock_lhb_stat (每日一次即可)")
+    parser.add_argument("--dzjy-snapshot", action="store_true",
+                        help="抓取全市场大宗交易快照 → stock_dzjy_stat (每日一次即可)")
+    parser.add_argument("--realtime-inst", type=str, metavar="CODE",
+                        help="查询某只股票的近实时机构动向 (主力资金+龙虎榜+大宗交易)")
+
     # 实时分析模式
     parser.add_argument("--analyze", type=str, metavar="CODE",
                         help="分析单只股票 (本地历史+线上实时)")
@@ -2903,6 +2935,23 @@ def main():
     if args.institutional_query:
         from institutional import format_institutional_report
         print(format_institutional_report(args.institutional_query))
+        return
+
+    if args.realtime_inst:
+        from institutional import format_realtime_report
+        print(format_realtime_report(args.realtime_inst))
+        return
+
+    if args.lhb_snapshot:
+        from institutional import refresh_lhb_stat
+        r = refresh_lhb_stat()
+        log.info("✅ 龙虎榜快照: %s", r)
+        return
+
+    if args.dzjy_snapshot:
+        from institutional import refresh_dzjy_stat
+        r = refresh_dzjy_stat()
+        log.info("✅ 大宗交易快照: %s", r)
         return
 
     if args.institutional:

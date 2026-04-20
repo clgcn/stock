@@ -1,6 +1,6 @@
 [project]
 name = "a-share-stock"
-version = "1.0.0"
+version = "1.1.0"
 description = "A-Share quantitative analysis MCP server for Claude Desktop"
 requires-python = ">=3.10"
 dependencies = [

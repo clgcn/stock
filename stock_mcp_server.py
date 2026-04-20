@@ -2846,7 +2846,25 @@ def institutional_holdings(stock_code: str) -> str:
         stock_code: Stock code (e.g. "600498") or name (e.g. "烽火通信")
     """
     try:
-        code = _resolve_stock_unique(stock_code)
+        resolved = _resolve_stock_unique(stock_code)
+        rows = resolved.get("rows", [])
+        if not rows:
+            return (
+                f"ERROR: No stock matched '{stock_code}' in local stocks table.\n"
+                "Please update stocks first or provide a more precise code/name."
+            )
+        if len(rows) != 1 or not resolved.get("code"):
+            lines = [
+                "ERROR: Stock query is ambiguous.",
+                f"Query: {stock_code}",
+                "Candidates:",
+            ]
+            for c, n, s in rows[:10]:
+                tag = "停牌" if s else "正常"
+                lines.append(f"- {c} {n} ({tag})")
+            lines.append("Please retry with the exact code.")
+            return "\n".join(lines)
+        code = resolved["code"]
 
         from institutional import (
             get_fund_holdings, get_top_holders,
@@ -2855,28 +2873,55 @@ def institutional_holdings(stock_code: str) -> str:
             _classify_holder_type,
         )
 
-        # ── 1. 尝试从数据库读取已有数据 ──
-        try:
-            score_data = institutional_score(code)
-            if score_data.get("fund_count", 0) > 0 or len(score_data.get("smart_money_types", [])) > 0:
-                return format_institutional_report(code)
-        except Exception:
-            pass
+        errors = []
 
-        # ── 2. 数据库无数据, 实时拉取 ──
+        # ── 1. 数据库优先: 只要 DB 里有任何数据 (基金 OR 十大股东), 就用 DB ──
+        #    这是关键: 即使 akshare 实时拉取失败, DB 已经有昨天/上季度的数据也能输出
+        try:
+            _db_conn = sf._get_db()
+            try:
+                db.init_schema(_db_conn)
+            except Exception:
+                pass
+            fund_cnt_row = db.fetchone(_db_conn,
+                "SELECT COUNT(*) FROM fund_holdings WHERE code = ?", (code,))
+            holder_cnt_row = db.fetchone(_db_conn,
+                "SELECT COUNT(*) FROM stock_top_holders WHERE code = ?", (code,))
+            db_fund_cnt = (fund_cnt_row[0] if fund_cnt_row else 0) or 0
+            db_holder_cnt = (holder_cnt_row[0] if holder_cnt_row else 0) or 0
+        except Exception as e:
+            db_fund_cnt = 0
+            db_holder_cnt = 0
+            errors.append(f"DB 查询: {e}")
+
+        if db_fund_cnt > 0 or db_holder_cnt > 0:
+            try:
+                report = format_institutional_report(code)
+                # 只要拿到了报告 (不是 "暂无当季..." 的空报告), 就直接返回
+                # 如果是空报告, 说明当季没数据, 继续走实时拉取
+                if "暂无当季" not in report:
+                    if errors:
+                        report += f"\n\n⚠️ 部分环节有警告: {'; '.join(errors)}"
+                    return report
+            except Exception as e:
+                errors.append(f"报告生成: {e}")
+                print(f"[institutional_holdings] format_institutional_report({code}) raised: {e}", file=sys.stderr)
+
+        # ── 2. DB 无数据 (或仅有旧季度), 实时拉取 ──
         holdings = None
         holders = None
-        errors = []
 
         try:
             holdings = get_fund_holdings(code)
         except Exception as e:
             errors.append(f"基金持仓: {e}")
+            print(f"[institutional_holdings] get_fund_holdings({code}) raised: {e}", file=sys.stderr)
 
         try:
             holders = get_top_holders(code)
         except Exception as e:
             errors.append(f"十大股东: {e}")
+            print(f"[institutional_holdings] get_top_holders({code}) raised: {e}", file=sys.stderr)
 
         # ── 3. 尝试入库 (失败不影响报告输出) ──
         try:
@@ -2888,16 +2933,75 @@ def institutional_holdings(stock_code: str) -> str:
                 store_top_holders(conn, code, holders)
         except Exception as e:
             errors.append(f"入库: {e}")
+            print(f"[institutional_holdings] store failed for {code}: {e}", file=sys.stderr)
 
-        # ── 4. 尝试从 DB 生成报告 ──
+        # ── 4. 入库后再尝试从 DB 生成完整报告 ──
         try:
             report = format_institutional_report(code)
             if "暂无" not in report:
                 if errors:
                     report += f"\n\n⚠️ 部分环节有警告: {'; '.join(errors)}"
                 return report
-        except Exception:
-            pass
+        except Exception as e:
+            errors.append(f"报告生成(2): {e}")
+            print(f"[institutional_holdings] format_institutional_report({code}) 2nd raised: {e}", file=sys.stderr)
+
+        # ── 4.5 DB 完整报告没成型, 但 DB 里其实有历史数据, 退回用 DB 裸数据拼 ──
+        #    (比如当季还没披露, 但上一季度有数据)
+        if db_fund_cnt > 0 or db_holder_cnt > 0:
+            try:
+                lines = [f"机构持仓报告 (历史数据, 当季未披露): {code}", "=" * 55, ""]
+                try:
+                    name_row = db.fetchone(_db_conn,
+                        "SELECT name FROM stocks WHERE code=?", (code,))
+                    if name_row:
+                        lines[0] = f"机构持仓报告 (历史数据, 当季未披露): {code} {name_row[0]}"
+                except Exception:
+                    pass
+
+                if db_holder_cnt > 0:
+                    hrows = db.fetchall(_db_conn,
+                        "SELECT rank, holder_name, holder_type, hold_pct, change_type, report_date "
+                        "FROM stock_top_holders WHERE code = ? "
+                        "ORDER BY report_date DESC, rank ASC LIMIT 10", (code,))
+                    if hrows:
+                        rdate = hrows[0][5] if len(hrows[0]) > 5 else "?"
+                        lines.append(f"十大流通股东 (报告期 {rdate}):")
+                        type_names = {
+                            "fund": "基金", "social_security": "社保", "qfii": "QFII",
+                            "insurance": "险资", "broker": "券商", "private": "私募",
+                            "connect": "港股通", "individual": "个人", "unknown": "-",
+                        }
+                        for rnk, hname, htype, pct, ct, _rd in hrows:
+                            pct_str = f"{pct:.2f}%" if pct else "-"
+                            type_str = type_names.get(htype or "", htype or "-")
+                            lines.append(
+                                f"  {rnk:<4} {(hname or '')[:22]:<24} {type_str:<8} "
+                                f"{pct_str:>6} {(ct or '-'):>8}"
+                            )
+                        lines.append("")
+
+                if db_fund_cnt > 0:
+                    frows = db.fetchall(_db_conn,
+                        "SELECT fund_name, nav_pct, hold_mv, report_date "
+                        "FROM fund_holdings WHERE code = ? "
+                        "ORDER BY report_date DESC, hold_mv DESC NULLS LAST LIMIT 10",
+                        (code,))
+                    if frows:
+                        rdate = frows[0][3] if len(frows[0]) > 3 else "?"
+                        lines.append(f"前10大持仓基金 (共{db_fund_cnt}只历史记录, 最新报告期 {rdate}):")
+                        for fname, nav_pct, hold_mv, _rd in frows:
+                            nav_str = f"{nav_pct:.2f}%" if nav_pct else "-"
+                            mv_str = f"{hold_mv/1e8:.2f}亿" if hold_mv else "-"
+                            lines.append(f"  {(fname or '')[:26]:<28} {nav_str:>6} {mv_str:>12}")
+                        lines.append("")
+
+                if errors:
+                    lines.extend(["", f"⚠️ 部分环节有警告: {'; '.join(errors)}"])
+                return "\n".join(lines)
+            except Exception as e:
+                errors.append(f"DB 裸报告: {e}")
+                print(f"[institutional_holdings] raw DB report failed for {code}: {e}", file=sys.stderr)
 
         # ── 5. DB 报告失败, 直接用内存数据拼文本 ──
         lines = [f"机构持仓报告: {code}", "=" * 55, ""]
@@ -2937,6 +3041,74 @@ def institutional_holdings(stock_code: str) -> str:
 
         return "\n".join(lines)
 
+    except Exception as e:
+        import traceback
+        return f"ERROR: {e}\n\n{traceback.format_exc()}"
+
+
+# =====================================================
+# Tool: Realtime Institutional Signal (近实时机构动向)
+# =====================================================
+
+@mcp.tool()
+def institutional_realtime(stock_code: str) -> str:
+    """
+    Query near-realtime institutional activity for an A-share stock.
+
+    Unlike institutional_holdings (quarterly, 15-90 day lag), this tool gives
+    a T+1 view based on daily signals:
+      - Main-force money flow (stock_moneyflow, daily, 40 points)
+      - Dragon-tiger list institutional seats (stock_lhb_stat, daily, 40 points)
+      - Block trade activity (stock_dzjy_stat, daily, 20 points)
+
+    Returns a 0-100 score plus breakdown. Combine with institutional_holdings
+    to see both the quarterly positioning AND recent activity.
+
+    Use this tool when asked about: 最近机构买入, 近期资金流向, 龙虎榜, 主力资金,
+    institutional money flow, recent block trades, smart money activity.
+
+    Args:
+        stock_code: Stock code (e.g. "600498") or name (e.g. "烽火通信")
+    """
+    try:
+        resolved = _resolve_stock_unique(stock_code)
+        rows = resolved.get("rows", [])
+        if not rows:
+            return (
+                f"ERROR: No stock matched '{stock_code}' in local stocks table."
+            )
+        if len(rows) != 1 or not resolved.get("code"):
+            lines = [
+                "ERROR: Stock query is ambiguous.",
+                f"Query: {stock_code}",
+                "Candidates:",
+            ]
+            for c, n, s in rows[:10]:
+                tag = "停牌" if s else "正常"
+                lines.append(f"- {c} {n} ({tag})")
+            return "\n".join(lines)
+        code = resolved["code"]
+
+        from institutional import (
+            format_realtime_report, refresh_lhb_stat, refresh_dzjy_stat,
+        )
+
+        # 快照表若为空, 先抓一次(各覆盖全市场, 很快)
+        try:
+            conn = sf._get_db()
+            db.init_schema(conn)
+            lhb_row = db.fetchone(conn,
+                "SELECT COUNT(*) FROM stock_lhb_stat WHERE period = '近一月'")
+            if not lhb_row or (lhb_row[0] or 0) == 0:
+                refresh_lhb_stat(conn=conn, period="近一月")
+            dzjy_row = db.fetchone(conn,
+                "SELECT COUNT(*) FROM stock_dzjy_stat WHERE period = '近一月'")
+            if not dzjy_row or (dzjy_row[0] or 0) == 0:
+                refresh_dzjy_stat(conn=conn, period="近一月")
+        except Exception:
+            pass
+
+        return format_realtime_report(code)
     except Exception as e:
         import traceback
         return f"ERROR: {e}\n\n{traceback.format_exc()}"

@@ -76,10 +76,24 @@ def get_fund_holdings(code: str, **_kwargs) -> dict:
     import akshare as ak
 
     code = str(code).strip()
-    df = ak.stock_fund_stock_holder(symbol=code)
+    empty = {"report_date": "", "total_count": 0, "items": []}
 
-    if df is None or df.empty:
-        return {"report_date": "", "total_count": 0, "items": []}
+    # akshare 对部分股票会返回空 DataFrame, 内部 rename 触发
+    # "Length mismatch" / "None of [Index([...])] are in the [columns]"
+    # 这类错误必须吞掉, 否则 MCP 链路会直接断
+    try:
+        df = ak.stock_fund_stock_holder(symbol=code)
+    except Exception as e:
+        _log.debug("ak.stock_fund_stock_holder(%s) 失败: %s", code, e)
+        return empty
+
+    if df is None or getattr(df, "empty", True):
+        return empty
+
+    if "截止日期" not in df.columns:
+        _log.debug("基金持仓数据格式异常 (%s): 缺少 '截止日期' 列, 实际列=%s",
+                   code, list(df.columns))
+        return empty
 
     # 取最新一期 (截止日期最大)
     df["截止日期"] = df["截止日期"].astype(str)
@@ -182,13 +196,20 @@ def get_top_holders(code: str) -> dict:
         except (TypeError, ValueError):
             return None
 
+    empty_result = {"report_date": "", "items": []}
+
     # ── 主数据源: 东财个股页 ──
     try:
         sym = _ak_symbol(code)
         date_str = _quarter_date_str()
-        df = ak.stock_gdfx_free_top_10_em(symbol=sym, date=date_str)
+        try:
+            df = ak.stock_gdfx_free_top_10_em(symbol=sym, date=date_str)
+        except Exception as fetch_err:
+            _log.debug("ak.stock_gdfx_free_top_10_em(%s, %s) 失败: %s",
+                       sym, date_str, fetch_err)
+            df = None
 
-        if df is not None and not df.empty:
+        if df is not None and not getattr(df, "empty", True):
             # 报告期就是请求的季度
             report_date = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:]}"
 
@@ -241,10 +262,19 @@ def get_top_holders(code: str) -> dict:
         _log.debug("东财十大流通股东失败 (%s): %s, 尝试新浪回退", code, e)
 
     # ── 回退: 新浪财经 ──
-    df = ak.stock_circulate_stock_holder(symbol=code)
+    try:
+        df = ak.stock_circulate_stock_holder(symbol=code)
+    except Exception as e:
+        _log.debug("ak.stock_circulate_stock_holder(%s) 失败: %s", code, e)
+        return empty_result
 
-    if df is None or df.empty:
-        return {"report_date": "", "items": []}
+    if df is None or getattr(df, "empty", True):
+        return empty_result
+
+    if "截止日期" not in df.columns:
+        _log.debug("十大流通股东数据格式异常 (%s): 缺少 '截止日期' 列, 实际列=%s",
+                   code, list(df.columns))
+        return empty_result
 
     # 取最新一期
     df["截止日期"] = df["截止日期"].astype(str)
@@ -710,6 +740,514 @@ def format_institutional_report(code: str, conn=None) -> str:
 
 
 # ══════════════════════════════════════════════════════════════
+# 7. 近实时机构动向 (龙虎榜 + 主力资金)
+#     — 不依赖季报披露, 日频滚动更新
+# ══════════════════════════════════════════════════════════════
+
+_LHB_PERIOD_DEFAULT = "近一月"
+_LHB_PERIODS = ("近一月", "近三月", "近六月", "近一年")
+
+_DZJY_PERIOD_DEFAULT = "近一月"
+_DZJY_PERIODS = ("近一月", "近三月", "近六月", "近一年")
+
+
+def fetch_lhb_snapshot(period: str = _LHB_PERIOD_DEFAULT) -> list:
+    """
+    一次性拉取全市场龙虎榜近期统计快照。
+
+    数据源: ak.stock_lhb_stock_statistic_em
+    列: 代码 / 名称 / 最近上榜日 / 上榜次数 / 龙虎榜净买额 /
+        买方机构次数 / 卖方机构次数 / 机构买入净额 /
+        机构买入总额 / 机构卖出总额 / ...
+
+    Args:
+        period: "近一月" / "近三月" / "近六月" / "近一年"
+
+    Returns:
+        list of dict, 每条对应一只上榜股票
+    """
+    import akshare as ak
+
+    if period not in _LHB_PERIODS:
+        period = _LHB_PERIOD_DEFAULT
+
+    df = ak.stock_lhb_stock_statistic_em(symbol=period)
+    if df is None or df.empty:
+        return []
+
+    def _f(v):
+        try:
+            return round(float(v), 2)
+        except (TypeError, ValueError):
+            return None
+
+    def _i(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    rows = []
+    for _, r in df.iterrows():
+        code = str(r.get("代码") or "").strip().zfill(6)
+        if not code or not code.isdigit():
+            continue
+        last_date = str(r.get("最近上榜日") or "")[:10]
+        rows.append({
+            "code": code,
+            "period": period,
+            "last_lhb_date": last_date,
+            "lhb_count": _i(r.get("上榜次数")),
+            "lhb_net_amt": _f(r.get("龙虎榜净买额")),
+            "inst_buy_count": _i(r.get("买方机构次数")),
+            "inst_sell_count": _i(r.get("卖方机构次数")),
+            "inst_net_amt": _f(r.get("机构买入净额")),
+            "inst_buy_total": _f(r.get("机构买入总额")),
+            "inst_sell_total": _f(r.get("机构卖出总额")),
+        })
+    return rows
+
+
+def store_lhb_snapshot(conn, rows: list) -> int:
+    """把 fetch_lhb_snapshot 的结果写进 stock_lhb_stat 表。"""
+    if not rows:
+        return 0
+    now_str = cn_now().strftime("%Y-%m-%d %H:%M:%S")
+    sql = db.upsert_sql(
+        "stock_lhb_stat",
+        ["code", "period", "last_lhb_date", "lhb_count", "lhb_net_amt",
+         "inst_buy_count", "inst_sell_count", "inst_net_amt",
+         "inst_buy_total", "inst_sell_total", "updated_at"],
+        ["code", "period"],
+    )
+    count = 0
+    for r in rows:
+        db.execute(conn, sql, (
+            r["code"], r["period"], r.get("last_lhb_date"),
+            _db_safe(r.get("lhb_count")),
+            _db_safe(r.get("lhb_net_amt")),
+            _db_safe(r.get("inst_buy_count")),
+            _db_safe(r.get("inst_sell_count")),
+            _db_safe(r.get("inst_net_amt")),
+            _db_safe(r.get("inst_buy_total")),
+            _db_safe(r.get("inst_sell_total")),
+            now_str,
+        ))
+        count += 1
+    conn.commit()
+    return count
+
+
+def refresh_lhb_stat(conn=None, period: str = _LHB_PERIOD_DEFAULT) -> dict:
+    """拉一次全市场龙虎榜 + 落库。每日跑一次即可。"""
+    own_conn = conn is None
+    if own_conn:
+        conn = db.get_conn()
+        db.init_schema(conn)
+    try:
+        rows = fetch_lhb_snapshot(period)
+        stored = store_lhb_snapshot(conn, rows)
+        _log.info("龙虎榜快照 (%s): 抓取 %d 只 / 入库 %d 条",
+                  period, len(rows), stored)
+        return {"period": period, "fetched": len(rows), "stored": stored}
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _moneyflow_sub_score(conn, code: str, days: int = 10) -> tuple:
+    """
+    基于 stock_moneyflow 表(已入库, 日频)算主力资金动向分 (0-50)。
+
+    评分:
+      - 净流入分数 (0-25): 累计主力净流入, 映射 [-5亿, +5亿] → [0, 25]
+      - 连续强度分 (0-25): 流入天数占比 * 25
+    """
+    rows = db.fetchall(
+        conn,
+        "SELECT date, main_net, main_net_pct FROM stock_moneyflow "
+        "WHERE code = ? ORDER BY date DESC LIMIT ?",
+        (code, days),
+    )
+    if not rows:
+        return 0.0, {"available": False, "days_available": 0}
+
+    nets = [float(r[1] or 0) for r in rows]
+    net_sum = sum(nets)  # 单位: 亿元
+    up_days = sum(1 for n in nets if n > 0)
+
+    # 净流入分: 累计 +5 亿 → 25 分; -5 亿 → 0 分
+    net_score = max(0.0, min(25.0, 12.5 + net_sum * 2.5))
+    # 连续分: 流入天数占比
+    up_score = (up_days / len(nets)) * 25.0
+
+    return round(net_score + up_score, 1), {
+        "available": True,
+        "days_available": len(nets),
+        "net_sum_yi": round(net_sum, 2),
+        "up_days": up_days,
+        "net_score": round(net_score, 1),
+        "up_score": round(up_score, 1),
+        "latest_date": str(rows[0][0]) if rows else "",
+    }
+
+
+def _lhb_sub_score(conn, code: str, period: str = _LHB_PERIOD_DEFAULT) -> tuple:
+    """
+    基于 stock_lhb_stat 表算龙虎榜机构席位动向分 (0-50)。
+
+    评分:
+      - 机构净买分 (0-30): inst_net_amt 映射 [-1亿, +1亿] → [0, 30]
+      - 机构参与分 (0-20): 买方机构次数 × 2, 上限 20
+    """
+    row = db.fetchone(
+        conn,
+        "SELECT last_lhb_date, lhb_count, inst_buy_count, inst_sell_count, "
+        "inst_net_amt, lhb_net_amt FROM stock_lhb_stat "
+        "WHERE code = ? AND period = ?",
+        (code, period),
+    )
+    if not row:
+        return 0.0, {"available": False, "lhb_count": 0}
+
+    last_date, lhb_count, inst_buy, inst_sell, inst_net, lhb_net = row
+    inst_net_yi = float(inst_net or 0) / 1e8  # 元 → 亿
+    lhb_net_yi = float(lhb_net or 0) / 1e8
+
+    # 机构净买分: ±1 亿 → ±15 分
+    net_score = max(0.0, min(30.0, 15.0 + inst_net_yi * 15.0))
+    # 机构参与分: 买方机构次数 * 2, 最多 20
+    participation = (inst_buy or 0) * 2.0
+    participation_score = max(0.0, min(20.0, participation))
+
+    return round(net_score + participation_score, 1), {
+        "available": True,
+        "period": period,
+        "last_lhb_date": last_date or "",
+        "lhb_count": int(lhb_count or 0),
+        "inst_buy_count": int(inst_buy or 0),
+        "inst_sell_count": int(inst_sell or 0),
+        "inst_net_yi": round(inst_net_yi, 2),
+        "lhb_net_yi": round(lhb_net_yi, 2),
+        "net_score": round(net_score, 1),
+        "participation_score": round(participation_score, 1),
+    }
+
+
+def fetch_dzjy_snapshot(period: str = _DZJY_PERIOD_DEFAULT) -> list:
+    """
+    一次性拉取全市场大宗交易近期统计快照。
+
+    数据源: ak.stock_dzjy_hygtj
+    列: 证券代码 / 证券简称 / 最近上榜日 /
+        上榜次数-总计 / 上榜次数-溢价 / 上榜次数-折价 /
+        总成交额(万) / 折溢率 / 成交总额/流通市值 / ...
+
+    溢价 (premium) = 成交价高于当日收盘价 → 机构愿意溢价接盘 (看多)
+    折价 (discount) = 成交价低于当日收盘价 → 持有人打折出货 (中性偏弱)
+    """
+    import akshare as ak
+
+    if period not in _DZJY_PERIODS:
+        period = _DZJY_PERIOD_DEFAULT
+
+    df = ak.stock_dzjy_hygtj(symbol=period)
+    if df is None or df.empty:
+        return []
+
+    def _f(v):
+        try:
+            return round(float(v), 4)
+        except (TypeError, ValueError):
+            return None
+
+    def _i(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    rows = []
+    for _, r in df.iterrows():
+        code = str(r.get("证券代码") or "").strip().zfill(6)
+        if not code or not code.isdigit():
+            continue
+        rows.append({
+            "code": code,
+            "period": period,
+            "last_dzjy_date": str(r.get("最近上榜日") or "")[:10],
+            "total_count": _i(r.get("上榜次数-总计")),
+            "premium_count": _i(r.get("上榜次数-溢价")),
+            "discount_count": _i(r.get("上榜次数-折价")),
+            "total_amt": _f(r.get("总成交额")),       # 万元
+            "avg_premium_rate": _f(r.get("折溢率")),   # 百分比
+            "amt_to_float": _f(r.get("成交总额/流通市值")),
+        })
+    return rows
+
+
+def store_dzjy_snapshot(conn, rows: list) -> int:
+    """大宗交易快照入库 stock_dzjy_stat。"""
+    if not rows:
+        return 0
+    now_str = cn_now().strftime("%Y-%m-%d %H:%M:%S")
+    sql = db.upsert_sql(
+        "stock_dzjy_stat",
+        ["code", "period", "last_dzjy_date", "total_count",
+         "premium_count", "discount_count", "total_amt",
+         "avg_premium_rate", "amt_to_float", "updated_at"],
+        ["code", "period"],
+    )
+    count = 0
+    for r in rows:
+        db.execute(conn, sql, (
+            r["code"], r["period"], r.get("last_dzjy_date"),
+            _db_safe(r.get("total_count")),
+            _db_safe(r.get("premium_count")),
+            _db_safe(r.get("discount_count")),
+            _db_safe(r.get("total_amt")),
+            _db_safe(r.get("avg_premium_rate")),
+            _db_safe(r.get("amt_to_float")),
+            now_str,
+        ))
+        count += 1
+    conn.commit()
+    return count
+
+
+def refresh_dzjy_stat(conn=None, period: str = _DZJY_PERIOD_DEFAULT) -> dict:
+    """拉一次全市场大宗交易 + 落库。"""
+    own_conn = conn is None
+    if own_conn:
+        conn = db.get_conn()
+        db.init_schema(conn)
+    try:
+        rows = fetch_dzjy_snapshot(period)
+        stored = store_dzjy_snapshot(conn, rows)
+        _log.info("大宗交易快照 (%s): 抓取 %d 只 / 入库 %d 条",
+                  period, len(rows), stored)
+        return {"period": period, "fetched": len(rows), "stored": stored}
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def _dzjy_sub_score(conn, code: str, period: str = _DZJY_PERIOD_DEFAULT) -> tuple:
+    """
+    基于 stock_dzjy_stat 表算大宗交易动向分 (0-20)。
+
+    评分:
+      - 溢价分 (0-12): premium_count * 3, 上限 12  (溢价 4 次拉满)
+      - 折价惩罚 (0-8): 从 8 开始, 每折价一次扣 1.5, 最低 0
+    """
+    row = db.fetchone(
+        conn,
+        "SELECT last_dzjy_date, total_count, premium_count, discount_count, "
+        "total_amt, avg_premium_rate, amt_to_float FROM stock_dzjy_stat "
+        "WHERE code = ? AND period = ?",
+        (code, period),
+    )
+    if not row:
+        return 0.0, {"available": False, "total_count": 0}
+
+    last_date, total, premium, discount, amt, rate, amt2float = row
+    total = int(total or 0)
+    premium = int(premium or 0)
+    discount = int(discount or 0)
+    amt_yi = float(amt or 0) / 1e4  # 万 → 亿
+
+    premium_score = min(premium * 3.0, 12.0)
+    discount_penalty_score = max(0.0, 8.0 - discount * 1.5)
+
+    return round(premium_score + discount_penalty_score, 1), {
+        "available": True,
+        "period": period,
+        "last_dzjy_date": last_date or "",
+        "total_count": total,
+        "premium_count": premium,
+        "discount_count": discount,
+        "total_amt_yi": round(amt_yi, 2),
+        "avg_premium_rate": float(rate or 0),
+        "amt_to_float": float(amt2float or 0),
+        "premium_score": round(premium_score, 1),
+        "discount_penalty_score": round(discount_penalty_score, 1),
+    }
+
+
+def realtime_institutional_score(code: str, conn=None,
+                                 moneyflow_days: int = 10,
+                                 lhb_period: str = _LHB_PERIOD_DEFAULT,
+                                 dzjy_period: str = _DZJY_PERIOD_DEFAULT) -> dict:
+    """
+    近实时机构动向评分 (0-100), 不依赖季报披露。
+
+    三条腿:
+      - 主力资金 (stock_moneyflow, 日频, 0-40)
+      - 龙虎榜机构席位 (stock_lhb_stat, 日频快照, 0-40)
+      - 大宗交易 (stock_dzjy_stat, 日频快照, 0-20)
+
+    Args:
+        code: 股票代码
+        conn: DB 连接
+        moneyflow_days: 主力资金统计天数 (默认 10)
+        lhb_period: 龙虎榜统计周期 ("近一月" 默认)
+        dzjy_period: 大宗交易统计周期 ("近一月" 默认)
+
+    Returns:
+        {
+            "score": float,              # 综合 0-100
+            "main_money_score": float,   # 0-40
+            "lhb_score": float,          # 0-40
+            "dzjy_score": float,         # 0-20
+            "main_money": {...},
+            "lhb": {...},
+            "dzjy": {...},
+            "detail": str,
+        }
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = db.get_conn()
+    try:
+        # 子分函数原本返回 50 分制 / 50 分制 / 20 分制, 这里按新权重缩放
+        mm_raw, mm_data = _moneyflow_sub_score(conn, code, moneyflow_days)
+        lhb_raw, lhb_data = _lhb_sub_score(conn, code, lhb_period)
+        dzjy_score, dzjy_data = _dzjy_sub_score(conn, code, dzjy_period)
+
+        # 主力资金 50 → 40, 龙虎榜 50 → 40
+        mm_score = round(mm_raw * 0.8, 1)
+        lhb_score = round(lhb_raw * 0.8, 1)
+        total = round(mm_score + lhb_score + dzjy_score, 1)
+
+        parts = []
+        if mm_data.get("available"):
+            sign = "+" if mm_data["net_sum_yi"] >= 0 else ""
+            parts.append(
+                f"{mm_data['days_available']}日主力净流入"
+                f"{sign}{mm_data['net_sum_yi']:.2f}亿"
+                f"({mm_data['up_days']}/{mm_data['days_available']}日流入)"
+            )
+        if lhb_data.get("available"):
+            sign = "+" if lhb_data["inst_net_yi"] >= 0 else ""
+            parts.append(
+                f"{lhb_period}上榜{lhb_data['lhb_count']}次, "
+                f"机构席位净买{sign}{lhb_data['inst_net_yi']:.2f}亿"
+            )
+        if dzjy_data.get("available"):
+            parts.append(
+                f"{dzjy_period}大宗交易{dzjy_data['total_count']}次"
+                f"(溢价{dzjy_data['premium_count']}/折价{dzjy_data['discount_count']}), "
+                f"成交{dzjy_data['total_amt_yi']:.2f}亿"
+            )
+
+        detail = "; ".join(parts) if parts else \
+            "近期无机构异动数据(主力资金/龙虎榜/大宗交易均无记录)"
+
+        return {
+            "score": total,
+            "main_money_score": mm_score,
+            "lhb_score": lhb_score,
+            "dzjy_score": dzjy_score,
+            "main_money": mm_data,
+            "lhb": lhb_data,
+            "dzjy": dzjy_data,
+            "detail": detail,
+        }
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def format_realtime_report(code: str, conn=None) -> str:
+    """
+    生成某只股票的「近实时机构动向」报告。
+
+    与 format_institutional_report (季度快照) 并列:
+      - format_institutional_report → 基金持仓 + 十大股东 (滞后 15-90 天)
+      - format_realtime_report       → 主力资金 + 龙虎榜 (滞后 T+1)
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = db.get_conn()
+    try:
+        name_row = db.fetchone(conn,
+            "SELECT name FROM stocks WHERE code=?", (code,))
+        name = name_row[0] if name_row else code
+
+        s = realtime_institutional_score(code, conn)
+        mm = s["main_money"]
+        lhb = s["lhb"]
+        dzjy = s["dzjy"]
+
+        lines = [
+            f"近实时机构动向: {code} {name}",
+            "=" * 55,
+            f"综合评分: {s['score']}/100  "
+            f"(主力 {s['main_money_score']}/40 + "
+            f"龙虎榜 {s['lhb_score']}/40 + "
+            f"大宗 {s['dzjy_score']}/20)",
+            "",
+        ]
+
+        # 主力资金段
+        if mm.get("available"):
+            sign = "+" if mm["net_sum_yi"] >= 0 else ""
+            lines.extend([
+                f"▌ 主力资金 (近{mm['days_available']}日)",
+                f"  累计净流入:       {sign}{mm['net_sum_yi']:.2f} 亿元",
+                f"  净流入天数:       {mm['up_days']} / {mm['days_available']}",
+                f"  最新数据日期:     {mm['latest_date']}",
+                "",
+            ])
+        else:
+            lines.extend(["▌ 主力资金: 暂无数据 (请先跑 slow_fetcher --moneyflow)", ""])
+
+        # 龙虎榜段
+        if lhb.get("available"):
+            lines.extend([
+                f"▌ 龙虎榜机构席位 ({lhb['period']})",
+                f"  上榜次数:         {lhb['lhb_count']}",
+                f"  买方机构次数:     {lhb['inst_buy_count']}",
+                f"  卖方机构次数:     {lhb['inst_sell_count']}",
+                f"  机构净买入:       {lhb['inst_net_yi']:+.2f} 亿元",
+                f"  龙虎榜净买:       {lhb['lhb_net_yi']:+.2f} 亿元",
+                f"  最近上榜日:       {lhb['last_lhb_date'] or '-'}",
+                "",
+            ])
+        else:
+            lines.extend([
+                "▌ 龙虎榜机构席位: 该股近期未入选龙虎榜",
+                "  (或 stock_lhb_stat 表为空, 请先跑 slow_fetcher --lhb-snapshot)",
+                "",
+            ])
+
+        # 大宗交易段
+        if dzjy.get("available"):
+            lines.extend([
+                f"▌ 大宗交易 ({dzjy['period']})",
+                f"  总上榜次数:       {dzjy['total_count']}  "
+                f"(溢价 {dzjy['premium_count']} / 折价 {dzjy['discount_count']})",
+                f"  总成交额:         {dzjy['total_amt_yi']:.2f} 亿元",
+                f"  平均折溢率:       {dzjy['avg_premium_rate']:+.2f}%",
+                f"  成交额/流通市值:  {dzjy['amt_to_float']:.2f}%",
+                f"  最近上榜日:       {dzjy['last_dzjy_date'] or '-'}",
+                "",
+            ])
+        else:
+            lines.extend([
+                "▌ 大宗交易: 该股近期无大宗交易记录",
+                "  (或 stock_dzjy_stat 表为空, 请先跑 slow_fetcher --dzjy-snapshot)",
+                "",
+            ])
+
+        lines.append(f"一句话: {s['detail']}")
+        return "\n".join(lines)
+    finally:
+        if own_conn:
+            conn.close()
+
+
+# ══════════════════════════════════════════════════════════════
 # CLI 入口
 # ══════════════════════════════════════════════════════════════
 
@@ -734,11 +1272,34 @@ def main():
                         help="每只股票间隔秒数 (默认 2)")
     parser.add_argument("--max-minutes", type=float, default=0,
                         help="最长运行分钟数 (0=无限制)")
+    parser.add_argument("--realtime", type=str, metavar="CODE",
+                        help="查看某只股票的近实时机构动向 (主力资金+龙虎榜)")
+    parser.add_argument("--lhb-snapshot", action="store_true",
+                        help="抓取一次全市场龙虎榜快照 (写入 stock_lhb_stat)")
+    parser.add_argument("--lhb-period", type=str, default=_LHB_PERIOD_DEFAULT,
+                        choices=list(_LHB_PERIODS),
+                        help="龙虎榜统计周期 (默认 近一月)")
+    parser.add_argument("--dzjy-snapshot", action="store_true",
+                        help="抓取一次全市场大宗交易快照 (写入 stock_dzjy_stat)")
+    parser.add_argument("--dzjy-period", type=str, default=_DZJY_PERIOD_DEFAULT,
+                        choices=list(_DZJY_PERIODS),
+                        help="大宗交易统计周期 (默认 近一月)")
 
     args = parser.parse_args()
 
     if args.query:
         print(format_institutional_report(args.query))
+
+    elif args.realtime:
+        print(format_realtime_report(args.realtime))
+
+    elif args.lhb_snapshot:
+        r = refresh_lhb_stat(period=args.lhb_period)
+        _log.info("✅ 龙虎榜快照完成: %s", r)
+
+    elif args.dzjy_snapshot:
+        r = refresh_dzjy_stat(period=args.dzjy_period)
+        _log.info("✅ 大宗交易快照完成: %s", r)
 
     elif args.score:
         import json
