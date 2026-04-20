@@ -37,6 +37,141 @@ logger = logging.getLogger(__name__)
 _HISTORY_PROFILE_CACHE: Dict[tuple, pd.DataFrame] = {}
 
 
+# ══════════════════════════════════════════════════════════════════
+# Data-health diagnostic
+# ══════════════════════════════════════════════════════════════════
+# The snapshot pipeline can miss a daily run (weekends, holidays, cron
+# failures) or land only half-populated. When pct_chg or updated_at
+# is mostly stale, every strategy will return 0 results and the user
+# has no way to tell whether the filter is too strict or the data
+# itself is the blocker. This diagnostic surfaces it.
+
+def _build_data_health(df: pd.DataFrame) -> Dict:
+    """Compute a data-health snapshot. Never raises.
+
+    Returns dict with:
+      total_rows, pct_chg_coverage (0-1), max_updated_at, staleness_days,
+      is_stale (bool), warnings (list of str).
+    """
+    health: Dict = {"warnings": []}
+    try:
+        health["total_rows"] = int(len(df))
+
+        if "pct_chg" in df.columns:
+            coverage = float(df["pct_chg"].notna().mean()) if len(df) else 0.0
+        else:
+            coverage = 0.0
+        health["pct_chg_coverage"] = round(coverage, 3)
+
+        last_upd = None
+        if "updated_at" in df.columns:
+            try:
+                s = pd.to_datetime(df["updated_at"], errors="coerce")
+                if s.notna().any():
+                    last_upd = s.max()
+            except Exception:
+                last_upd = None
+        health["max_updated_at"] = str(last_upd) if last_upd is not None else None
+
+        stale_days = None
+        if last_upd is not None:
+            try:
+                now = pd.Timestamp(cn_now())
+                # drop tz info on either side for subtraction
+                if hasattr(last_upd, "tz_localize") and last_upd.tzinfo is None:
+                    now = now.tz_localize(None)
+                stale_days = max(0.0, (now - last_upd).total_seconds() / 86400.0)
+            except Exception:
+                stale_days = None
+        health["staleness_days"] = round(stale_days, 2) if stale_days is not None else None
+
+        # A snapshot is "stale" if most pct_chg are NaN OR data is >2 days old.
+        health["is_stale"] = bool(
+            coverage < 0.5
+            or (stale_days is not None and stale_days > 2.0)
+        )
+
+        if coverage < 0.5:
+            health["warnings"].append(
+                f"pct_chg 仅 {coverage*100:.1f}% 股票有值（通常应>95%）— "
+                "快照可能未在最新交易日更新。已放宽 pct_chg.notna() 约束，"
+                "但建议重跑 slow_fetcher 拉取最新行情。"
+            )
+        if stale_days is not None and stale_days > 2.0:
+            health["warnings"].append(
+                f"数据距今已 {stale_days:.1f} 天 (最新快照 {last_upd}) — "
+                "跨越周末/节假日或同步任务中断。"
+            )
+    except Exception as e:
+        # Never let diagnostic itself break the pipeline
+        health["warnings"].append(f"data-health probe failed: {type(e).__name__}: {e}")
+    return health
+
+
+# ══════════════════════════════════════════════════════════════════
+# v2 pipeline helpers — cross-sectional standardization
+# ══════════════════════════════════════════════════════════════════
+# These are the foundation for the P0 fixes:
+#   - winsorize extremes so rank/z-score are not distorted by outliers
+#   - cross-sectional z-score so factors of different scales can be combined
+#   - quantile-based cuts so thresholds are always relative to the current
+#     distribution (robust across bull/bear markets)
+
+def _winsorize(s: pd.Series, lo: float = 0.01, hi: float = 0.99) -> pd.Series:
+    """Clip extreme values at lo/hi percentiles. Leaves NaN as NaN."""
+    s = pd.to_numeric(s, errors="coerce")
+    if s.dropna().empty:
+        return s
+    q_lo, q_hi = s.quantile([lo, hi])
+    if pd.isna(q_lo) or pd.isna(q_hi):
+        return s
+    return s.clip(lower=q_lo, upper=q_hi)
+
+
+def _cs_zscore(s: pd.Series, winsorize: bool = True) -> pd.Series:
+    """Cross-sectional z-score. Returns 0 for all-NaN / zero-variance input.
+
+    Rationale: combining factors with different natural scales (e.g. PE in
+    [-1e5, +1e5] vs. prob_up in [0, 100]) requires first projecting them
+    onto a common scale. z-score (mean=0, sd=1) is the standard choice
+    because it preserves relative differences while being scale-invariant.
+    """
+    s = pd.to_numeric(s, errors="coerce")
+    if s.dropna().empty:
+        return pd.Series(0.0, index=s.index)
+    s_clean = _winsorize(s) if winsorize else s
+    mu = s_clean.mean(skipna=True)
+    sd = s_clean.std(skipna=True)
+    if sd is None or pd.isna(sd) or sd == 0:
+        return pd.Series(0.0, index=s.index)
+    z = (s_clean - mu) / sd
+    return z.fillna(0.0)
+
+
+def _quantile_cut(results: List[Dict], quantile: float = 0.20,
+                  min_keep: int = 0, score_key: str = "entry_quality_score") -> List[Dict]:
+    """Keep the top `quantile` fraction of results by `score_key`.
+
+    Args:
+        results:   list of result dicts, already scored
+        quantile:  fraction to keep (0.20 = top 20%)
+        min_keep:  safety floor — always keep at least this many results
+                   (use 0 to be strict, which may return 0 results if the
+                   pool is tiny; use 3-5 for user-facing pipelines)
+        score_key: which field to rank by
+
+    Returns sorted (descending) top-k.
+    """
+    if not results:
+        return results
+    n = len(results)
+    k = max(int(n * quantile), min_keep)
+    k = min(k, n)
+    return sorted(results,
+                  key=lambda r: (r.get(score_key) or -1e18),
+                  reverse=True)[:k]
+
+
 def _decision_rank(result: Dict) -> tuple:
     """Sort buyable candidates ahead of hold/sell, then by quality."""
     decision = result.get("decision", {}) or {}
@@ -272,15 +407,24 @@ def fetch_all_stocks(market: str = "all",
 # 2. Stage 1: Fast Filter Strategies
 # =====================================================
 
-def _base_filter(df: pd.DataFrame, exclude_st: bool = True) -> pd.Series:
+def _base_filter(df: pd.DataFrame, exclude_st: bool = True,
+                 allow_limit_up: bool = False) -> pd.Series:
     """
     Common base filter applied to ALL strategies:
     - Exclude ST stocks (special treatment, high risk)
-    - Exclude stocks at or near daily limit up (pct_chg >= 9.5%)
-      to avoid chasing rallies (main board limit is 10%)
-    - Exclude stocks at daily limit down (pct_chg <= -9.5%)
-      because they are likely untradeable (no buyers)
+    - Exclude stocks at daily limit down (pct_chg <= -9.5%) because they
+      are likely untradeable (no buyers)
     - Exclude suspended stocks (volume == 0 or current == 0)
+
+    Limit-up policy (configurable):
+    - Default (allow_limit_up=False):  exclude stocks near limit up
+      (pct_chg >= 9.5%). Suitable for value / mean-reversion / fundamental
+      strategies where chasing a rally is undesirable.
+    - allow_limit_up=True:             keep limit-up candidates. Required
+      for momentum / event-driven strategies, where a sealed limit-up is
+      often the STRONGEST signal (earnings surprise, M&A news, sector
+      catalyst). Pre-v2 pipelines hard-coded this filter on, which was
+      self-defeating for momentum.
     """
     mask = pd.Series(True, index=df.index)
 
@@ -289,11 +433,17 @@ def _base_filter(df: pd.DataFrame, exclude_st: bool = True) -> pd.Series:
     if exclude_st:
         mask &= ~df["name"].str.match(r"^\*?ST\b", case=False, na=False)
 
-    # Exclude stocks at or near daily limit up/down
-    # Main board limit: +/-10%, using 9.5% threshold to catch near-limit stocks
-    mask &= df["pct_chg"].notna()
-    mask &= df["pct_chg"].notna() & (df["pct_chg"] < 9.5)     # Not at or near limit up (avoid chasing)
-    mask &= df["pct_chg"].notna() & (df["pct_chg"] > -9.5)    # Not at or near limit down (untradeable)
+    # Limit-down check. IMPORTANT: NaN pct_chg must be treated as "unknown",
+    # not as "excluded" — on a stale snapshot (e.g. pre-market, post-holiday,
+    # or missed cron run), the snapshot job may populate most columns but
+    # leave pct_chg NULL, which would wipe out the entire universe if we
+    # required notna().
+    pct = df["pct_chg"]
+    mask &= (pct.isna() | (pct > -9.5))
+
+    # Limit-up: only filter out for non-momentum strategies
+    if not allow_limit_up:
+        mask &= (pct.isna() | (pct < 9.5))
 
     # Exclude suspended / zero-volume stocks
     mask &= df["volume"].notna() & (df["volume"] > 0)
@@ -309,12 +459,13 @@ def filter_value(df: pd.DataFrame,
                  pb_min: float = 0,
                  mv_min: float = 50,
                  turnover_min: float = 0.5,
-                 exclude_st: bool = True) -> pd.DataFrame:
+                 exclude_st: bool = True,
+                 allow_limit_up: bool = False) -> pd.DataFrame:
     """
     Value stock filter.
     Criteria: Reasonable PE, low PB, decent market cap, some liquidity.
     """
-    mask = _base_filter(df, exclude_st=exclude_st)
+    mask = _base_filter(df, exclude_st=exclude_st, allow_limit_up=allow_limit_up)
     mask &= df["pe_ttm"].notna() & (df["pe_ttm"] > pe_min) & (df["pe_ttm"] <= pe_max)
     mask &= df["pb"].notna() & (df["pb"] > pb_min) & (df["pb"] <= pb_max)
     mask &= df["total_mv"].notna() & (df["total_mv"] >= mv_min)  # 100M CNY
@@ -334,20 +485,25 @@ def filter_value(df: pd.DataFrame,
 
 def filter_momentum(df: pd.DataFrame,
                     pct_chg_min: float = 1.0,
-                    pct_chg_max: float = 7.0,
+                    pct_chg_max: float = 11.0,   # v2: 11.0 admits sealed limit-ups (9.8-10.0%)
                     volume_ratio_min: float = 1.2,
                     mv_min: float = 30,
                     turnover_min: float = 1.0,
-                    exclude_st: bool = True) -> pd.DataFrame:
+                    exclude_st: bool = True,
+                    allow_limit_up: bool = True) -> pd.DataFrame:
     """
     Growth momentum filter.
-    Criteria: Positive price change but NOT near daily limit (avoid chasing),
-    above-average volume, decent liquidity.
-    pct_chg_max defaults to 7% to avoid stocks that are already near limit up.
+    Criteria: Positive price change, above-average volume, decent liquidity.
+
+    v2 change: allow_limit_up defaults to True and pct_chg_max defaults to
+    11.0 (was 7.0). A sealed limit-up is the single strongest momentum
+    signal — cutting it off for fear of "chasing" is self-defeating for
+    a momentum strategy. Callers that explicitly want the old behavior
+    can pass allow_limit_up=False and pct_chg_max=7.0.
     """
-    mask = _base_filter(df, exclude_st=exclude_st)
+    mask = _base_filter(df, exclude_st=exclude_st, allow_limit_up=allow_limit_up)
     mask &= df["pct_chg"].notna() & (df["pct_chg"] >= pct_chg_min)
-    mask &= df["pct_chg"].notna() & (df["pct_chg"] <= pct_chg_max)   # Cap: avoid chasing limit-up stocks
+    mask &= df["pct_chg"].notna() & (df["pct_chg"] <= pct_chg_max)
     mask &= df["volume_ratio"].notna() & (df["volume_ratio"] >= volume_ratio_min)
     mask &= df["total_mv"].notna() & (df["total_mv"] >= mv_min)
     mask &= df["turnover_rate"].notna() & (df["turnover_rate"] >= turnover_min)
@@ -368,13 +524,14 @@ def filter_oversold(df: pd.DataFrame,
                     pct_chg_max: float = -2.0,
                     mv_min: float = 30,
                     turnover_min: float = 0.3,
-                    exclude_st: bool = True) -> pd.DataFrame:
+                    exclude_st: bool = True,
+                    allow_limit_up: bool = False) -> pd.DataFrame:
     """
     Oversold bounce filter.
     Criteria: Significant recent drop, still has decent market cap and liquidity.
     Not at limit down (untradeable).
     """
-    mask = _base_filter(df, exclude_st=exclude_st)
+    mask = _base_filter(df, exclude_st=exclude_st, allow_limit_up=allow_limit_up)
     mask &= df["pct_chg"].notna() & (df["pct_chg"] <= pct_chg_max)
     mask &= df["total_mv"].notna() & (df["total_mv"] >= mv_min)
     mask &= df["turnover_rate"].notna() & (df["turnover_rate"] >= turnover_min)
@@ -402,7 +559,8 @@ def filter_potential(df: pd.DataFrame,
                      mv_min: float = 50,
                      today_chg_min: float = -3.0,
                      turnover_min: float = 0.3,
-                     exclude_st: bool = True) -> pd.DataFrame:
+                     exclude_st: bool = True,
+                     allow_limit_up: bool = False) -> pd.DataFrame:
     """
     Potential / bottom-fishing filter.
 
@@ -433,7 +591,7 @@ def filter_potential(df: pd.DataFrame,
                         that are still actively crashing.
         turnover_min    Min turnover rate %
     """
-    mask = _base_filter(df, exclude_st=exclude_st)
+    mask = _base_filter(df, exclude_st=exclude_st, allow_limit_up=allow_limit_up)
 
     # Core: stock must have fallen significantly over past 60 days
     mask &= df["chg_60d"].notna()
@@ -483,13 +641,15 @@ def filter_custom(df: pd.DataFrame,
                   turnover_min: float = None, turnover_max: float = None,
                   volume_ratio_min: float = None,
                   price_min: float = None, price_max: float = None,
-                  exclude_st: bool = True) -> pd.DataFrame:
+                  exclude_st: bool = True,
+                  allow_limit_up: bool = False) -> pd.DataFrame:
     """
     Custom filter with user-specified conditions.
     Any parameter left as None is not applied.
-    Always applies base filter (exclude ST, limit-up/down, suspended).
+    Always applies base filter (exclude ST, limit-down, suspended).
+    Limit-up gating follows allow_limit_up (default False).
     """
-    mask = _base_filter(df, exclude_st=exclude_st)
+    mask = _base_filter(df, exclude_st=exclude_st, allow_limit_up=allow_limit_up)
 
     if pe_min is not None:
         mask &= df["pe_ttm"].notna() & (df["pe_ttm"] >= pe_min)
@@ -875,6 +1035,11 @@ def screen_stocks(
 
     total_market = len(all_stocks)
 
+    # ── 数据健康体检（提前检测 pct_chg 缺失/快照过期等根因问题）──
+    data_health = _build_data_health(all_stocks)
+    for w in data_health.get("warnings", []):
+        logger.warning("data-health: %s", w)
+
     # ── 历史横截面评分（stock_history → 趋势/动量/回撤评分）──
     all_stocks = attach_historical_profiles(
         all_stocks,
@@ -916,6 +1081,15 @@ def screen_stocks(
     stage1_count = len(candidates)
 
     if stage1_count == 0:
+        summary_lines = [
+            f"基础过滤后无股票通过（策略={strategy}，全市场{total_market}只）。",
+        ]
+        if data_health.get("is_stale"):
+            summary_lines.append(
+                f"⚠️ 数据可能过期 (pct_chg覆盖率={data_health.get('pct_chg_coverage', 0)*100:.1f}%, "
+                f"最新快照={data_health.get('max_updated_at')})。"
+            )
+        summary_lines.append("可考虑放宽过滤条件或重跑 slow_fetcher。")
         return {
             "strategy": strategy,
             "total_market": total_market,
@@ -925,9 +1099,9 @@ def screen_stocks(
             "qualified_count": 0,
             "quality_threshold": quality_threshold,
             "market_regime": market_regime,
+            "data_health": data_health,
             "results": [],
-            "summary": (f"基础过滤后无股票通过（策略={strategy}，全市场{total_market}只）。"
-                        f"可考虑放宽过滤条件。"),
+            "summary": "".join(summary_lines),
         }
 
     # ── 量化深度扫描（本地 kline，0 次网络）──
@@ -1036,6 +1210,7 @@ def screen_stocks(
         "qualified_count": len(results),
         "quality_threshold": quality_threshold,
         "market_regime": market_regime,
+        "data_health": data_health,
         "results": results,
         "summary": _format_summary(
             strategy, total_market, stage1_count, stage2_count,
@@ -1176,3 +1351,413 @@ def _format_summary(strategy, total_market, stage1_count,
     ])
 
     return "\n".join(lines)
+
+
+# =====================================================
+# 6. v2 Scoring Pipeline (P0 fixes)
+# =====================================================
+# Design goals, in plain language:
+#   - Every factor enters the composite on the SAME scale (z-score ≈ ±3),
+#     so a 0.10 weight on one factor really is 2x the impact of a 0.05
+#     weight on another. No more mixing {-100..+100} with {0..1}.
+#   - Weights are EXPLICIT and sum to 1.0 — easy to tune, easy to audit.
+#   - Quality gate is a cross-sectional QUANTILE (default top 20%),
+#     so the result size and the composition track the current market
+#     regime instead of depending on a magic absolute threshold.
+#   - Multi-strategy merge uses HIT COUNT as the primary rank, rewarding
+#     candidates that survive multiple orthogonal lenses.
+#   - Refinement step is a single quantile cut on a z-score composite of
+#     (prob_up, total_score, expected_return) — no more 65%→55%→giveup.
+
+# Weight spec for v2 EQS. Each weight is explained inline. Weights must
+# sum to 1.0 — unit test at the bottom of this file guards it.
+EQS_V2_WEIGHTS = {
+    # Quant diagnosis (7-dim technical + structural, already composite)
+    "tech":   0.22,   # primary technical signal
+    # Stage-1 composite (fast_score + historical)
+    "s1":     0.14,
+    # Medium/long-term trend
+    "hist":   0.10,
+    # Monte Carlo 20-day upside probability
+    "prob":   0.12,
+    # Monte Carlo expected return magnitude
+    "exp":    0.12,
+    # Risk/reward ratio (entry-to-TP vs entry-to-stop)
+    "rr":     0.13,
+    # Market regime beta
+    "regime": 0.05,
+    # Discrete decision bonus (buy/hold/sell, already on [-1, +1])
+    "action": 0.12,
+}
+# Multiplier applied after z-weighted sum, so the output range is
+# comparable to the v1 EQS (~ ±30). This is cosmetic — the ordering
+# is unaffected.
+EQS_V2_SCALE = 10.0
+
+
+def _compute_eqs_v2(results: List[Dict]) -> List[Dict]:
+    """Recompute entry_quality_score for a batch of results using
+    cross-sectional z-score standardization.
+
+    This is a PURE FUNCTION over the batch — the output score of stock X
+    depends on the whole batch (because it's cross-sectional), so don't
+    call this per-stock. Always call it once on the full deep_scan output.
+
+    Mutates each dict in-place by overwriting `entry_quality_score` and
+    adding `_eqs_factors` (each component's z-score), `entry_quality_raw_v1`
+    (the old score, for A/B comparison).
+    """
+    if not results:
+        return results
+
+    df = pd.DataFrame(results)
+
+    # Preserve the v1 score for side-by-side inspection
+    df["_v1"] = pd.to_numeric(df.get("entry_quality_score"), errors="coerce")
+
+    # Extract raw component values. Fill sentinels that map to "neutral"
+    # so missing data doesn't penalize unfairly (50 is neutral prob_up,
+    # 0 is neutral for everything else).
+    df["_raw_tech"]   = pd.to_numeric(df.get("total_score"),          errors="coerce").fillna(0)
+    df["_raw_s1"]     = pd.to_numeric(df.get("stage1_score"),         errors="coerce").fillna(0)
+    df["_raw_hist"]   = pd.to_numeric(df.get("history_score"),        errors="coerce").fillna(0)
+    df["_raw_prob"]   = pd.to_numeric(df.get("prob_up"),              errors="coerce").fillna(50) - 50
+    df["_raw_exp"]    = pd.to_numeric(df.get("expected_return"),      errors="coerce").fillna(0)
+    df["_raw_rr"]     = pd.to_numeric(df.get("risk_reward"),          errors="coerce").fillna(0)
+    df["_raw_regime"] = pd.to_numeric(df.get("market_regime_score"),  errors="coerce").fillna(0)
+
+    # Cross-sectional z-score for continuous factors
+    for col in ["tech", "s1", "hist", "prob", "exp", "rr", "regime"]:
+        df[f"_z_{col}"] = _cs_zscore(df[f"_raw_{col}"])
+
+    # Action is already on a bounded discrete scale — map directly
+    action_map = {"buy": 1.0, "hold": 0.0, "sell": -1.0}
+    df["_z_action"] = df.get("decision_action", pd.Series("hold", index=df.index)) \
+                        .fillna("hold").map(lambda v: action_map.get(v, 0.0))
+
+    # Weighted sum (each _z_* is mean ~0, sd ~1 so weighted sum is also
+    # ~N(0, sum_of_squares_of_weights) ≈ N(0, 0.4) for our weights)
+    composite = sum(df[f"_z_{k}"] * w for k, w in EQS_V2_WEIGHTS.items())
+    df["_eqs_v2"] = (composite * EQS_V2_SCALE).round(2)
+
+    # Write back
+    for i, rec in enumerate(results):
+        rec["entry_quality_raw_v1"] = (
+            float(df.iloc[i]["_v1"]) if pd.notna(df.iloc[i]["_v1"]) else None
+        )
+        rec["entry_quality_score"]  = float(df.iloc[i]["_eqs_v2"])
+        rec["_eqs_factors"] = {
+            k: float(df.iloc[i][f"_z_{k}"]) for k in EQS_V2_WEIGHTS
+        }
+    return results
+
+
+def _refine_picks_v2(picks: List[Dict], max_review: int = 15,
+                     min_review: int = 5) -> Dict:
+    """Relative-rank refinement (replaces 65%/55% cascade).
+
+    Strategy:
+      1. z-score prob_up, total_score, expected_return across `picks`
+      2. average the three z-scores → refine_score
+      3. keep top-k where k = min(max_review, len(picks)), with floor min_review
+
+    Returns {"picks_for_review": list, "refine_scores": dict}.
+    """
+    if not picks:
+        return {"picks_for_review": [], "refine_scores": {}}
+    if len(picks) <= min_review:
+        return {"picks_for_review": list(picks), "refine_scores": {}}
+
+    df = pd.DataFrame(picks)
+    z_prob = _cs_zscore(pd.to_numeric(df.get("prob_up"), errors="coerce").fillna(50) - 50)
+    z_tot  = _cs_zscore(pd.to_numeric(df.get("total_score"), errors="coerce").fillna(0))
+    z_exp  = _cs_zscore(pd.to_numeric(df.get("expected_return"), errors="coerce").fillna(0))
+    df["_refine_score"] = (z_prob + z_tot + z_exp) / 3.0
+
+    df_sorted = df.sort_values("_refine_score", ascending=False).reset_index(drop=True)
+    n_keep = min(max_review, len(df_sorted))
+    n_keep = max(n_keep, min_review)
+    n_keep = min(n_keep, len(df_sorted))
+
+    kept_codes = df_sorted["code"].head(n_keep).tolist()
+    code_to_score = dict(zip(df_sorted["code"], df_sorted["_refine_score"]))
+    picks_for_review = [p for p in picks if p["code"] in set(kept_codes)]
+    # Preserve the quantile ranking in the returned list
+    picks_for_review.sort(
+        key=lambda p: code_to_score.get(p["code"], -1e18), reverse=True,
+    )
+    return {
+        "picks_for_review": picks_for_review,
+        "refine_scores": {c: float(code_to_score.get(c, 0.0)) for c in kept_codes},
+    }
+
+
+def _merge_auto_results_v2(per_strategy: Dict[str, List[Dict]]) -> List[Dict]:
+    """Multi-strategy merge for `auto` mode.
+
+    Replaces the v1 "take max EQS" approach with:
+      1. Within each strategy, z-score fast_score → comparable scale
+      2. For each stock: record which strategies hit it, and its per-strategy z
+      3. Final sort: (hit_count DESC, avg_z DESC, EQS DESC)
+
+    This rewards robust picks that survive multiple orthogonal lenses
+    (value + momentum + potential + ...) instead of just the single
+    highest-scoring strategy, which is the correct behavior for an
+    ensemble selection system.
+    """
+    if not per_strategy:
+        return []
+
+    # 1. Per-strategy within-cohort z-score of fast_score
+    per_strat_z: Dict[str, Dict[str, float]] = {}
+    for strat, results in per_strategy.items():
+        if not results:
+            per_strat_z[strat] = {}
+            continue
+        sdf = pd.DataFrame(results)
+        if "fast_score" not in sdf.columns or sdf["fast_score"].dropna().empty:
+            per_strat_z[strat] = {r["code"]: 0.0 for r in results}
+            continue
+        z = _cs_zscore(pd.to_numeric(sdf["fast_score"], errors="coerce"))
+        per_strat_z[strat] = dict(zip(sdf["code"], z))
+
+    # 2. Merge per-stock, keeping the record with highest EQS as the "base"
+    merged: Dict[str, Dict] = {}
+    for strat, results in per_strategy.items():
+        for r in results:
+            code = r["code"]
+            fz = per_strat_z[strat].get(code, 0.0)
+            if code not in merged:
+                base = dict(r)
+                base["strategy_hits"] = [strat]
+                base["strategy_zs"]   = [float(fz)]
+                merged[code] = base
+            else:
+                merged[code]["strategy_hits"].append(strat)
+                merged[code]["strategy_zs"].append(float(fz))
+                # Upgrade base record if this strategy's EQS is higher
+                cur_eqs = merged[code].get("entry_quality_score") or -1e18
+                new_eqs = r.get("entry_quality_score") or -1e18
+                if new_eqs > cur_eqs:
+                    preserved_hits = merged[code]["strategy_hits"]
+                    preserved_zs   = merged[code]["strategy_zs"]
+                    merged[code] = dict(r)
+                    merged[code]["strategy_hits"] = preserved_hits
+                    merged[code]["strategy_zs"]   = preserved_zs
+
+    # 3. Compute summary fields
+    for code, r in merged.items():
+        r["hit_count"]       = len(r["strategy_hits"])
+        r["avg_strategy_z"]  = float(np.mean(r["strategy_zs"])) if r["strategy_zs"] else 0.0
+        r["source_strategy"] = "+".join(r["strategy_hits"])
+
+    # 4. Sort: hit_count DESC, avg_z DESC, EQS DESC
+    ordered = sorted(
+        merged.values(),
+        key=lambda r: (
+            r.get("hit_count", 0),
+            r.get("avg_strategy_z", 0.0),
+            r.get("entry_quality_score") or -1e18,
+        ),
+        reverse=True,
+    )
+    return ordered
+
+
+def screen_stocks_v2(
+    strategy: str = "value",
+    top_n: int = 20,
+    stage1_limit: int = 60,
+    quality_quantile: float = 0.20,
+    min_keep: int = 3,
+    max_candidates: int = 25,
+    analysis_days: int = 120,
+    history_lookback_days: int = 240,
+    history_min_days: int = 90,
+    **filter_kwargs,
+) -> Dict:
+    """v2 version of screen_stocks with cross-sectional scoring.
+
+    Differences vs v1:
+      - EQS is recomputed via _compute_eqs_v2 (z-score composite)
+      - Quality gate is a QUANTILE (default top 20%), not an absolute
+        threshold. `min_keep` guarantees a minimum batch size only if
+        deep scan actually produced that many scored results.
+      - Momentum strategy admits limit-up candidates by default.
+      - No "if 0 results, give 5 anyway" crutch.
+
+    Backward-compatibility notes:
+      - Returned dict has the same top-level keys as v1 plus
+        `quality_quantile` and `pipeline_version: "v2"`.
+      - Each result dict still has `entry_quality_score`, but the
+        magnitude/distribution is different — consumers that compare
+        EQS values across v1 and v2 runs will break.
+    """
+    stage1_limit = min(int(stage1_limit), 80)
+
+    try:
+        from slow_fetcher import assess_market_regime
+        market_regime = assess_market_regime()
+    except Exception:
+        market_regime = None
+
+    all_stocks = fetch_all_stocks()
+    if all_stocks.empty:
+        return {"error": "本地数据库无股票数据，请先运行 slow_fetcher 同步数据",
+                "pipeline_version": "v2"}
+    total_market = len(all_stocks)
+
+    data_health = _build_data_health(all_stocks)
+    for w in data_health.get("warnings", []):
+        logger.warning("data-health: %s", w)
+
+    all_stocks = attach_historical_profiles(
+        all_stocks,
+        lookback_days=history_lookback_days,
+        min_history_days=history_min_days,
+    )
+    history_profile_count = (int(all_stocks["history_score"].notna().sum())
+                             if "history_score" in all_stocks.columns else 0)
+
+    filter_func = STRATEGY_MAP.get(strategy)
+    if filter_func is None:
+        return {"error": f"未知策略 '{strategy}'", "pipeline_version": "v2"}
+
+    # v2: momentum admits limit-up automatically. Callers can override
+    # via filter_kwargs={"allow_limit_up": False}.
+    if strategy == "momentum" and "allow_limit_up" not in filter_kwargs:
+        filter_kwargs["allow_limit_up"] = True
+
+    try:
+        candidates = filter_func(all_stocks, **filter_kwargs)
+    except Exception as e:
+        logger.error("filter_func(%s) failed: %s", strategy, e)
+        return {"error": f"策略 '{strategy}' 过滤失败: {e}", "pipeline_version": "v2"}
+
+    if not candidates.empty:
+        history_component = candidates.get(
+            "history_score", pd.Series(0, index=candidates.index)).fillna(0)
+        fast_component = candidates.get(
+            "fast_score", pd.Series(0, index=candidates.index)).fillna(0)
+        # v2: readiness is a HARD FILTER (exclude) rather than a -8 soft
+        # penalty — this is cleaner; a stock with <90 days of history just
+        # isn't eligible, instead of being penalized in the composite.
+        ready_mask = candidates.get("history_ready",
+                                    pd.Series(False, index=candidates.index)).fillna(False)
+        if ready_mask.any():
+            candidates = candidates[ready_mask].copy()
+        # Re-pull the aligned series after the filter
+        history_component = candidates["history_score"].fillna(0)
+        fast_component = candidates["fast_score"].fillna(0)
+        candidates["stage1_score"] = (
+            fast_component * 0.55 + history_component * 0.45
+        ).round(1)
+        candidates = candidates.sort_values(
+            by=["stage1_score", "history_score", "fast_score"],
+            ascending=False,
+        )
+    stage1_count = len(candidates)
+
+    if stage1_count == 0:
+        summary = f"基础过滤后无股票通过（策略={strategy}，全市场{total_market}只）。"
+        if data_health.get("is_stale"):
+            summary += (
+                f" ⚠️ 数据可能过期 (pct_chg覆盖率="
+                f"{data_health.get('pct_chg_coverage', 0)*100:.1f}%, "
+                f"最新快照={data_health.get('max_updated_at')})，"
+                f"建议重跑 slow_fetcher。"
+            )
+        return {
+            "strategy": strategy,
+            "pipeline_version": "v2",
+            "total_market": total_market,
+            "history_profile_count": history_profile_count,
+            "stage1_count": 0,
+            "stage2_count": 0,
+            "qualified_count": 0,
+            "quality_quantile": quality_quantile,
+            "market_regime": market_regime,
+            "data_health": data_health,
+            "results": [],
+            "summary": summary,
+        }
+
+    scan_candidates = candidates.head(stage1_limit)
+
+    all_scanned = deep_scan(
+        scan_candidates,
+        top_n=len(scan_candidates),
+        analysis_days=analysis_days,
+        local_only=True,
+    )
+    stage2_count = len(all_scanned)
+
+    # v2 core: recompute EQS with z-score composite BEFORE any cut
+    all_scanned = _compute_eqs_v2(all_scanned)
+
+    # v2 quality gate: top quantile, with honest floor
+    qualified = _quantile_cut(all_scanned, quantile=quality_quantile,
+                              min_keep=min_keep)
+
+    # Cap at max_candidates
+    results = qualified[:max_candidates]
+
+    # Institutional bonus — computed on z-score composite AFTER the cut
+    # so that inst score is additive (not baked into the main cut) but
+    # still re-ranks within the kept set. Rationale: inst score is a
+    # slow-moving quarterly signal, so it's a tiebreaker, not a primary
+    # selector.
+    try:
+        from institutional import institutional_score as _inst_score
+        _inst_conn = db.get_conn() if results else None
+        for r in results:
+            try:
+                iscore = _inst_score(r["code"], conn=_inst_conn)
+                r["institutional_score"]  = iscore["score"]
+                r["institutional_detail"] = iscore["detail"]
+                r["fund_count"]           = iscore["fund_count"]
+                r["smart_money_types"]    = iscore["smart_money_types"]
+                # v2: inst bonus is also z-scaled implicitly — +10 bonus
+                # at max (inst_score=100) maps to roughly +1 z-unit, which
+                # is comparable to the other factors in EQS_V2_WEIGHTS
+                r["entry_quality_score"] = round(
+                    (r.get("entry_quality_score") or 0) + iscore["score"] * 0.10, 2
+                )
+            except Exception:
+                r["institutional_score"] = 0
+                r["institutional_detail"] = "无数据"
+                r["fund_count"] = 0
+                r["smart_money_types"] = []
+        if _inst_conn:
+            _inst_conn.close()
+        results = sorted(results,
+                         key=lambda x: x.get("entry_quality_score") or -1e18,
+                         reverse=True)
+    except ImportError:
+        pass
+
+    return {
+        "strategy": strategy,
+        "pipeline_version": "v2",
+        "total_market": total_market,
+        "history_profile_count": history_profile_count,
+        "stage1_count": stage1_count,
+        "stage2_count": stage2_count,
+        "qualified_count": len(results),
+        "quality_quantile": quality_quantile,
+        "min_keep": min_keep,
+        "market_regime": market_regime,
+        "data_health": data_health,
+        "results": results,
+        "summary": _format_summary(
+            strategy, total_market, stage1_count, stage2_count,
+            results, True,
+            history_profile_count=history_profile_count,
+            quality_threshold=quality_quantile * 100,  # display as pct
+        ),
+    }
+
+
+# Quick self-test: weights sum to 1.0 (off-by-0.001 tolerance for float)
+assert abs(sum(EQS_V2_WEIGHTS.values()) - 1.0) < 1e-6, \
+    f"EQS_V2_WEIGHTS must sum to 1.0, got {sum(EQS_V2_WEIGHTS.values())}"

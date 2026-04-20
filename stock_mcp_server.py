@@ -520,6 +520,9 @@ def full_stock_selection(
     include_quant_activity: bool = False,
     include_market_news: bool = True,
     include_margin_trading: bool = False,
+    use_v2_pipeline: bool = False,
+    v2_quality_quantile: float = 0.20,
+    v2_min_keep: int = 3,
 ) -> str:
     """
     ★★★ 选股唯一入口 ★★★
@@ -569,8 +572,20 @@ def full_stock_selection(
         ⚠️ 建议保持默认0，让系统自动决定。设为正数会限制深度复核数量，仪表盘也只展示复核过的股票。
         仅在用户明确要求"只看前N只"时才设正数
     quality_threshold : float
-        第一阶段质量门槛（entry_quality_score，默认5.0）
+        【v1 only】第一阶段质量门槛（entry_quality_score，默认5.0）
         牛市可调高到10~15，熊市/震荡市可调低到0~3
+    use_v2_pipeline : bool
+        【推荐 True】使用 v2 量化规范管线(P0 修复):
+          - 因子先横截面 z-score 再加权(EQS_V2_WEIGHTS)
+          - 质量门槛改为横截面分位数(默认 top 20%)而非绝对值
+          - momentum 策略允许涨停候选
+          - auto 模式按"命中次数 + z-score 均值"合并,而非简单取最大
+          - 精选阶段去掉 65%/55%/兜底瀑布,改 z-score 复合排名
+    v2_quality_quantile : float
+        【v2 only】Stage 2 质量分位门槛,默认 0.20(保留 top 20%)
+        熊市可调至 0.30,强势市场可调至 0.10
+    v2_min_keep : int
+        【v2 only】分位截取最少保留数,默认 3(避免某策略结果极少时空盘)
     analysis_days : int
         诊断用历史天数
     monte_carlo_days : int
@@ -614,22 +629,34 @@ def full_stock_selection(
     run_strategies = AUTO_STRATEGIES if strategy == "auto" else [strategy]
     strategy_label = "AUTO (value+momentum+oversold+potential)" if strategy == "auto" else strategy.upper()
 
-    all_picks = {}  # code → best result dict (按 EQS 去重取最高)
+    all_picks = {}  # code → best result dict (v1: 去重取最高 EQS)
+    per_strategy_results = {}  # v2: 按策略保留全部,用于 hit-count 合并
     total_market = 0
     total_stage1 = 0
     total_stage2 = 0
     total_hist = 0
     strategy_stats = []  # 每个策略的产出统计
+    data_health = None  # 由 screen_stocks/v2 返回的数据健康诊断 (全局同源)
 
     for strat in run_strategies:
-        sr = sc.screen_stocks(
-            strategy=strat,
-            top_n=top_n,
-            deep_scan_enabled=True,
-            stage1_limit=min(max(top_n * 4, 60), 80),
-            quality_threshold=quality_threshold,
-            max_candidates=max(review_top_n + 5, 25) if review_top_n > 0 else 25,
-        )
+        if use_v2_pipeline:
+            sr = sc.screen_stocks_v2(
+                strategy=strat,
+                top_n=top_n,
+                stage1_limit=min(max(top_n * 4, 60), 80),
+                quality_quantile=v2_quality_quantile,
+                min_keep=v2_min_keep,
+                max_candidates=max(review_top_n + 5, 25) if review_top_n > 0 else 25,
+            )
+        else:
+            sr = sc.screen_stocks(
+                strategy=strat,
+                top_n=top_n,
+                deep_scan_enabled=True,
+                stage1_limit=min(max(top_n * 4, 60), 80),
+                quality_threshold=quality_threshold,
+                max_candidates=max(review_top_n + 5, 25) if review_top_n > 0 else 25,
+            )
         if "error" in sr:
             strategy_stats.append(f"  {strat}: 失败 — {sr['error']}")
             continue
@@ -638,16 +665,28 @@ def full_stock_selection(
         total_stage1 += sr.get("stage1_count", 0)
         total_stage2 += sr.get("stage2_count", 0)
         total_hist = max(total_hist, sr.get("history_profile_count", 0))
+        # 数据健康诊断: 所有策略跑同一份全市场快照, 取一次就够
+        if data_health is None and sr.get("data_health"):
+            data_health = sr.get("data_health")
         strategy_stats.append(f"  {strat}: {len(results)} 只通过质量门槛")
+
+        # v2 path: keep per-strategy results intact for hit-count merge
+        per_strategy_results[strat] = [dict(r) for r in results]
+
+        # v1 path: dedupe by max EQS
         for r in results:
             code = r["code"]
-            # 记录来源策略
             r["source_strategy"] = strat
             if code not in all_picks or (r.get("entry_quality_score", 0) or 0) > (all_picks[code].get("entry_quality_score", 0) or 0):
                 all_picks[code] = r
 
-    # 合并去重后按 EQS 降序排列
-    picks = sorted(all_picks.values(), key=lambda x: x.get("entry_quality_score", 0) or 0, reverse=True)
+    if use_v2_pipeline:
+        # v2 merge: hit_count primary, avg z-score secondary
+        picks = sc._merge_auto_results_v2(per_strategy_results)
+    else:
+        picks = sorted(all_picks.values(),
+                       key=lambda x: x.get("entry_quality_score", 0) or 0,
+                       reverse=True)
     qualified_count = len(picks)
 
     if not picks and strategy != "auto":
@@ -699,10 +738,22 @@ def full_stock_selection(
         screen_report += "\n\n各策略产出:\n" + "\n".join(strategy_stats)
 
     if not picks:
-        return "\n".join([
+        empty_lines = [
             f"Full Stock Selection — {strategy_label}",
             "=" * 72,
             "",
+        ]
+        if data_health and data_health.get("is_stale"):
+            empty_lines.extend([
+                "⚠️  数据健康告警",
+                f"  pct_chg覆盖率: {data_health.get('pct_chg_coverage', 0)*100:.1f}%   "
+                f"最新快照: {data_health.get('max_updated_at')}   "
+                f"距今: {data_health.get('staleness_days', '?')} 天",
+            ])
+            for w in data_health.get("warnings", []):
+                empty_lines.append(f"  • {w}")
+            empty_lines.append("")
+        empty_lines.extend([
             "【1】市场环境 / 宏观基线",
             market_report,
             "",
@@ -712,29 +763,31 @@ def full_stock_selection(
             f"第一阶段未筛出符合质量阈值(≥{quality_threshold:.1f})的候选股。",
             "建议: 降低 quality_threshold（如3.0），或更换策略（如 oversold / potential）",
         ])
+        return "\n".join(empty_lines)
 
-    # ════ 精选门槛：从 EQS 候选池中筛出"最可能上涨"的股票 ════
-    # 用第一阶段已有的量化指标做硬过滤，减少无效深度复核
+    # ════ 精选门槛：从候选池中筛出"最可能上涨"的股票 ════
     MAX_REVIEW = 15
     pre_filter_count = len(picks)
 
-    if len(picks) > MAX_REVIEW:
-        # 精选条件（全部基于第一阶段本地数据，0网络开销）
+    if use_v2_pipeline:
+        # v2: single quantile cut over composite z-score of
+        # (prob_up, total_score, expected_return). No cascades, no
+        # magic thresholds. Top MAX_REVIEW by relative rank.
+        refine_out = sc._refine_picks_v2(picks, max_review=MAX_REVIEW, min_review=5)
+        picks_for_review = refine_out["picks_for_review"]
+    elif len(picks) > MAX_REVIEW:
+        # v1: original 65%/55%/fallback cascade
         refined = [p for p in picks if
-            (p.get("prob_up") or 0) >= 65          # 蒙特卡洛20日上涨概率 ≥ 65%
-            and (p.get("total_score") or 0) > 0    # 7维量化诊断看多
-            and (p.get("expected_return") or 0) > 0 # 期望收益为正
+            (p.get("prob_up") or 0) >= 65
+            and (p.get("total_score") or 0) > 0
+            and (p.get("expected_return") or 0) > 0
         ]
-        # 如果精选后太少（<5只），放宽到只要求 prob_up >= 55%
         if len(refined) < 5:
             refined = [p for p in picks if (p.get("prob_up") or 0) >= 55]
-        # 如果精选后仍然太多，按 EQS 取前 MAX_REVIEW
         if len(refined) > MAX_REVIEW:
             refined = refined[:MAX_REVIEW]
-        # 如果精选后为空（极端情况），保留原始 picks 前 MAX_REVIEW
         if not refined:
             refined = picks[:MAX_REVIEW]
-
         picks_for_review = refined
     else:
         picks_for_review = picks
@@ -744,10 +797,16 @@ def full_stock_selection(
 
     # 精选统计（追加到 screen_report）
     if pre_filter_count > len(picks_for_review):
-        screen_report += (
-            f"\n\n精选门槛: prob_up≥65% + total_score>0 + expected_return>0"
-            f"\n  EQS候选: {pre_filter_count} 只 → 精选后: {len(picks_for_review)} 只进入深度复核"
-        )
+        if use_v2_pipeline:
+            screen_report += (
+                f"\n\n精选门槛(v2): 横截面 z-score((prob_up, total_score, expected_return)) 取前 {MAX_REVIEW}"
+                f"\n  候选池: {pre_filter_count} 只 → 精选后: {len(picks_for_review)} 只进入深度复核"
+            )
+        else:
+            screen_report += (
+                f"\n\n精选门槛(v1): prob_up≥65% + total_score>0 + expected_return>0"
+                f"\n  EQS候选: {pre_filter_count} 只 → 精选后: {len(picks_for_review)} 只进入深度复核"
+            )
 
     # ════ 第二阶段: 深度复核（所有候选股并行分析）════
 
@@ -1010,14 +1069,32 @@ def full_stock_selection(
 
     _last_td = last_trade_day()
     _next_td = next_trade_day()
+    pipeline_tag = "v2(z-score)" if use_v2_pipeline else "v1(legacy)"
     lines = [
-        f"Full Stock Selection — {strategy_label} 策略",
+        f"Full Stock Selection — {strategy_label} 策略  [pipeline: {pipeline_tag}]",
         "=" * 72,
         f"报告时间: {cn_now().strftime('%Y-%m-%d %H:%M')}  "
         f"数据截止: {_last_td}  "
         f"下一个交易日: {_next_td}",
         api_summary,
         "",
+    ]
+
+    # ═══ 数据健康告警 ═══
+    # pct_chg 覆盖率或快照过期时, 直接把警告拍在报告开头, 别让用户在残缺数据
+    # 上做投资决策还不知情.
+    if data_health and data_health.get("is_stale"):
+        lines.extend([
+            "⚠️  数据健康告警",
+            f"  pct_chg覆盖率: {data_health.get('pct_chg_coverage', 0)*100:.1f}%   "
+            f"最新快照: {data_health.get('max_updated_at')}   "
+            f"距今: {data_health.get('staleness_days', '?')} 天",
+        ])
+        for w in data_health.get("warnings", []):
+            lines.append(f"  • {w}")
+        lines.append("")
+
+    lines.extend([
         "【1】环境感知层",
         market_report,
         "",
@@ -1027,7 +1104,7 @@ def full_stock_selection(
         "▌ 北向资金（沪深港通）" + (f"  情绪修正: {northbound_adj:+.2f}" if northbound_adj else ""),
         northbound_report,
         "",
-    ]
+    ])
 
     # ═══ Sector Rotation Context ═══
     try:

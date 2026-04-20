@@ -1082,6 +1082,18 @@ def bulk_daily_kline_from_clist(
     if all_done:
         _meta_set(conn, done_key, target_trade_date)
 
+    # 补算 pct_chg/change: 东财 clist 在盘前/盘后有时会把 f3 返回 "-",
+    # 导致 pct_chg 入库为 NULL（但 close 是有效的）。既然 close 和
+    # prev_close 都能查到，就直接用 (close/prev_close - 1) * 100 补回来。
+    # 这一步对当天 target_trade_date 做;
+    # 同时顺手把历史上其它 NULL 天也一次性修掉，保证 screener 永远有值.
+    try:
+        backfilled = backfill_pct_chg_from_close(conn, target_date=None)
+        if backfilled:
+            log.info("backfill pct_chg: 补回 %d 条历史 NULL 记录", backfilled)
+    except Exception as e:
+        log.warning("backfill_pct_chg_from_close failed: %s", e)
+
     if own_conn:
         conn.close()
 
@@ -1094,6 +1106,76 @@ def bulk_daily_kline_from_clist(
         "errors": errors,
         "skipped": False,
     }
+
+
+def backfill_pct_chg_from_close(conn, target_date: str = None) -> int:
+    """补算 stock_history 里缺失的 pct_chg / change 字段。
+
+    数据源（东财 clist API、部分分支的实时接口）在盘前/盘后或市场关闭时
+    会把 f3/f4 返回成 "-"，导致这两列落 NULL 但 close 是有效的。既然同一
+    code 的上一个交易日 close 能查到，就直接现算补回来:
+
+        change   = close - prev_close
+        pct_chg  = (close / prev_close - 1) * 100
+
+    Args:
+        conn: 数据库连接
+        target_date: 若指定，仅修复该交易日；否则修复所有 NULL 行。
+
+    Returns:
+        被更新的行数。
+    """
+    if target_date:
+        where_date = "AND h.date = %s"
+        params = (target_date,)
+    else:
+        where_date = ""
+        params = ()
+
+    # 用 LATERAL JOIN 取每行的上一个有效 close
+    # 注意: 这里用 %s 占位符，与 db.execute 兼容
+    sql = f"""
+        UPDATE stock_history AS h
+        SET
+          pct_chg = CASE
+            WHEN h.close IS NOT NULL AND prev.prev_close IS NOT NULL
+                 AND prev.prev_close > 0
+            THEN (h.close / prev.prev_close - 1.0) * 100.0
+            ELSE h.pct_chg
+          END,
+          change = CASE
+            WHEN h.close IS NOT NULL AND prev.prev_close IS NOT NULL
+            THEN h.close - prev.prev_close
+            ELSE h.change
+          END
+        FROM (
+          SELECT h1.code, h1.date,
+                 (SELECT h2.close
+                  FROM stock_history h2
+                  WHERE h2.code = h1.code
+                    AND h2.date < h1.date
+                    AND h2.close IS NOT NULL
+                  ORDER BY h2.date DESC
+                  LIMIT 1) AS prev_close
+          FROM stock_history h1
+          WHERE (h1.pct_chg IS NULL OR h1.change IS NULL)
+            AND h1.close IS NOT NULL
+        ) AS prev
+        WHERE h.code = prev.code
+          AND h.date = prev.date
+          {where_date}
+    """
+    cur = conn.cursor()
+    try:
+        if params:
+            cur.execute(sql, params)
+        else:
+            cur.execute(sql)
+        rowcount = cur.rowcount or 0
+        conn.commit()
+        return int(rowcount)
+    finally:
+        cur.close()
 
 
 def fetch_history_batch(
