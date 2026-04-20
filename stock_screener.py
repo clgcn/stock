@@ -50,8 +50,19 @@ def _build_data_health(df: pd.DataFrame) -> Dict:
     """Compute a data-health snapshot. Never raises.
 
     Returns dict with:
-      total_rows, pct_chg_coverage (0-1), max_updated_at, staleness_days,
+      total_rows, pct_chg_coverage (0-1), last_trade_date (str date),
+      max_updated_at (str, fundamentals sync ts — info only),
+      staleness_days (natural days from last_trade_date to today),
       is_stale (bool), warnings (list of str).
+
+    ── Staleness semantics ──
+    A-share 市场只在交易日产生行情。数据库里 *不存在* 周末/节假日行。
+    所以 staleness 必须基于 `MAX(stock_history.date)` = 最近交易日,
+    再比自然日。阈值:
+      • 间隔 ≤ 3 天:正常(覆盖到周二跑上周五数据的长周末场景)
+      • 间隔 > 3 天:真的漏了交易日,才告警
+    之前拿 `fundamentals.updated_at` 的墙钟时间戳来做这事是错的 —
+    那个时间戳和实际交易日解耦, 会在每个周一误报 stale.
     """
     health: Dict = {"warnings": []}
     try:
@@ -63,6 +74,20 @@ def _build_data_health(df: pd.DataFrame) -> Dict:
             coverage = 0.0
         health["pct_chg_coverage"] = round(coverage, 3)
 
+        # ── 1. last_trade_date: 取 stock_history 最大 date (唯一可信来源) ──
+        last_trade = None
+        if "last_trade_date" in df.columns:
+            try:
+                s = pd.to_datetime(df["last_trade_date"], errors="coerce")
+                if s.notna().any():
+                    last_trade = s.max()
+            except Exception:
+                last_trade = None
+        health["last_trade_date"] = (
+            last_trade.strftime("%Y-%m-%d") if last_trade is not None else None
+        )
+
+        # ── 2. max_updated_at: 旧字段保留,现在只做"基本面同步时间"展示 ──
         last_upd = None
         if "updated_at" in df.columns:
             try:
@@ -73,34 +98,35 @@ def _build_data_health(df: pd.DataFrame) -> Dict:
                 last_upd = None
         health["max_updated_at"] = str(last_upd) if last_upd is not None else None
 
+        # ── 3. staleness: 以 last_trade_date 为准, 按自然日差 ──
+        # 两边都归一成 naive date 再减, 避免 tz-aware/naive 混用抛异常.
         stale_days = None
-        if last_upd is not None:
+        if last_trade is not None:
             try:
-                now = pd.Timestamp(cn_now())
-                # drop tz info on either side for subtraction
-                if hasattr(last_upd, "tz_localize") and last_upd.tzinfo is None:
-                    now = now.tz_localize(None)
-                stale_days = max(0.0, (now - last_upd).total_seconds() / 86400.0)
+                today_d = cn_now().date()
+                lt_d = pd.Timestamp(last_trade).date()
+                stale_days = max(0, (today_d - lt_d).days)
             except Exception:
                 stale_days = None
-        health["staleness_days"] = round(stale_days, 2) if stale_days is not None else None
+        health["staleness_days"] = int(stale_days) if stale_days is not None else None
 
-        # A snapshot is "stale" if most pct_chg are NaN OR data is >2 days old.
+        # ── 4. is_stale 判定:覆盖率太低 OR 间隔 > 3 天 ──
         health["is_stale"] = bool(
             coverage < 0.5
-            or (stale_days is not None and stale_days > 2.0)
+            or (stale_days is not None and stale_days > 3)
         )
 
         if coverage < 0.5:
             health["warnings"].append(
-                f"pct_chg 仅 {coverage*100:.1f}% 股票有值（通常应>95%）— "
-                "快照可能未在最新交易日更新。已放宽 pct_chg.notna() 约束，"
-                "但建议重跑 slow_fetcher 拉取最新行情。"
+                f"pct_chg 仅 {coverage*100:.1f}% 股票有值(通常应>95%)— "
+                "快照可能未在最新交易日更新. 已放宽 pct_chg.notna() 约束,"
+                "但建议重跑 slow_fetcher 拉取最新行情."
             )
-        if stale_days is not None and stale_days > 2.0:
+        if stale_days is not None and stale_days > 3:
             health["warnings"].append(
-                f"数据距今已 {stale_days:.1f} 天 (最新快照 {last_upd}) — "
-                "跨越周末/节假日或同步任务中断。"
+                f"最近交易日 {health['last_trade_date']} 距今 {stale_days} 天 — "
+                f"疑似漏了一个或多个交易日的同步(长周末最多 3 天),"
+                f"建议重跑 slow_fetcher."
             )
     except Exception as e:
         # Never let diagnostic itself break the pipeline
@@ -1087,7 +1113,8 @@ def screen_stocks(
         if data_health.get("is_stale"):
             summary_lines.append(
                 f"⚠️ 数据可能过期 (pct_chg覆盖率={data_health.get('pct_chg_coverage', 0)*100:.1f}%, "
-                f"最新快照={data_health.get('max_updated_at')})。"
+                f"最近交易日={data_health.get('last_trade_date')}, "
+                f"距今 {data_health.get('staleness_days', '?')} 天)。"
             )
         summary_lines.append("可考虑放宽过滤条件或重跑 slow_fetcher。")
         return {
@@ -1664,7 +1691,8 @@ def screen_stocks_v2(
             summary += (
                 f" ⚠️ 数据可能过期 (pct_chg覆盖率="
                 f"{data_health.get('pct_chg_coverage', 0)*100:.1f}%, "
-                f"最新快照={data_health.get('max_updated_at')})，"
+                f"最近交易日={data_health.get('last_trade_date')}, "
+                f"距今 {data_health.get('staleness_days', '?')} 天),"
                 f"建议重跑 slow_fetcher。"
             )
         return {

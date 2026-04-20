@@ -747,7 +747,7 @@ def full_stock_selection(
             empty_lines.extend([
                 "⚠️  数据健康告警",
                 f"  pct_chg覆盖率: {data_health.get('pct_chg_coverage', 0)*100:.1f}%   "
-                f"最新快照: {data_health.get('max_updated_at')}   "
+                f"最近交易日: {data_health.get('last_trade_date')}   "
                 f"距今: {data_health.get('staleness_days', '?')} 天",
             ])
             for w in data_health.get("warnings", []):
@@ -1081,13 +1081,14 @@ def full_stock_selection(
     ]
 
     # ═══ 数据健康告警 ═══
-    # pct_chg 覆盖率或快照过期时, 直接把警告拍在报告开头, 别让用户在残缺数据
-    # 上做投资决策还不知情.
+    # pct_chg 覆盖率或快照过期时, 直接把警告拍在报告开头. Staleness 以
+    # last_trade_date (stock_history 最大日期) 为准, 不是 fundamentals.updated_at
+    # 墙钟戳 — 之前那样算每周一都会误报 stale.
     if data_health and data_health.get("is_stale"):
         lines.extend([
             "⚠️  数据健康告警",
             f"  pct_chg覆盖率: {data_health.get('pct_chg_coverage', 0)*100:.1f}%   "
-            f"最新快照: {data_health.get('max_updated_at')}   "
+            f"最近交易日: {data_health.get('last_trade_date')}   "
             f"距今: {data_health.get('staleness_days', '?')} 天",
         ])
         for w in data_health.get("warnings", []):

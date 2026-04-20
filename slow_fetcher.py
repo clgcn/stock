@@ -605,6 +605,7 @@ def _stock_overview_query(updated_at_expr: str, legacy_select: str = "",
                f.total_mv,
                f.float_mv,
                hist.history_days AS snapshot_history_days,
+               l.updated_at_history AS last_trade_date,
                COALESCE(f.updated_at, l.updated_at_history, {updated_at_expr}) AS updated_at
                {legacy_select}
         FROM stocks s
