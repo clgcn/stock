@@ -70,8 +70,8 @@ def assess_environment(
         try:
             market_data = mq.get_foreign_markets()
             market_score = mq.compute_market_score(market_data)
-        except Exception:
-            pass  # 行情获取失败 → 评分保持 0
+        except Exception as e:
+            print(f"Warning: [module_a] 外围行情获取失败 - {type(e).__name__}: {e}")
 
     # ── 2. 新闻面微调 ──
     news_delta = 0.0
@@ -91,7 +91,8 @@ def assess_environment(
             parts.append("")
             parts.append(f"  有效新闻: {total} 条  情绪微调值: {news_delta:+.2f}")
             news_report = "\n".join(parts)
-        except Exception:
+        except Exception as e:
+            print(f"Warning: [module_a] 新闻获取失败 - {type(e).__name__}: {e}")
             news_report = "  （新闻获取失败）"
 
     # ── 3. 北向资金修正（基于成交额趋势，2024年5月后无净流入数据）──
@@ -130,12 +131,13 @@ def assess_environment(
                         consecutive_outflow += 1
                     else:
                         break
-        except Exception:
+        except Exception as e:
+            print(f"Warning: [module_a] 北向资金获取失败 - {type(e).__name__}: {e}")
             northbound_report = "北向资金获取失败"
 
     # ── 4. 合并情绪 ──
     # 外围行情(权重60%) + 新闻微调(权重20%) + 北向修正(权重20%)
-    combined = market_score + news_delta * 0.4 + northbound_adj
+    combined = market_score * 0.6 + news_delta * 0.2 + northbound_adj * 0.2
     combined = max(-1.0, min(1.0, round(combined, 2)))
 
     # ── 5. 大盘情绪评级 H/M/L ──

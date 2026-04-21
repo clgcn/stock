@@ -31,7 +31,7 @@ STAMP_TAX_RATE = 0.001  # 0.1% on sales
 COMMISSION_RATE = 0.00025  # 0.025%
 MIN_COMMISSION = 5  # CNY
 LOT_SIZE = 100  # minimum trading unit
-RISK_FREE_RATE = 0.02  # default annual risk-free rate
+RISK_FREE_RATE = 0.025  # default annual risk-free rate (unified across system)
 
 # Market limits
 DAILY_LIMIT_MAIN = 0.10  # 10% for main board
@@ -61,6 +61,7 @@ def _load_histories(codes: List[str], days: int = 250) -> Dict[str, pd.DataFrame
         Dict mapping code -> DataFrame with columns [date, close]
     """
     result = {}
+    conn = None
     try:
         conn = db.get_conn()
         for code in codes:
@@ -73,9 +74,14 @@ def _load_histories(codes: List[str], days: int = 250) -> Dict[str, pd.DataFrame
             df = db.read_sql(query, conn, params=(code, days))
             if not df.empty:
                 result[code] = df.sort_values('date').reset_index(drop=True)
-        conn.close()
     except Exception as e:
         warnings.warn(f"Failed to load histories: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     return result
 
@@ -177,7 +183,9 @@ def estimate_returns(
 
 def estimate_covariance(
     history_dict: Dict[str, pd.DataFrame],
-    method: str = "ledoit_wolf"
+    method: str = "ledoit_wolf",
+    use_ewma: bool = True,
+    ewma_span: int = 60,
 ) -> pd.DataFrame:
     """
     Estimate covariance matrix of returns.
@@ -187,9 +195,12 @@ def estimate_covariance(
         method: Estimation method
             - 'sample': Raw sample covariance (can be unstable)
             - 'ledoit_wolf': Ledoit-Wolf shrinkage toward constant correlation matrix
+        use_ewma: If True, apply exponential decay (span=60 days) so recent
+            observations get higher weight. Critical for A-share regime changes.
+        ewma_span: Half-life parameter for EWMA (default 60 trading days ≈ 3 months)
 
     Returns:
-        pd.DataFrame: Covariance matrix (codes x codes)
+        pd.DataFrame: Annualized covariance matrix (codes x codes)
 
     Raises:
         ValueError: If method is unknown or data is insufficient
@@ -213,11 +224,23 @@ def estimate_covariance(
         for code in codes
     ])
 
+    # EWMA: exponential weights so recent regime dominates (A-share specific)
+    if use_ewma and min_len > ewma_span:
+        decay = 2.0 / (ewma_span + 1)
+        raw_weights = np.array([(1 - decay) ** i for i in range(min_len - 1, -1, -1)])
+        ewma_weights = raw_weights / raw_weights.sum()
+    else:
+        ewma_weights = None
+
+    def _weighted_cov(arr: np.ndarray, w=None) -> np.ndarray:
+        if w is None:
+            return np.cov(arr.T)
+        mean = np.average(arr, axis=0, weights=w)
+        centered = arr - mean
+        return (centered.T * w) @ centered / (1 - np.sum(w ** 2))
+
     if method == "sample":
-        # Simple sample covariance
-        cov_matrix = np.cov(returns_array.T)
-        # Annualize (252 trading days)
-        cov_matrix = cov_matrix * 252
+        cov_matrix = _weighted_cov(returns_array, ewma_weights) * 252
         return pd.DataFrame(cov_matrix, index=codes, columns=codes)
 
     elif method == "ledoit_wolf":
@@ -225,12 +248,18 @@ def estimate_covariance(
         n_assets = len(codes)
         n_obs = returns_array.shape[0]
 
-        # Sample covariance
-        sample_cov = np.cov(returns_array.T)
+        # Sample covariance — use EWMA weights if available for regime sensitivity
+        sample_cov = _weighted_cov(returns_array, ewma_weights)
 
         # Target: constant correlation matrix
         # Compute average pairwise correlation
-        corr_matrix = np.corrcoef(returns_array.T)
+        if ewma_weights is not None:
+            mean = np.average(returns_array, axis=0, weights=ewma_weights)
+            centered = returns_array - mean
+            std = np.sqrt(np.diag(sample_cov))
+            corr_matrix = sample_cov / np.outer(std, std)
+        else:
+            corr_matrix = np.corrcoef(returns_array.T)
         np.fill_diagonal(corr_matrix, 1.0)
 
         # Average correlation (off-diagonal)
@@ -394,6 +423,9 @@ def optimize_max_sharpe(
 
     if n_assets < 2:
         raise ValueError("Need at least 2 assets for optimization")
+    if n_assets < 5:
+        import warnings
+        warnings.warn(f"Small universe ({n_assets} assets): optimizer may over-concentrate. Consider adding more stocks or using equal-weight.")
 
     if cov.shape[0] != n_assets or cov.shape[1] != n_assets:
         raise ValueError("mu and cov dimensions don't match")
@@ -431,7 +463,7 @@ def optimize_max_sharpe(
         # Sharpe = (w'mu - rf) / sqrt(w'Cov*w)
         # dSharpe/dw = (mu*sqrt(w'Cov*w) - (w'mu - rf)*Cov*w/sqrt(w'Cov*w)) / (w'Cov*w)
 
-        term1 = mu_array * port_vol
+        term1 = mu_array * port_vol  # ∂/∂w of numerator (w'μ - rf); gradient is μ, not (μ - rf)
         term2 = (port_return - risk_free) * (cov_reg @ w) / port_vol
         gradient = (term1 - term2) / (port_vol ** 2)
 
@@ -1119,6 +1151,72 @@ def rebalance_plan(
             })
 
     return orders
+
+
+# ============================================================================
+# Turnover Management
+# ============================================================================
+
+def compute_turnover(
+    new_weights: Dict[str, float],
+    current_weights: Dict[str, float],
+) -> float:
+    """
+    Compute L1 turnover between two weight dicts.
+    Returns a value in [0, 2]: 0 = no change, 1 = full portfolio rotated once.
+    Round-trip cost at 0.15% per trade: turnover × 0.075% ≈ trading cost fraction.
+    """
+    all_codes = set(new_weights) | set(current_weights)
+    return sum(
+        abs(new_weights.get(c, 0.0) - current_weights.get(c, 0.0))
+        for c in all_codes
+    )
+
+
+def apply_turnover_constraint(
+    new_weights: Dict[str, float],
+    current_weights: Dict[str, float],
+    turnover_limit: float = 0.30,
+) -> Dict[str, float]:
+    """
+    Blend new_weights toward current_weights to cap L1 turnover.
+
+    A-share round-trip cost is ~0.15% (commission 0.025%×2 + stamp tax 0.1%).
+    Unconstrained optimizers routinely generate 40-60% daily turnover, erasing
+    ~6-9bps of alpha per rebalance. Capping at turnover_limit=0.30 limits trading
+    friction to ~4.5bps while preserving most of the optimizer signal.
+
+    Args:
+        new_weights: Target weights from optimizer {code: weight}
+        current_weights: Current holdings weights {code: weight}
+        turnover_limit: Max L1 turnover (sum |w_new - w_old|). Default 0.30 = 30%
+
+    Returns:
+        Adjusted weights respecting turnover_limit with sum = 1.
+        Returns new_weights unchanged when current turnover is already within limit.
+    """
+    turnover = compute_turnover(new_weights, current_weights)
+
+    if turnover <= turnover_limit:
+        return dict(new_weights)
+
+    # Linear blend: alpha × new + (1 - alpha) × current achieves exactly turnover_limit
+    alpha = turnover_limit / turnover  # 0 < alpha < 1
+
+    all_codes = set(new_weights) | set(current_weights)
+    blended: Dict[str, float] = {}
+    for code in all_codes:
+        w_new = new_weights.get(code, 0.0)
+        w_cur = current_weights.get(code, 0.0)
+        blended[code] = alpha * w_new + (1.0 - alpha) * w_cur
+
+    # Drop dust positions (< 0.1%) and renormalize
+    blended = {c: w for c, w in blended.items() if w > 0.001}
+    total = sum(blended.values())
+    if total > 0:
+        blended = {c: w / total for c, w in blended.items()}
+
+    return blended
 
 
 # ============================================================================

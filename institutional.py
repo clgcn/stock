@@ -823,7 +823,19 @@ def institutional_score(code: str, conn=None) -> dict:
         # 映射: raw ∈ [-30, +50] → score ∈ [0, 30]
         holder_change_score = max(0, min(30, 15 + change_raw))
 
-        total = round(fund_score + smart_money_score + holder_change_score, 1)
+        total_raw = round(fund_score + smart_money_score + holder_change_score, 1)
+
+        # 时效衰减：机构持仓按季度披露，最长90天滞后，评分随时效衰减
+        import datetime as _dt_inst
+        lag_days = 0
+        if report_date:
+            try:
+                rd = _dt_inst.datetime.strptime(str(report_date)[:10], "%Y-%m-%d")
+                lag_days = max(0, (_dt_inst.datetime.now() - rd).days)
+            except Exception:
+                lag_days = 0
+        time_decay = max(0.3, 1.0 - lag_days / 90.0)
+        total = round(total_raw * time_decay, 1)
 
         # 一句话描述
         parts = []

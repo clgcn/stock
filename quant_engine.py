@@ -84,8 +84,7 @@ def hurst_exponent(series: np.ndarray, max_lag: int = 20) -> float:
         return 0.5
     log_lags = np.array([v[0] for v in rs_values])
     log_rs   = np.array([v[1] for v in rs_values])
-    slope, _, _ = linear_regression(log_rs)
-    # Regress on log_lags
+    # Regress log(R/S) on log(lag) to get Hurst exponent
     n = len(log_lags)
     x_m = log_lags.mean()
     y_m = log_rs.mean()
@@ -94,13 +93,9 @@ def hurst_exponent(series: np.ndarray, max_lag: int = 20) -> float:
 
 
 def ewma(series: np.ndarray, span: int) -> np.ndarray:
-    """Exponentially weighted moving average"""
-    alpha = 2.0 / (span + 1)
-    result = np.zeros_like(series, dtype=float)
-    result[0] = series[0]
-    for i in range(1, len(series)):
-        result[i] = alpha * series[i] + (1 - alpha) * result[i - 1]
-    return result
+    """Exponentially weighted moving average — pandas C implementation (10-100x faster)."""
+    import pandas as pd
+    return pd.Series(series, dtype=float).ewm(span=span, adjust=False).mean().values
 
 
 # =====================================================
@@ -2555,9 +2550,9 @@ def detect_accumulation(
             else:
                 d3_signals.append(f"换手率{avg_turnover:.1f}% ✗")
         else:
-            # 没有换手率数据时用成交量相对比来粗估
-            vol_recent = np.mean(volume[-20:])
-            vol_early = np.mean(volume[-60:-20]) if n >= 60 else vol_recent
+            # 没有换手率数据时用成交量相对比来粗估 (5日近期 vs 20日基准)
+            vol_recent = np.mean(volume[-5:])
+            vol_early = np.mean(volume[-20:-5]) if n >= 20 else vol_recent
             ratio = vol_recent / vol_early if vol_early > 0 else 1
             if 0.4 <= ratio <= 0.8:
                 d3_score += 5

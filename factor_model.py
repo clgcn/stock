@@ -16,16 +16,23 @@ import numpy as np
 import pandas as pd
 
 DEFAULT_WEIGHTS = {
-    "ep": 0.12, "bp": 0.08, "dp": 0.05, "sp": 0.05,
-    "roe_stability": 0.08, "gm_stability": 0.05,
-    "accrual": 0.04, "debt_equity": 0.03,
-    "mom_1m": 0.05, "mom_3m": 0.06, "mom_6m": 0.05,
-    "mom_12_1m": 0.04,
-    "vol_60d": 0.06, "beta": 0.04, "downside_dev": 0.03,
+    # Value factors (25%) — strong A-share premium post-2019
+    "ep": 0.17, "bp": 0.08,
+    # Quality factors (30%) — most predictive in A-share 2020-2025 research
+    "roe_stability": 0.18, "gm_stability": 0.05, "accrual": 0.05, "downside_dev": 0.02,
+    # Risk/leverage (3%)
+    "debt_equity": 0.03,
+    # Momentum factors (13%) — reduced from 20%; A-share momentum weaker post-2021
+    "mom_1m": 0.03, "mom_3m": 0.04, "mom_6m": 0.03, "mom_12_1m": 0.03,
+    # Volatility/risk (11%)
+    "vol_60d": 0.07, "beta": 0.04,
+    # Size (5%)
     "log_mcap": 0.05,
+    # Liquidity (8%)
     "turnover_20d": 0.04, "amihud": 0.04,
-    "reversal_5d": 0.04,
-}
+    # Short-term reversal (5%)
+    "reversal_5d": 0.05,
+}  # sum=1.00: Value(25)+Quality(30)+Leverage(3)+Momentum(13)+Vol(11)+Size(5)+Liq(8)+Rev(5)
 
 # Constants for robustness
 MAD_SCALE = 0.6745  # Scale factor for MAD to std deviation
@@ -73,8 +80,8 @@ def _robust_zscore(values: np.ndarray) -> np.ndarray:
     upper_bound = median + WINSORIZE_THRESHOLD * mad
     winsorized = np.clip(values, lower_bound, upper_bound)
 
-    # Z-score
-    zscore = (winsorized - median) / (mad * MAD_SCALE)
+    # Z-score: divide by (MAD / 0.6745) to convert MAD to approximate std
+    zscore = (winsorized - median) / (mad / MAD_SCALE)
     zscore[~valid_mask] = np.nan
 
     return zscore
@@ -111,34 +118,31 @@ def _spearman_rank_correlation(x: np.ndarray, y: np.ndarray) -> float:
     rank_x = _compute_ranks(x)
     rank_y = _compute_ranks(y)
 
-    d_squared = np.sum((rank_x - rank_y) ** 2)
-    rho = 1 - (6 * d_squared) / (n * (n ** 2 - 1))
+    # Pearson formula on ranks — correctly handles ties (unlike simplified Spearman)
+    rank_x_mean = np.mean(rank_x)
+    rank_y_mean = np.mean(rank_y)
+    numerator = np.sum((rank_x - rank_x_mean) * (rank_y - rank_y_mean))
+    denom = np.sqrt(np.sum((rank_x - rank_x_mean) ** 2) * np.sum((rank_y - rank_y_mean) ** 2))
+    rho = numerator / denom if denom > 1e-10 else 0.0
 
     return rho
 
 
 def _compute_ranks(values: np.ndarray) -> np.ndarray:
-    """Compute ranks with average handling for ties."""
-    order = np.argsort(values)
-    ranks = np.empty_like(order)
-    ranks[order] = np.arange(len(order)) + 1
-
-    # Handle ties by assigning average rank
-    for i in range(len(values)):
-        for j in range(i + 1, len(values)):
-            if values[order[i]] == values[order[j]]:
-                # Find all equal values
-                start = i
-                while start > 0 and values[order[start - 1]] == values[order[i]]:
-                    start -= 1
-                end = j + 1
-                while end < len(values) and values[order[end]] == values[order[i]]:
-                    end += 1
-
-                avg_rank = np.mean(np.arange(start + 1, end + 1))
-                for k in range(start, end):
-                    ranks[order[k]] = avg_rank
-
+    """Compute ranks with average handling for ties — O(n log n)."""
+    n = len(values)
+    order = np.argsort(values, kind='mergesort')
+    ranks = np.empty(n, dtype=float)
+    ranks[order] = np.arange(1, n + 1, dtype=float)
+    i = 0
+    while i < n:
+        j = i
+        while j < n - 1 and values[order[j]] == values[order[j + 1]]:
+            j += 1
+        if j > i:
+            avg = (i + j) / 2.0 + 1.0
+            ranks[order[i:j + 1]] = avg
+        i = j + 1
     return ranks
 
 
@@ -184,18 +188,28 @@ def compute_single_stock_factors(
     else:
         factors['bp'] = np.nan
 
-    # Dividend/Price - approximation: 0 if no dividend data
-    factors['dp'] = 0.0
+    # Dividend/Price - TODO: connect to actual dividend data source; weight reallocated to ep
+    # factors['dp'] = 0.0  # removed from DEFAULT_WEIGHTS
 
-    # Sales/Price - approximation using fundamental data if available
-    factors['sp'] = 0.0
+    # Sales/Price - TODO: connect to actual sales data source; weight reallocated to roe_stability
+    # factors['sp'] = 0.0  # removed from DEFAULT_WEIGHTS
 
     # ============ QUALITY FACTORS ============
     if 'roe' in fundamentals and isinstance(fundamentals['roe'], (list, np.ndarray)):
         roe_values = np.array(fundamentals['roe'], dtype=np.float64)
         roe_values = roe_values[~np.isnan(roe_values)]
-        if len(roe_values) >= 2:
-            factors['roe_stability'] = 1.0 / (np.std(roe_values) + 0.01)  # Inverse of volatility
+        if len(roe_values) >= 4:  # require 4+ quarters for reliable std estimate
+            base = 1.0 / (np.std(roe_values) + 0.01)
+            # Growth-aware adjustment: improving ROE trend should not be penalized as instability.
+            # roe_values assumed oldest-first (chronological order).
+            median_roe = np.median(roe_values)
+            std_roe = np.std(roe_values)
+            recent_roe = roe_values[-1]
+            if recent_roe > median_roe + 0.5 * std_roe:
+                base *= 1.2   # improving quality: reward trend
+            elif recent_roe < median_roe - 0.5 * std_roe:
+                base *= 0.8   # deteriorating quality: penalize
+            factors['roe_stability'] = base
         else:
             factors['roe_stability'] = np.nan
     else:
@@ -204,7 +218,7 @@ def compute_single_stock_factors(
     if 'gross_margin' in fundamentals and isinstance(fundamentals['gross_margin'], (list, np.ndarray)):
         gm_values = np.array(fundamentals['gross_margin'], dtype=np.float64)
         gm_values = gm_values[~np.isnan(gm_values)]
-        if len(gm_values) >= 2:
+        if len(gm_values) >= 4:  # require 4+ quarters for reliable std estimate
             factors['gm_stability'] = 1.0 / (np.std(gm_values) + 0.01)
         else:
             factors['gm_stability'] = np.nan
@@ -229,16 +243,16 @@ def compute_single_stock_factors(
     else:
         factors['mom_1m'] = np.nan
 
-    # 3-month return
-    if len(close) >= 65:
-        ret_3m = (close[-1] / close[-65] - 1.0) if close[-65] > 0 else np.nan
+    # 3-month return (skip last 5 days to avoid short-term reversal contamination)
+    if len(close) >= 70:
+        ret_3m = (close[-6] / close[-70] - 1.0) if close[-70] > 0 else np.nan
         factors['mom_3m'] = ret_3m
     else:
         factors['mom_3m'] = np.nan
 
-    # 6-month return
-    if len(close) >= 130:
-        ret_6m = (close[-1] / close[-130] - 1.0) if close[-130] > 0 else np.nan
+    # 6-month return (skip last 5 days)
+    if len(close) >= 135:
+        ret_6m = (close[-6] / close[-135] - 1.0) if close[-135] > 0 else np.nan
         factors['mom_6m'] = ret_6m
     else:
         factors['mom_6m'] = np.nan
@@ -250,10 +264,16 @@ def compute_single_stock_factors(
     else:
         factors['mom_12_1m'] = np.nan
 
-    # 5-day reversal
+    # 5-day reversal — asymmetric for A-shares:
+    # up-reversal decays faster (retail stop-loss), down-reversal persists (accumulation)
     if len(close) >= 5:
         ret_5d = (close[-1] / close[-5] - 1.0) if close[-5] > 0 else np.nan
-        factors['reversal_5d'] = -ret_5d  # Negative of recent return (reversal signal)
+        if ret_5d is not None and not np.isnan(ret_5d):
+            # Up moves: stronger reversal signal (×1.3); Down moves: weaker (×0.8)
+            asymmetry = 1.3 if ret_5d > 0 else 0.8
+            factors['reversal_5d'] = -ret_5d * asymmetry
+        else:
+            factors['reversal_5d'] = np.nan
     else:
         factors['reversal_5d'] = np.nan
 
@@ -285,15 +305,12 @@ def compute_single_stock_factors(
     else:
         factors['beta'] = np.nan
 
-    # Downside deviation
+    # Downside deviation — full-sample semi-variance (MAR=0), avoids NaN when all returns positive
     if len(close) >= 60:
         returns_60d = np.diff(np.log(close[-60:])) * 100
-        downside_returns = returns_60d[returns_60d < 0]
-        if len(downside_returns) > 0:
-            downside_dev = np.sqrt(np.mean(downside_returns ** 2))
-            factors['downside_dev'] = -downside_dev  # Lower is preferred
-        else:
-            factors['downside_dev'] = np.nan
+        downside_sq = np.minimum(returns_60d, 0) ** 2
+        downside_dev = np.sqrt(np.mean(downside_sq))
+        factors['downside_dev'] = -downside_dev if downside_dev > 0 else 0.0
     else:
         factors['downside_dev'] = np.nan
 
@@ -306,24 +323,28 @@ def compute_single_stock_factors(
         factors['log_mcap'] = np.nan
 
     # ============ LIQUIDITY FACTORS ============
-    # 20-day average turnover
+    # 20-day average turnover — winsorized to avoid trading-halt distortion
     if turnover is not None and len(turnover) >= 20:
-        avg_turnover_20d = np.mean(turnover[-20:])
-        factors['turnover_20d'] = avg_turnover_20d
+        t20 = turnover[-20:]
+        valid_t = t20[t20 > 0]
+        if len(valid_t) >= 10:
+            p10, p90 = np.percentile(valid_t, 10), np.percentile(valid_t, 90)
+            t20_clipped = np.clip(t20, p10, p90)
+        else:
+            t20_clipped = t20
+        factors['turnover_20d'] = np.mean(t20_clipped)
     else:
         factors['turnover_20d'] = np.nan
 
-    # Amihud illiquidity ratio
+    # Amihud illiquidity ratio — median (not mean) to handle A-share illiquidity spikes
     if len(close) >= 20 and turnover is not None and len(turnover) >= 20:
-        returns_20d = np.diff(np.log(close[-20:])) * 100  # In percentage (19 elements)
-        turnover_20d = turnover[-19:]  # Match length of returns
-
-        # Avoid division by zero
+        returns_20d = np.diff(np.log(close[-20:])) * 100  # percentage, 19 elements
+        turnover_20d = turnover[-19:]
         valid_mask = turnover_20d > 0
-        if valid_mask.sum() > 0:
+        if valid_mask.sum() >= 5:
             amihud_values = np.abs(returns_20d[valid_mask]) / turnover_20d[valid_mask]
-            amihud = np.mean(amihud_values)
-            factors['amihud'] = -amihud  # Lower illiquidity is preferred
+            amihud = np.median(amihud_values)  # median avoids suspension-day spikes
+            factors['amihud'] = -amihud  # higher score = more liquid = preferred
         else:
             factors['amihud'] = np.nan
     else:
@@ -496,17 +517,25 @@ def composite_alpha_score(
     total_weight = sum(valid_weights.values())
     normalized_weights = {k: v / total_weight for k, v in valid_weights.items()}
 
-    # Compute composite score
+    # Compute composite score — redistribute weights to non-NaN factors instead of zero-filling.
+    # Zero-filling biases stocks with many missing factors toward zero alpha; redistribution is unbiased.
     alpha_scores = np.zeros(len(factor_df))
+    weight_sum = np.zeros(len(factor_df))
     missing_count = np.zeros(len(factor_df))
 
     for factor, weight in normalized_weights.items():
         factor_values = factor_df[factor].values
-        alpha_scores += np.nan_to_num(factor_values, nan=0) * weight
-        missing_count += np.isnan(factor_values).astype(int)
+        valid_mask = ~np.isnan(factor_values)
+        alpha_scores[valid_mask] += factor_values[valid_mask] * weight
+        weight_sum[valid_mask] += weight
+        missing_count[~valid_mask] += 1
 
-    # Mark as NaN if >50% factors missing
-    alpha_scores[missing_count > len(normalized_weights) * 0.5] = np.nan
+    # Normalize by sum of weights that were actually used (handles partial missingness)
+    with np.errstate(invalid='ignore', divide='ignore'):
+        alpha_scores = np.where(weight_sum > 0, alpha_scores / weight_sum, np.nan)
+
+    # Mark as NaN if >40% factors missing (require ≥60% coverage for reliable scoring)
+    alpha_scores[missing_count > len(normalized_weights) * 0.4] = np.nan
 
     return pd.Series(alpha_scores, index=factor_df.index)
 
@@ -553,14 +582,19 @@ def factor_exposure_report(
 
 def compute_ic(
     factor_df: pd.DataFrame,
-    forward_returns: pd.Series
+    forward_returns: pd.Series,
+    holding_days: int = 20,
 ) -> Dict[str, float]:
     """
     Compute Information Coefficient (rank correlation) between each factor and forward returns.
 
     Args:
         factor_df: DataFrame with factors (index = codes, columns = factors)
-        forward_returns: Series with forward returns (index = codes)
+        forward_returns: Series of forward returns (index = codes) at the specified horizon.
+            Must be computed at holding_days lag to match the intended rebalance frequency.
+            Default 20 days ≈ monthly rebalance. For weekly: 5. For quarterly: 60.
+        holding_days: Intended holding period in trading days (documentation only; caller
+            is responsible for computing forward_returns at this exact lag).
 
     Returns:
         Dict mapping factor name to IC value
@@ -632,12 +666,15 @@ def load_stock_data(code: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict]]:
     Returns:
         Tuple of (history_df, fundamentals_dict) or (None, None) if not found
     """
+    conn = None
     try:
         conn = _get_db_connection()
 
-        # Load history
+        # Load history — 500 days covers all factor lookbacks (mom_12_1m needs ~265 days)
         history_df = db.read_sql(
-            "SELECT * FROM stock_history WHERE code = %s ORDER BY date",
+            """SELECT * FROM (
+                SELECT * FROM stock_history WHERE code = %s ORDER BY date DESC LIMIT 500
+            ) sub ORDER BY date ASC""",
             conn,
             params=(code,)
         )
@@ -649,8 +686,6 @@ def load_stock_data(code: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict]]:
             params=(code,)
         )
 
-        conn.close()
-
         if history_df.empty or fundamentals_df.empty:
             return None, None
 
@@ -661,6 +696,12 @@ def load_stock_data(code: str) -> Tuple[Optional[pd.DataFrame], Optional[Dict]]:
     except Exception as e:
         print(f"Error loading data for {code}: {e}")
         return None, None
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def batch_compute_factors(codes: List[str], benchmark_close: Optional[np.ndarray] = None) -> List[Dict]:

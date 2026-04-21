@@ -113,16 +113,17 @@ def compute_scorecard(
 
 
 def _score_label(score: float) -> str:
+    """技术信号描述，避免投资建议类措辞以降低合规风险。"""
     if score >= 80:
-        return "优质，值得配置"
+        return "技术信号偏强，可关注"
     elif score >= 60:
-        return "偏强，可关注"
+        return "技术信号较强"
     elif score >= 40:
-        return "中性，谨慎观望"
+        return "技术信号中性"
     elif score >= 20:
-        return "偏弱，不建议"
+        return "技术信号偏弱"
     else:
-        return "极弱，回避"
+        return "技术信号偏弱，谨慎"
 
 
 # ══════════════════════════════════════════════════════

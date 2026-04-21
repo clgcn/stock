@@ -24,11 +24,13 @@ Usage:
 
 import os
 import sys
+import threading
 import psycopg2
 import psycopg2.extras
 import psycopg2.extensions
 import pandas as pd
 from pathlib import Path
+from contextlib import contextmanager
 from dotenv import load_dotenv
 
 # Load .env from project root
@@ -51,6 +53,7 @@ psycopg2.extensions.register_type(_NUMERIC)
 
 # Connection pool for reuse
 _shared_conn = None
+_shared_conn_lock = threading.Lock()
 
 
 def get_conn():
@@ -88,10 +91,24 @@ def get_shared_conn():
         psycopg2 connection object with autocommit=True
     """
     global _shared_conn
-    if _shared_conn is None or _shared_conn.closed:
-        _shared_conn = get_conn()
-        _shared_conn.autocommit = True
+    with _shared_conn_lock:
+        if _shared_conn is None or _shared_conn.closed:
+            _shared_conn = get_conn()
+            _shared_conn.autocommit = True
     return _shared_conn
+
+
+@contextmanager
+def connect():
+    """数据库连接 context manager，自动关闭连接。用于替代手动 conn.close() 模式。"""
+    conn = get_conn()
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def execute(conn, sql, params=None):
@@ -254,14 +271,10 @@ def init_schema(conn=None):
             )
         """)
 
-        # Index for faster lookups by code and date range
+        # Composite index for efficient per-stock date-range queries
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_history_code
-            ON stock_history (code)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_history_date
-            ON stock_history (date)
+            CREATE INDEX IF NOT EXISTS idx_stock_history_code_date
+            ON stock_history (code, date)
         """)
 
         # stock_fundamentals table - PE, PB, market cap
@@ -280,10 +293,10 @@ def init_schema(conn=None):
             )
         """)
 
-        # Index for faster lookups by code
+        # Composite index for (code, trade_date) — covers per-stock date-range queries
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_fundamentals_code
-            ON stock_fundamentals (code)
+            CREATE INDEX IF NOT EXISTS idx_stock_fundamentals_code_date
+            ON stock_fundamentals (code, trade_date)
         """)
 
         # stock_moneyflow table - Large order flows
@@ -325,12 +338,8 @@ def init_schema(conn=None):
             )
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_fund_holdings_code
-            ON fund_holdings (code)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_fund_holdings_report_date
-            ON fund_holdings (report_date)
+            CREATE INDEX IF NOT EXISTS idx_fund_holdings_code_date
+            ON fund_holdings (code, report_date)
         """)
 
         # stock_top_holders table - 十大流通股东
@@ -350,8 +359,8 @@ def init_schema(conn=None):
             )
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_stock_top_holders_code
-            ON stock_top_holders (code)
+            CREATE INDEX IF NOT EXISTS idx_stock_top_holders_code_date
+            ON stock_top_holders (code, report_date)
         """)
 
         # stock_lhb_stat table - 龙虎榜近期统计（近实时机构动向）

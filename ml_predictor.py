@@ -698,10 +698,10 @@ def _compute_hurst_exponent(close, period=60):
         R = np.max(Y) - np.min(Y)
         S = np.std(r, ddof=1)
 
-        if S > 0:
-            hurst[i] = R / S
+        if S > 0 and len(r) > 1:
+            hurst[i] = np.log(R / S) / np.log(len(r))  # True Hurst exponent in (0,1)
         else:
-            hurst[i] = 0.5
+            hurst[i] = 0.5  # random walk default
 
     return hurst
 
@@ -1285,7 +1285,7 @@ def walk_forward_validate(df: pd.DataFrame, features_df: pd.DataFrame,
 
             auc = _compute_auc(y_test_binary, proba_positive)
             aucs.append(auc)
-        except:
+        except Exception as e:
             aucs.append(0.5)
 
         per_split_results.append({
@@ -1386,16 +1386,18 @@ def predict_stock(code: str, history_df: pd.DataFrame,
     features = extract_features(history_df, fundamentals)
     labels = generate_labels(history_df, horizon=horizon, binary=False)
 
-    # Standardize features
-    mean = np.nanmean(features.values, axis=0)
-    std = np.nanstd(features.values, axis=0)
-    std[std == 0] = 1
-
-    X = (features.values - mean) / std
+    X = features.values
     y = labels.values
 
     # Train-test split (use last 20% for testing)
     split_idx = int(0.8 * len(X))
+
+    # Standardize using only training set statistics to prevent data leakage
+    train_mean = np.nanmean(X[:split_idx], axis=0)
+    train_std = np.nanstd(X[:split_idx], axis=0)
+    train_std[train_std == 0] = 1.0
+    X = (X - train_mean) / train_std
+
     X_train, X_test = X[:split_idx], X[split_idx:]
     y_train, y_test = y[:split_idx], y[split_idx:]
 
@@ -1465,7 +1467,7 @@ def predict_stock(code: str, history_df: pd.DataFrame,
         y_test_binary = (y_test > 0).astype(int)
         proba_positive = y_proba[:, 1] if y_proba.shape[1] == 2 else np.max(y_proba, axis=1)
         auc = _compute_auc(y_test_binary, proba_positive)
-    except:
+    except Exception as e:
         auc = 0.5
 
     return {

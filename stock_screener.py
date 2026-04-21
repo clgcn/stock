@@ -803,7 +803,7 @@ def _load_kline(code: str, analysis_days: int = 120,
 
     # 单股模式: 回退在线 API
     try:
-        return get_kline(code, period="daily", start=start, adjust="qfq")
+        return get_kline(code, period="daily", start=start, adjust="hfq")
     except Exception:
         return None
 

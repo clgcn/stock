@@ -48,8 +48,14 @@ def calc_var(
 
     # Adjust for holding period returns
     if holding_days > 1:
-        # Square root of time rule
-        adj_ret = log_ret * np.sqrt(holding_days)
+        # Use real multi-day overlapping returns instead of sqrt scaling
+        # (sqrt rule assumes i.i.d. normal, which A-share returns violate)
+        step = max(1, holding_days // 2)
+        multi_day_rets = np.array([
+            np.sum(log_ret[i:i + holding_days])
+            for i in range(0, len(log_ret) - holding_days + 1, step)
+        ])
+        adj_ret = multi_day_rets if len(multi_day_rets) >= 10 else log_ret * np.sqrt(holding_days)
     else:
         adj_ret = log_ret
 
@@ -112,7 +118,7 @@ def kelly_position(
     win_rate: float,
     avg_win_pct: float,
     avg_loss_pct: float,
-    kelly_fraction: float = 0.5,
+    kelly_fraction: float = 0.25,
 ) -> Dict:
     """
     Kelly Criterion for optimal position sizing.
@@ -126,7 +132,7 @@ def kelly_position(
         win_rate        Win rate (0~1)
         avg_win_pct     Average win percentage
         avg_loss_pct    Average loss percentage (positive number)
-        kelly_fraction  Kelly discount factor (0.5 = half-Kelly, more conservative)
+        kelly_fraction  Kelly discount factor (0.25 = quarter-Kelly, recommended for single stocks)
     """
     if avg_loss_pct <= 0:
         return {"error": "Average loss must be positive"}

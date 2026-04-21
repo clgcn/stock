@@ -834,7 +834,7 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
         start = (cn_now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
     try:
-        df = get_kline(code, period="daily", start=start, adjust="qfq", limit=500)
+        df = get_kline(code, period="daily", start=start, adjust="hfq", limit=500)
     except ValueError as e:
         # data_fetcher 对"空数据"抛 ValueError → 视为停牌候选
         raise _KlineEmpty(f"{code}: {e}")
@@ -1971,6 +1971,9 @@ def load_all_history(lookback_days: int = 250, columns: str = None) -> pd.DataFr
                 f"SELECT {col_expr} FROM stock_history WHERE close IS NOT NULL AND date >= ? ORDER BY code, date",
                 conn, params=(cutoff,))
         else:
+            # WARNING: unbounded query — full stock_history can exceed 2M rows.
+            # Only call with lookback_days=0 when the caller explicitly needs all history
+            # (e.g., long-period factor backtests). Never call this from per-request paths.
             df = db.read_sql(
                 f"SELECT {col_expr} FROM stock_history WHERE close IS NOT NULL ORDER BY code, date",
                 conn)

@@ -160,7 +160,7 @@ def _get_kline_tencent(
     if tperiod is None:
         raise ValueError(f"Tencent kline does not support period={period}")
 
-    fqt = _TENCENT_FQT_MAP.get(adjust, "qfq")
+    fqt = _TENCENT_FQT_MAP.get(adjust, "hfq")
     sym = _tencent_prefix(code)
 
     # 腾讯 param 格式: code,period,start,end,limit,fq
@@ -294,7 +294,7 @@ def get_kline(
     period: str = "daily",
     start: str = None,
     end: str = None,
-    adjust: str = "qfq",
+    adjust: str = "hfq",
     limit: int = 500,
     _skip_cache: bool = False,
 ) -> pd.DataFrame:
@@ -382,7 +382,7 @@ def get_kline_prefer_db(
     code: str,
     period: str = "daily",
     start: str = None,
-    adjust: str = "qfq",
+    adjust: str = "hfq",
     min_bars: int = 30,
     local_only: bool = False,
 ) -> pd.DataFrame:
@@ -648,7 +648,7 @@ def _cli():
     parser.add_argument("--start", type=str, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", type=str, help="End date YYYY-MM-DD")
     parser.add_argument("--days", type=int, default=250, help="Recent N days (default 250)")
-    parser.add_argument("--adjust", type=str, default="qfq", choices=["qfq","hfq","none"])
+    parser.add_argument("--adjust", type=str, default="hfq", choices=["qfq","hfq","none"])
     parser.add_argument("--realtime", action="store_true", help="Fetch realtime quotes")
     parser.add_argument("--financial", action="store_true", help="Fetch financial data")
     parser.add_argument("--plot", action="store_true", help="Generate K-line chart")

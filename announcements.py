@@ -26,6 +26,34 @@ _EARNINGS_KEYWORDS = [
     "业绩预告", "业绩快报", "业绩修正",
 ]
 
+# Extended announcement type keywords
+_CONTRACT_KEYWORDS = (
+    "中标", "签约", "重大合同", "战略合作", "中选", "框架协议",
+    "供应合同", "采购合同", "销售合同", "大客户", "重大订单", "项目合同",
+)
+# Context words indicating the "重大合同" mention is a risk disclosure, not an actual contract win
+_CONTRACT_RISK_CONTEXT = ("风险", "可能终止", "终止风险", "集中度风险", "依赖", "流失")
+
+# Staleness thresholds by announcement category (days)
+_STALENESS_DAYS = {
+    "earnings": 120,       # Financial reports valid longer
+    "contract": 90,        # Contract announcements stay relevant ~3 months
+    "investigation": 365,  # Regulatory investigations linger much longer
+    "default": 90,
+}
+_DEFAULT_STALENESS_DAYS = 90  # Default for announcements not in above categories
+_EQUITY_INCENTIVE_KEYWORDS = ("股权激励", "限制性股票", "股票期权", "期权授予")
+_DILUTION_KEYWORDS = (
+    "定向增发", "非公开发行", "配股", "可转债发行",
+    "增发预案", "配股预案",
+)
+_INVESTIGATION_KEYWORDS = (
+    "立案调查", "被调查", "违规违法", "监管处罚", "行政处罚",
+    "问询函", "年报问询", "关联交易质证",
+)
+_RESTRUCTURING_KEYWORDS = ("重大资产重组", "资产重组", "借壳", "吸收合并", "分拆上市")
+_INSIDER_KEYWORDS = ("控股股东增持", "控股股东减持", "实控人增持", "实控人减持", "大股东减持")
+
 _COLUMN_LABEL = {
     "年度报告":   "年报",
     "半年度报告": "半年报",
@@ -34,6 +62,37 @@ _COLUMN_LABEL = {
     "业绩快报":   "业绩快报",
     "定期报告":   "定期报告",
 }
+
+
+def _extract_profit_change(title: str):
+    """从公告标题提取业绩变化幅度（%）。正数为增长，负数为下降，None表示无法提取。"""
+    import re as _re
+    # Turnaround: "扭亏为盈" → sentinel +999
+    if '扭亏为盈' in title:
+        return 999.0
+    # Range pattern: "增长30%至50%" or "增长约30%-50%" → take upper bound
+    m = _re.search(r'(?:预增|增长|增加|提升|同比增).*?(\d+\.?\d*)\s*[%％].*?[至~到~-]\s*(\d+\.?\d*)\s*[%％]', title)
+    if m:
+        return float(m.group(2))  # upper bound is more informative
+    # Range decline: "下降20%至30%" → take upper (worse) bound
+    m = _re.search(r'(?:预减|下降|下滑|减少).*?(\d+\.?\d*)\s*[%％].*?[至~到~-]\s*(\d+\.?\d*)\s*[%％]', title)
+    if m:
+        return -float(m.group(2))
+    # Single percentage growth: "增长50%"
+    m = _re.search(r'(?:预增|增长|增加|提升|同比增).*?(\d+\.?\d*)\s*[%％]', title)
+    if m:
+        return float(m.group(1))
+    m = _re.search(r'(?:预减|下降|下滑|减少|预亏).*?(\d+\.?\d*)\s*[%％]', title)
+    if m:
+        return -float(m.group(1))
+    # Fold growth: "增长3倍" → +300%
+    m = _re.search(r'(?:增长|增加|提升|翻).*?(\d+\.?\d*)\s*倍', title)
+    if m:
+        return float(m.group(1)) * 100
+    # Loss keywords without percentage
+    if any(kw in title for kw in ('预亏', '首亏', '续亏', '由盈转亏')):
+        return -999.0  # 标记亏损但幅度未知
+    return None
 
 
 # ──────────────────────────────────────────
@@ -77,8 +136,14 @@ def get_announcements(code: str, page_size: int = 20, ann_type: str = "ALL") -> 
 
     results = []
     for item in items:
-        raw_date = item.get("notice_date", "")
-        date_str = raw_date[:10] if raw_date else ""
+        raw_date = str(item.get("notice_date", "") or "")
+        # Handle both "YYYY-MM-DD..." and "YYYY年MM月DD日" formats
+        if "年" in raw_date:
+            import re as _re2
+            m = _re2.search(r'(\d{4})年(\d{1,2})月(\d{1,2})日', raw_date)
+            date_str = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}" if m else ""
+        else:
+            date_str = raw_date[:10] if raw_date else ""
 
         title    = item.get("title", "").strip()
         col      = item.get("column") or {}
@@ -87,6 +152,18 @@ def get_announcements(code: str, page_size: int = 20, ann_type: str = "ALL") -> 
 
         label = _COLUMN_LABEL.get(category, category)
         is_earnings = any(kw in title or kw in category for kw in _EARNINGS_KEYWORDS)
+        profit_change_pct = _extract_profit_change(title) if is_earnings else None
+
+        # Extended classification
+        # Contract: keyword match AND not in a risk-disclosure context (false positive filter)
+        _kw_match = any(kw in title for kw in _CONTRACT_KEYWORDS)
+        _risk_ctx = any(rc in title for rc in _CONTRACT_RISK_CONTEXT)
+        has_major_contract = _kw_match and not _risk_ctx
+        has_equity_incentive = any(kw in title for kw in _EQUITY_INCENTIVE_KEYWORDS)
+        has_dilution_risk = any(kw in title for kw in _DILUTION_KEYWORDS)
+        under_investigation = any(kw in title for kw in _INVESTIGATION_KEYWORDS)
+        insider_buy = any(kw in title for kw in ("控股股东增持", "实控人增持"))
+        insider_sell = any(kw in title for kw in ("控股股东减持", "实控人减持", "大股东减持"))
 
         ann_url = (
             f"https://np-anotice-stock.eastmoney.com/api/security/ann/{art_code}"
@@ -94,12 +171,19 @@ def get_announcements(code: str, page_size: int = 20, ann_type: str = "ALL") -> 
         )
 
         results.append({
-            "date":        date_str,
-            "title":       title,
-            "category":    category,
-            "label":       label,
-            "is_earnings": is_earnings,
-            "url":         ann_url,
+            "date":               date_str,
+            "title":              title,
+            "category":           category,
+            "label":              label,
+            "is_earnings":        is_earnings,
+            "profit_change_pct":  profit_change_pct,
+            "has_major_contract": has_major_contract,
+            "has_equity_incentive": has_equity_incentive,
+            "has_dilution_risk":  has_dilution_risk,
+            "under_investigation": under_investigation,
+            "insider_buy":        insider_buy,
+            "insider_sell":       insider_sell,
+            "url":                ann_url,
         })
 
     return results
@@ -317,6 +401,21 @@ def format_earnings_analysis(
                 trends.append(f"净利润同比下滑 {abs(latest['profit_yoy']):.1f}%，盈利承压")
             else:
                 trends.append(f"净利润同比大幅下滑 {abs(latest['profit_yoy']):.1f}%，基本面走弱")
+        rv_yoy = latest.get("revenue_yoy")
+        if rv_yoy is not None:
+            if rv_yoy > 30:
+                trends.append(f"营收同比增长 {rv_yoy:.1f}%，增速强劲")
+            elif rv_yoy > 0:
+                trends.append(f"营收同比增长 {rv_yoy:.1f}%，保持正增长")
+            elif rv_yoy > -20:
+                trends.append(f"营收同比下滑 {abs(rv_yoy):.1f}%，收入承压")
+            else:
+                trends.append(f"营收同比大幅下滑 {abs(rv_yoy):.1f}%，需关注需求侧")
+            # Revenue-profit divergence warning (margin compression signal)
+            if latest.get("profit_yoy") is not None:
+                gap = rv_yoy - latest["profit_yoy"]
+                if gap > 15:
+                    trends.append(f"⚠️ 营收增速({rv_yoy:.1f}%)显著高于利润增速({latest['profit_yoy']:.1f}%)，关注费用/毛利率恶化")
         if latest["gross_margin"] is not None and prev["gross_margin"] is not None:
             gm_delta = latest["gross_margin"] - prev["gross_margin"]
             if abs(gm_delta) > 1:

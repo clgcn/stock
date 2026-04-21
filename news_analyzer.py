@@ -532,6 +532,7 @@ _BEARISH_KEYWORDS = [
     "layoff", "裁员", "slump", "萧条", "downgrade", "下调",
     "hawk", "鹰派", "bear market", "熊市", "contagion", "蔓延",
     "下行", "回落", "走低", "承压", "利空", "缩量", "恐慌",
+    "债务违约", "净流出", "破位", "技术破位", "索赔",
 ]
 
 _BULLISH_KEYWORDS = [
@@ -541,17 +542,59 @@ _BULLISH_KEYWORDS = [
     "growth", "增长", "profit", "盈利", "upgrade", "上调", "利好",
     "ceasefire", "停火", "peace", "和平", "recovery", "复苏",
     "上涨", "走高", "放量", "活跃", "回暖", "景气", "提振",
+    "扭亏为盈", "持续增长", "政策支持", "扩大内需", "并购重组",
+    # 2024-2025 A股热点主题
+    "国产替代", "出海", "央企改革", "新质生产力", "专精特新",
+    "低空经济", "人形机器人", "固态电池", "核电", "卫星互联网",
+    "股权激励", "市值管理", "中特估", "DeepSeek", "具身智能",
 ]
 
 
+_NEGATION_CHARS = {'未', '无', '不', '没', '非', '否'}
+
+
+def _negated(title: str, kw: str) -> bool:
+    """Return True if keyword is preceded by a negation within 5 chars (catches 尚未/并未/从未)."""
+    idx = title.find(kw)
+    if idx < 0:
+        return False
+    return any(c in _NEGATION_CHARS for c in title[max(0, idx - 5):idx])
+
+
+def _recency_weight(item: dict, now) -> float:
+    """Return 2.0 if news is within 6 hours, else 1.0."""
+    # Support pub_date, pub_time, or time field names
+    raw = item.get("pub_date") or item.get("pub_time") or item.get("time") or ""
+    if not raw:
+        return 1.0
+    try:
+        from datetime import datetime as _dt
+        pt = _dt.fromisoformat(str(raw)[:19])
+        if pt.tzinfo is None:
+            from _http_utils import CN_TZ
+            pt = pt.replace(tzinfo=CN_TZ)
+        return 2.0 if (now - pt).total_seconds() / 3600 <= 6 else 1.0
+    except Exception:
+        return 1.0
+
+
 def news_sentiment_delta(international: list[dict], domestic: list[dict]) -> float:
-    """基于新闻标题关键词，给出情绪微调值 [-0.3, +0.3]。"""
-    all_titles = [i["title"].lower() for i in (international + domestic)]
-    if not all_titles:
+    """基于新闻标题关键词，给出情绪微调值 [-0.3, +0.3]。近6小时新闻2倍权重，含否定词过滤。"""
+    now = cn_now()
+    all_items = international + domestic
+    if not all_items:
         return 0.0
-    bear_count = sum(1 for t in all_titles for kw in _BEARISH_KEYWORDS if kw in t)
-    bull_count = sum(1 for t in all_titles for kw in _BULLISH_KEYWORDS if kw in t)
-    raw = (bull_count - bear_count) / max(len(all_titles), 1) * 2
+
+    bear_score = 0.0
+    bull_score = 0.0
+    for item in all_items:
+        title = item.get("title", "").lower()
+        weight = _recency_weight(item, now)
+        bear_score += weight * sum(1 for kw in _BEARISH_KEYWORDS if kw in title and not _negated(title, kw))
+        bull_score += weight * sum(1 for kw in _BULLISH_KEYWORDS if kw in title and not _negated(title, kw))
+
+    total_signal = bull_score + bear_score
+    raw = (bull_score - bear_score) / max(total_signal, 1) * 2
     return round(max(-0.3, min(0.3, raw)), 2)
 
 
@@ -624,6 +667,10 @@ _STOCK_BEARISH_KEYWORDS = [
     "裁员", "冻结", "停产", "退市", "调查", "失败", "质押", "解禁", "商誉减值",
     "warning", "lawsuit", "probe", "investigation", "loss", "default", "risk",
     "下行", "承压", "利空", "被罚", "警示",
+    "债务违约", "控股权变更", "基本面恶化", "实控人变更", "立案",
+    # 2024-2025补充
+    "收到问询函", "被ST", "大股东质押", "内幕交易", "业绩暴雷",
+    "强制平仓", "债券违约", "流动性危机", "监管介入", "财务造假",
 ]
 
 _STOCK_BULLISH_KEYWORDS = [
@@ -631,17 +678,30 @@ _STOCK_BULLISH_KEYWORDS = [
     "并购", "收购", "落地", "投产", "扩产", "合作", "分红", "重组", "利好", "创新高",
     "buyback", "profit", "growth", "contract", "order", "breakthrough", "deal",
     "景气", "回暖", "提振", "获批", "中选",
+    "扭亏为盈", "大客户", "战略合作", "业绩超预期", "超额分红", "破净",
+    # 2024-2025补充
+    "国产替代", "出海", "专精特新", "新质生产力", "回A",
+    "AI+", "低空经济", "人形机器人", "大模型", "算力",
+    "股权激励", "市值管理", "中特估", "DeepSeek", "具身智能",
 ]
 
 
 def _stock_news_delta(items: list[dict]) -> float:
-    """个股新闻情绪微调 [-0.4, +0.4]"""
-    titles = [i.get("title", "").lower() for i in items]
-    if not titles:
+    """个股新闻情绪微调 [-0.4, +0.4]。近6小时新闻2倍权重，含否定词过滤（未/无/不/没）。"""
+    now = cn_now()
+    if not items:
         return 0.0
-    bear_count = sum(1 for t in titles for kw in _STOCK_BEARISH_KEYWORDS if kw in t)
-    bull_count = sum(1 for t in titles for kw in _STOCK_BULLISH_KEYWORDS if kw in t)
-    raw = (bull_count - bear_count) / max(len(titles), 1) * 2
+
+    bear_score = 0.0
+    bull_score = 0.0
+    for item in items:
+        title = item.get("title", "").lower()
+        weight = _recency_weight(item, now)
+        bear_score += weight * sum(1 for kw in _STOCK_BEARISH_KEYWORDS if kw in title and not _negated(title, kw))
+        bull_score += weight * sum(1 for kw in _STOCK_BULLISH_KEYWORDS if kw in title and not _negated(title, kw))
+
+    total_signal = bull_score + bear_score
+    raw = (bull_score - bear_score) / max(total_signal, 1) * 2
     return round(max(-0.4, min(0.4, raw)), 2)
 
 

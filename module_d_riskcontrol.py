@@ -68,6 +68,14 @@ def run_risk_control(
     if stop_loss is not None and stop_loss > 0:
         stop_loss = -stop_loss
 
+    # TODO: 重构 - risk_assessment 应返回结构化 dict 以替代文本解析
+    # 止损安全检查：正则提取失败或值不合理时使用安全默认值
+    if stop_loss is None or stop_loss == 0 or not (-50.0 < stop_loss < 0):
+        stop_loss = -8.0  # 默认8%止损，基于A股平均ATR
+    # 止盈安全检查
+    if take_profit is None or take_profit <= 0:
+        take_profit = 15.0  # 默认15%止盈
+
     # ── 基于评分卡调整仓位建议 ──
     position_advice = _compute_position_advice(scorecard, kelly, var95)
 

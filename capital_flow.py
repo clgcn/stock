@@ -164,8 +164,11 @@ def format_northbound_report(flow_data: list) -> str:
 
     lines.append("-" * 65)
 
-    # 成交额趋势分析
-    amts = [d.get("total_deal_amt", 0) for d in flow_data]
+    # 成交额趋势分析 — 过滤零流量日（港股节假日伪影）
+    amts_raw = [d.get("total_deal_amt", 0) for d in flow_data]
+    amts = [a for a in amts_raw if a > 0]  # skip HK holiday zero-flow days
+    if not amts:
+        amts = amts_raw  # fallback: no data at all, use raw
     recent5 = amts[:5]
     early5 = amts[-5:] if len(amts) >= 10 else amts[:5]
     avg_recent = sum(recent5) / len(recent5) if recent5 else 0
@@ -193,17 +196,24 @@ def format_northbound_report(flow_data: list) -> str:
         "",
     ])
 
-    # 活跃度信号判定
-    if trend_pct > 20:
-        signal = "外资成交大幅放量（参与度显著提升，关注度增强）"
-    elif trend_pct > 5:
-        signal = "外资成交温和放量（参与度上升，偏积极）"
-    elif trend_pct > -5:
-        signal = "外资成交基本持平（参与度稳定，观望为主）"
-    elif trend_pct > -20:
-        signal = "外资成交温和缩量（参与度下降，偏谨慎）"
+    # 活跃度信号判定 — 结合绝对量（>10亿为有意义参与）+ 趋势
+    _MEANINGFUL_THRESHOLD = 10.0  # 10亿/日为有意义北向参与水位
+    abs_level = "高" if avg_recent >= _MEANINGFUL_THRESHOLD else "低"
+    if avg_recent < _MEANINGFUL_THRESHOLD:
+        _trend_pfx = f"（日均{avg_recent:.1f}亿<{_MEANINGFUL_THRESHOLD}亿参考阈值，信号参考价值有限）"
     else:
-        signal = "外资成交大幅缩量（参与度显著下降，兴趣减弱）"
+        _trend_pfx = f"（日均{avg_recent:.1f}亿）"
+
+    if trend_pct > 20:
+        signal = f"外资成交大幅放量{_trend_pfx}"
+    elif trend_pct > 5:
+        signal = f"外资成交温和放量{_trend_pfx}"
+    elif trend_pct > -5:
+        signal = f"外资成交基本持平{_trend_pfx}"
+    elif trend_pct > -20:
+        signal = f"外资成交温和缩量{_trend_pfx}"
+    else:
+        signal = f"外资成交大幅缩量{_trend_pfx}"
 
     lines.extend([
         f"  北向资金活跃度信号: {signal}",
@@ -299,6 +309,9 @@ _XUEQIU_COOKIE_TTL = 3600 * 12   # 12 小时复用
 
 def _get_xueqiu_session():
     """获取已带 cookie 的 requests session, 12 小时复用一次。"""
+    # COMPLIANCE WARNING: 此实现使用浏览器指纹模拟(impersonate="chrome")，
+    # 可能违反雪球用户协议。TODO: 替换为合规数据源，
+    # 如 akshare.stock_individual_fund_flow() 等官方接口。
     global _XUEQIU_SESSION, _XUEQIU_COOKIE_TS
     now = time.time()
     if _XUEQIU_SESSION is not None and now - _XUEQIU_COOKIE_TS < _XUEQIU_COOKIE_TTL:

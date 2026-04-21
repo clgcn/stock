@@ -311,8 +311,15 @@ def compute_peg(financial_history: list, pe_ttm: float) -> dict:
     if not growths:
         return {"peg": None, "growth_rate": None, "growth_method": "无增速数据", "verdict": "无法计算"}
 
-    avg_growth = sum(growths) / len(growths)
-    method = f"近{len(growths)}期平均净利润增速"
+    # CAGR geometric mean to avoid overestimating growth with arithmetic average
+    factors_list = [(1 + g / 100) for g in growths if g is not None]
+    if factors_list and all(f > 0 for f in factors_list):
+        import functools
+        product = functools.reduce(lambda a, b: a * b, factors_list)
+        avg_growth = (product ** (1.0 / len(factors_list)) - 1) * 100
+    else:
+        avg_growth = sum(g for g in growths if g is not None) / max(len(growths), 1)
+    method = f"近{len(growths)}期CAGR净利润增速"
 
     if avg_growth <= 0:
         verdict = "净利润下滑，PEG无参考意义（负增长）"

@@ -29,6 +29,9 @@ SECTORS = {
     "公用事业": "utilities",
     "交通运输": "transportation",
     "军工": "defense",
+    "文化传媒": "media",
+    "建筑": "construction",
+    "农业": "agriculture",
     "其他": "other",
 }
 
@@ -39,18 +42,25 @@ SECTOR_CN = {v: k for k, v in SECTORS.items()}
 SECTOR_KEYWORDS = {
     "金融": ["银行", "证券", "保险", "信托", "金融", "期货"],
     "房地产": ["地产", "置业", "房产", "置地"],
+    "医药": ["医药", "药业", "生物", "医疗", "制药", "健康", "基因"],
+    "军工": ["军工", "国防", "航天", "兵器", "导弹"],
+    # 文化传媒 must appear BEFORE 科技: "游戏" stocks with "科技" in name map to media, not tech
+    "文化传媒": ["传媒", "游戏", "动画", "电影", "音乐", "影视", "出版", "广告", "媒体", "文化传媒"],
+    "科技": ["科技", "软件", "信息", "电子", "半导体", "芯片", "智能", "数据",
+             "网络", "通信", "计算机", "互联", "云计算", "大数据", "人工智能",
+             "服务器", "存储", "5G"],
     "消费": ["食品", "饮料", "酒", "乳业", "家电", "服饰", "零售", "百货", "超市",
              "旅游", "酒店", "餐饮", "教育"],
-    "医药": ["医药", "药业", "生物", "医疗", "制药", "健康", "基因"],
-    "科技": ["科技", "软件", "信息", "电子", "半导体", "芯片", "智能", "数据",
-             "网络", "通信", "计算机", "互联"],
-    "制造": ["机械", "装备", "汽车", "电气", "自动化", "仪器", "航空", "船舶"],
+    "制造": ["机械", "装备", "汽车", "电气", "自动化", "仪器", "航空", "船舶",
+             "设备", "工业", "精密"],
     "能源": ["能源", "电力", "煤炭", "石油", "天然气", "石化", "新能源", "光伏",
-             "风电", "核电"],
+             "风电", "核电", "储能", "充电桩", "锂电", "燃料电池"],
     "材料": ["钢铁", "有色", "化工", "建材", "水泥", "玻璃", "铝", "铜", "锂"],
     "公用事业": ["水务", "燃气", "环保", "供热", "供水"],
-    "交通运输": ["交通", "运输", "物流", "航运", "港口", "铁路", "公路", "快递"],
-    "军工": ["军工", "国防", "航天", "兵器", "导弹"],
+    "交通运输": ["交通", "运输", "物流", "航运", "港口", "铁路", "公路", "快递",
+                "机场", "仓储", "货运"],
+    "建筑": ["建筑", "建设", "工程", "路桥", "市政", "施工", "基建"],
+    "农业": ["农业", "种业", "养殖", "渔业", "牧业", "农产品", "畜牧"],
 }
 
 
@@ -452,10 +462,10 @@ def sector_rotation_signal() -> Dict:
     # Detect rotation phase based on sector leadership
     overweight_sectors_set = set([x['sector'] for x in overweight_list])
 
-    # Define sector groups
+    # Define sector groups — materials removed from late_cycle to avoid dual membership
     early_cycle_sectors = {'finance', 'materials', 'energy'}
     mid_cycle_sectors = {'technology', 'consumer'}
-    late_cycle_sectors = {'materials', 'energy'}
+    late_cycle_sectors = {'energy'}  # materials belongs to early_cycle only
     defensive_sectors = {'utilities', 'healthcare'}
 
     early_cycle_score = len(overweight_sectors_set & early_cycle_sectors)

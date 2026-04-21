@@ -290,7 +290,7 @@ class RiskFace:
         try:
             start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
             df = get_kline_prefer_db(stock_code, period="daily", start=start,
-                                      adjust="qfq", local_only=local_only)
+                                      adjust="hfq", local_only=local_only)
             if df is None:
                 return None, "本地DB无数据（local_only模式）"
             return df, None

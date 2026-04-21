@@ -284,6 +284,20 @@ def full_stock_analysis(
     run_short = analysis_mode in ("full", "short")
     run_long = analysis_mode in ("full", "long")
 
+    # ── ST/退市 前置拦截 ──────────────────────────────────────────────────
+    is_st = any(tag in stock_name for tag in ("ST", "*ST", "退"))
+    if is_st:
+        return (
+            f"⚠️ ST/退市风险警示  {stock_name} ({stock_code})\n\n"
+            "该标的处于 ST/退市风险区间（名称含 ST/*ST/退）:\n"
+            "· 涨跌幅限制 ±5%，日内波动受限\n"
+            "· 退市风险高，基本面因子模型不适用\n"
+            "· 不建议建立中长线仓位\n\n"
+            "如确认为壳资源重组行情，请在问题中注明"壳资源炒作"以获取专项分析。\n"
+            "否则建议转换分析标的。"
+        )
+    # ────────────────────────────────────────────────────────────────────
+
     # ══════════════════════════════════════════════════
     # 环境层 A — 市场评级 H/M/L（每次必跑）
     # ══════════════════════════════════════════════════
@@ -1039,9 +1053,9 @@ def full_stock_selection(
             outer_pool.submit(_analyze_one, idx, item): idx
             for idx, item in enumerate(picks_for_review[:actual_review], 1)
         }
-        for fut in as_completed(futures):
+        for fut in as_completed(futures, timeout=300):
             try:
-                review_results.append(fut.result())
+                review_results.append(fut.result(timeout=25))
             except Exception as e:
                 i = futures[fut]
                 review_results.append({
@@ -1192,7 +1206,7 @@ def kline_data(
     start_date: str = "",
     end_date: str = "",
     recent_days: int = 60,
-    adjust: str = "qfq",
+    adjust: str = "hfq",
     with_indicators: bool = True,
 ) -> str:
     """
@@ -1206,7 +1220,7 @@ def kline_data(
     start_date      : str   Start date "YYYY-MM-DD", if empty uses recent_days
     end_date        : str   End date "YYYY-MM-DD", if empty uses today
     recent_days     : int   Effective when start_date is empty, fetch recent N days, default 60
-    adjust          : str   Adjustment: qfq (forward, default) / hfq (backward) / none
+    adjust          : str   Adjustment: hfq (backward, default) / qfq (forward) / none
     with_indicators : bool  Whether to compute MA/MACD/RSI/BOLL/KDJ, default True
 
     Returns
@@ -1357,6 +1371,11 @@ def batch_quote(stock_list: str) -> str:
 
     df = df.sort_values("pct_chg", ascending=False).reset_index(drop=True)
 
+    warning = ""
+    if len(df) < len(codes):
+        failed = set(codes) - set(df["code"].tolist())
+        warning = f"  WARNING: {len(failed)} code(s) returned no data: {', '.join(sorted(failed))}\n"
+
     lines = ["Batch Quote Overview", f"  Total {len(df)} stocks   {df.iloc[0]['date']} {df.iloc[0]['time']}",
              "-" * 65,
              f"  {'Name':<8} {'Code':<8} {'Latest':>8} {'Chg%':>8} {'Change':>7} {'Vol(lots)':>12} {'Turnover(10k)':>12}",
@@ -1378,7 +1397,10 @@ def batch_quote(stock_list: str) -> str:
     down = (df["pct_chg"] < 0).sum()
     flat = len(df) - up - down
     lines.append(f"  Up {up} / Flat {flat} / Down {down}")
-    return "\n".join(lines)
+    result = "\n".join(lines)
+    if warning:
+        result = warning + result
+    return result
 
 
 # =====================================================
@@ -1428,7 +1450,7 @@ def stock_diagnosis(
 
     data_source = "online"
     try:
-        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="qfq")
+        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="hfq")
     except Exception as e:
         try:
             df = sf.load_stock_history(stock_code)
@@ -1630,7 +1652,7 @@ def strategy_backtest(
     start = (cn_now() - timedelta(days=backtest_days)).strftime("%Y-%m-%d")
 
     try:
-        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="qfq")
+        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="hfq")
     except Exception as e:
         return f"ERROR: Failed to fetch K-line data: {e}"
 
@@ -1705,7 +1727,7 @@ def risk_assessment(
     start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
     try:
-        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="qfq")
+        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="hfq")
     except Exception as e:
         return f"ERROR: Failed to fetch K-line data: {e}"
 
@@ -2770,11 +2792,23 @@ def sector_analysis() -> str:
 @mcp.tool()
 def factor_analysis(stock_code: str = "") -> str:
     """
-    Multi-factor analysis. If stock_code is provided, shows factor exposure for that stock.
-    If empty, shows cross-sectional factor rankings for top stocks.
+    Multi-factor analysis tool with two operating modes:
+
+    Mode 1 — Single-stock factor exposure (stock_code provided, e.g. "600519"):
+      Returns z-scored factor values (Value, Quality, Momentum, Volatility, Size, Liquidity,
+      Leverage, Reversal) for that stock vs universe. Positive z > +1 = top quartile.
+
+    Mode 2 — Cross-sectional rankings (stock_code="" or omitted):
+      Runs composite_alpha_score across all stocks in the universe and returns top/bottom
+      ranked stocks by alpha. Use this for stock screening or factor crowding checks.
+      Factors exceeding 80% crowding trigger a WARNING in the output.
 
     Args:
-        stock_code: Optional. Single stock code for factor exposure analysis.
+        stock_code: Optional stock code (e.g. "600519"). Leave empty for cross-sectional view.
+
+    Examples:
+        factor_analysis("600519")  → factor exposure for Kweichow Moutai
+        factor_analysis("")        → cross-sectional alpha rankings for all stocks
     """
     try:
         import factor_model as fm
@@ -2859,7 +2893,31 @@ def factor_analysis(stock_code: str = "") -> str:
                     except Exception:
                         continue
 
+                # Build sector map for neutralization
+                sector_map = {}
+                try:
+                    sector_rows = db.fetchall(conn,
+                        "SELECT code, sector FROM stocks WHERE suspended = 0")
+                    sector_map = {r[0]: (r[1] or "unknown") for r in sector_rows}
+                except Exception:
+                    pass
+
                 if all_factors:
+                    # Apply sector neutralization (0.7 strength) to reduce hot-sector clustering
+                    try:
+                        import pandas as _pd
+                        factor_df = _pd.DataFrame(
+                            [item["factors"] for item in all_factors],
+                            index=[item["code"] for item in all_factors],
+                        )
+                        if sector_map and not factor_df.empty:
+                            factor_df = fm.sector_neutralize(factor_df, sector_map)
+                            for item in all_factors:
+                                if item["code"] in factor_df.index:
+                                    item["factors"] = factor_df.loc[item["code"]].to_dict()
+                    except Exception:
+                        pass  # fallback: use raw factors without neutralization
+
                     # Show top factors
                     all_factor_names = set()
                     for item in all_factors:
@@ -2950,15 +3008,18 @@ def institutional_holdings(stock_code: str) -> str:
         try:
             _db_conn = sf._get_db()
             try:
-                db.init_schema(_db_conn)
-            except Exception:
-                pass
-            fund_cnt_row = db.fetchone(_db_conn,
-                "SELECT COUNT(*) FROM fund_holdings WHERE code = ?", (code,))
-            holder_cnt_row = db.fetchone(_db_conn,
-                "SELECT COUNT(*) FROM stock_top_holders WHERE code = ?", (code,))
-            db_fund_cnt = (fund_cnt_row[0] if fund_cnt_row else 0) or 0
-            db_holder_cnt = (holder_cnt_row[0] if holder_cnt_row else 0) or 0
+                try:
+                    db.init_schema(_db_conn)
+                except Exception:
+                    pass
+                fund_cnt_row = db.fetchone(_db_conn,
+                    "SELECT COUNT(*) FROM fund_holdings WHERE code = ?", (code,))
+                holder_cnt_row = db.fetchone(_db_conn,
+                    "SELECT COUNT(*) FROM stock_top_holders WHERE code = ?", (code,))
+                db_fund_cnt = (fund_cnt_row[0] if fund_cnt_row else 0) or 0
+                db_holder_cnt = (holder_cnt_row[0] if holder_cnt_row else 0) or 0
+            finally:
+                _db_conn.close()
         except Exception as e:
             db_fund_cnt = 0
             db_holder_cnt = 0
@@ -2996,11 +3057,14 @@ def institutional_holdings(stock_code: str) -> str:
         # ── 3. 尝试入库 (失败不影响报告输出) ──
         try:
             conn = sf._get_db()
-            db.init_schema(conn)
-            if holdings and holdings.get("items"):
-                store_fund_holdings(conn, code, holdings)
-            if holders and holders.get("items"):
-                store_top_holders(conn, code, holders)
+            try:
+                db.init_schema(conn)
+                if holdings and holdings.get("items"):
+                    store_fund_holdings(conn, code, holdings)
+                if holders and holders.get("items"):
+                    store_top_holders(conn, code, holders)
+            finally:
+                conn.close()
         except Exception as e:
             errors.append(f"入库: {e}")
             print(f"[institutional_holdings] store failed for {code}: {e}", file=sys.stderr)
@@ -3166,15 +3230,18 @@ def institutional_realtime(stock_code: str) -> str:
         # 快照表若为空, 先抓一次(各覆盖全市场, 很快)
         try:
             conn = sf._get_db()
-            db.init_schema(conn)
-            lhb_row = db.fetchone(conn,
-                "SELECT COUNT(*) FROM stock_lhb_stat WHERE period = '近一月'")
-            if not lhb_row or (lhb_row[0] or 0) == 0:
-                refresh_lhb_stat(conn=conn, period="近一月")
-            dzjy_row = db.fetchone(conn,
-                "SELECT COUNT(*) FROM stock_dzjy_stat WHERE period = '近一月'")
-            if not dzjy_row or (dzjy_row[0] or 0) == 0:
-                refresh_dzjy_stat(conn=conn, period="近一月")
+            try:
+                db.init_schema(conn)
+                lhb_row = db.fetchone(conn,
+                    "SELECT COUNT(*) FROM stock_lhb_stat WHERE period = '近一月'")
+                if not lhb_row or (lhb_row[0] or 0) == 0:
+                    refresh_lhb_stat(conn=conn, period="近一月")
+                dzjy_row = db.fetchone(conn,
+                    "SELECT COUNT(*) FROM stock_dzjy_stat WHERE period = '近一月'")
+                if not dzjy_row or (dzjy_row[0] or 0) == 0:
+                    refresh_dzjy_stat(conn=conn, period="近一月")
+            finally:
+                conn.close()
         except Exception:
             pass
 

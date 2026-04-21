@@ -239,7 +239,7 @@ def backtest(
     strategy_name: str = "ma_cross",
     strategy_params: dict = None,
     initial_capital: float = 100000,
-    commission: float = 0.001,     # One-way commission 0.1%
+    commission: float = 0.0003,    # One-way commission 万3 (A-share standard)
     slippage: float = 0.001,       # Slippage 0.1%
     stamp_tax: float = 0.001,      # Stamp tax (sell side only) 0.1%
     max_position: float = 1.0,     # Maximum position ratio
@@ -287,81 +287,69 @@ def backtest(
     capital = initial_capital
     shares = 0
     entry_price = 0
-    buy_bar_idx = -999  # Track which bar we bought on (for T+1 settlement)
+    # T+1: orders queued at close of day T execute at open of day T+1
+    pending_order = None  # 'buy' or 'sell'
+    pending_order_days = 0  # bars the pending order has been waiting
+    MAX_PENDING_DAYS = 10  # force-close if stuck (e.g., consecutive limit-down)
     trades = []
     equity_curve = []
     positions = []
     trade_log = []
 
+    # Pre-compute column existence — pandas Series has no .get(); check once before loop
+    _has_open_col = "open" in df_bt.columns
+    _has_volume_col = "volume" in df_bt.columns
+
     # Get price limit for this stock
     price_limit_pct = _get_price_limit(code, name)
 
     for i in range(n):
-        price = df_bt.iloc[i]["close"]
+        close = df_bt.iloc[i]["close"]
+        # Use open price for order execution; fall back to close if column absent
+        open_price = df_bt.iloc[i]["open"] if _has_open_col else close
         sig = signal.iloc[i]
 
         # Feature 3: Stock Suspension Handling
-        # If volume is zero or missing, treat as suspended day
-        volume = df_bt.iloc[i].get("volume", 0)
+        volume = df_bt.iloc[i]["volume"] if _has_volume_col else 0
         is_suspended = volume <= 0 or pd.isna(volume)
 
         # Feature 1: 涨跌停 (Daily Price Limit) Handling
-        prev_close = df_bt.iloc[i - 1]["close"] if i > 0 else price
-        is_limit_up_flag = _is_limit_up(price, prev_close, price_limit_pct)
-        is_limit_down_flag = _is_limit_down(price, prev_close, price_limit_pct)
+        prev_close = df_bt.iloc[i - 1]["close"] if i > 0 else close
+        is_limit_up_flag = _is_limit_up(close, prev_close, price_limit_pct)
+        is_limit_down_flag = _is_limit_down(close, prev_close, price_limit_pct)
 
-        # Stop-loss / take-profit check (when holding)
-        if shares > 0 and entry_price > 0:
-            pnl_pct = (price - entry_price) / entry_price
-            if stop_loss > 0 and pnl_pct < -stop_loss:
-                sig = -1  # Trigger stop-loss
-            if take_profit > 0 and pnl_pct > take_profit:
-                sig = -1  # Trigger take-profit
+        # --- Execute pending orders at today's open (T+1 settlement) ---
+        if pending_order == "buy" and shares == 0 and not is_suspended:
+            buy_price = open_price * (1 + slippage)
+            buy_amount = capital * max_position
+            new_shares = int(buy_amount / buy_price / 100) * 100
+            if new_shares == 0:
+                new_shares = 100  # minimum 1 lot for backtest validation
+            cost = new_shares * buy_price * (1 + commission)
+            capital -= cost
+            shares = new_shares
+            entry_price = buy_price
+            trade_log.append({
+                "date": df_bt.iloc[i]["date"],
+                "action": "BUY",
+                "price": round(buy_price, 2),
+                "shares": shares,
+                "cost": round(cost, 2),
+            })
+            pending_order = None
+            pending_order_days = 0
 
-        # Buy
-        if sig == 1 and shares == 0 and not is_suspended:
-            # Cannot buy on limit up day
-            if is_limit_up_flag:
-                sig = 0  # Cancel buy order
-            else:
-                buy_price = price * (1 + slippage)
-                buy_amount = capital * max_position
-                shares = int(buy_amount / buy_price / 100) * 100  # A-share: multiples of 100
-                # If insufficient for 1 lot, allow 100 shares for backtest purposes
-                if shares == 0 and buy_amount >= buy_price:
-                    shares = 100
-                elif shares == 0 and buy_amount < buy_price:
-                    shares = 100  # Allow minimum 1 lot for strategy validation
-                if shares > 0:
-                    cost = shares * buy_price * (1 + commission)
-                    capital -= cost
-                    entry_price = buy_price
-                    buy_bar_idx = i  # Feature 2: T+1 Settlement tracking
-                    trade_log.append({
-                        "date": df_bt.iloc[i]["date"],
-                        "action": "BUY",
-                        "price": round(buy_price, 2),
-                        "shares": shares,
-                        "cost": round(cost, 2),
-                    })
-
-        # Sell
-        elif sig == -1 and shares > 0 and not is_suspended:
-            # Feature 2: T+1 Settlement - cannot sell on same day as buy
-            if i <= buy_bar_idx:
-                sig = 0  # Cancel sell order (T+1 rule)
-            # Cannot sell on limit down day (but stop-loss can queue for next available)
-            elif is_limit_down_flag:
-                sig = 0  # Cancel sell order
-            else:
-                sell_price = price * (1 - slippage)
+        elif pending_order == "sell" and shares > 0 and not is_suspended:
+            force_sell = pending_order_days >= MAX_PENDING_DAYS  # timeout: consecutive limit-down
+            if not is_limit_down_flag or force_sell:
+                exec_price = open_price  # always execute at open (forced or not); limit-down close is untradeable
+                sell_price = exec_price * (1 - slippage)
                 revenue = shares * sell_price * (1 - commission - stamp_tax)
                 pnl = revenue - (shares * entry_price * (1 + commission))
                 capital += revenue
-
                 trade_log.append({
                     "date": df_bt.iloc[i]["date"],
-                    "action": "SELL",
+                    "action": "SELL" if not force_sell else "SELL(FORCED)",
                     "price": round(sell_price, 2),
                     "shares": shares,
                     "revenue": round(revenue, 2),
@@ -371,8 +359,34 @@ def backtest(
                 trades.append(pnl)
                 shares = 0
                 entry_price = 0
+                pending_order = None
+                pending_order_days = 0
+            # else: limit down and not timed out → retry next bar
 
-        total_equity = capital + shares * price
+        # Increment pending counter when order remains unfilled
+        if pending_order is not None:
+            pending_order_days += 1
+        else:
+            pending_order_days = 0
+
+        # --- Stop-loss / take-profit check at today's close ---
+        if shares > 0 and entry_price > 0 and pending_order is None:
+            pnl_pct = (close - entry_price) / entry_price
+            if stop_loss > 0 and pnl_pct < -stop_loss:
+                pending_order = "sell"
+            elif take_profit > 0 and pnl_pct > take_profit:
+                pending_order = "sell"
+
+        # --- Queue new orders from strategy signal ---
+        # T+1 naturally enforced: buy queued day T executes day T+1 open;
+        # earliest sell signal fires day T+1 close → executes day T+2 open.
+        if pending_order is None and not is_suspended:
+            if sig == 1 and shares == 0 and not is_limit_up_flag:
+                pending_order = "buy"
+            elif sig == -1 and shares > 0 and not is_limit_down_flag:
+                pending_order = "sell"
+
+        total_equity = capital + shares * close
         equity_curve.append(total_equity)
         positions.append(1 if shares > 0 else 0)
 
@@ -427,11 +441,11 @@ def _calc_metrics(equity_curve, trades, trade_log,
     excess_std = np.std(excess_ret, ddof=1) if len(excess_ret) > 1 else 0
     sharpe = (np.mean(excess_ret) / excess_std * np.sqrt(252)) if excess_std > 1e-10 else 0
 
-    # -- Sortino ratio --
-    downside = daily_ret[daily_ret < 0]
-    downside_std = np.std(downside, ddof=1) if len(downside) > 1 else 0
-    sortino = (np.mean(daily_ret) * 252 - 0.03) / (downside_std * np.sqrt(252)) \
-        if downside_std > 1e-10 else 0
+    # -- Sortino ratio — full-sample semi-variance (includes all days, not just negative) --
+    rf_daily_sortino = 0.03 / 252
+    downside_ret = np.minimum(daily_ret - rf_daily_sortino, 0)
+    downside_dev = np.sqrt(np.mean(downside_ret ** 2)) * np.sqrt(252)
+    sortino = (np.mean(daily_ret) * 252 - 0.03) / downside_dev if downside_dev > 1e-10 else 0
 
     # -- Calmar ratio --
     calmar = cagr / max_drawdown if max_drawdown > 0 else 0
