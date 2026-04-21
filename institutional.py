@@ -18,8 +18,8 @@
 import time
 import logging
 import db
-from datetime import datetime, timedelta
-from _http_utils import cn_now, cn_str
+from datetime import timedelta, date
+from _http_utils import cn_now
 
 _log = logging.getLogger(__name__)
 
@@ -47,7 +47,7 @@ def _quarter_date_str(report_date: str = None) -> str:
 # 1. 基金持仓 — 某只股票被哪些基金持有
 # ══════════════════════════════════════════════════════════════
 
-def get_fund_holdings(code: str, **_kwargs) -> dict:
+def get_fund_holdings(code: str, report_date: str = None, **_kwargs) -> dict:
     """
     通过 AKShare (新浪财经) 获取某只股票的基金持仓。
 
@@ -56,6 +56,7 @@ def get_fund_holdings(code: str, **_kwargs) -> dict:
 
     Args:
         code: 股票代码 (如 "600519")
+        report_date: 指定报告期 "YYYY-MM-DD"; None 时返回数据源最新一期
 
     Returns:
         {
@@ -95,10 +96,19 @@ def get_fund_holdings(code: str, **_kwargs) -> dict:
                    code, list(df.columns))
         return empty
 
-    # 取最新一期 (截止日期最大)
+    # 取最新一期 (截止日期最大), 或调用方指定的 report_date
     df["截止日期"] = df["截止日期"].astype(str)
-    latest_date = df["截止日期"].max()
-    latest = df[df["截止日期"] == latest_date].copy()
+    if report_date:
+        target = report_date[:10]
+        subset = df[df["截止日期"].str[:10] == target]
+        if subset.empty:
+            # 该股票在数据源里没有该季度数据, 返回空而不是回落到 max
+            return empty
+        latest = subset.copy()
+        latest_date = target
+    else:
+        latest_date = df["截止日期"].max()
+        latest = df[df["截止日期"] == latest_date].copy()
 
     # 转换日期格式: "2024-12-31" (可能是 datetime.date 或 str)
     report_date = str(latest_date)[:10]
@@ -161,7 +171,7 @@ def _classify_holder_type(name: str) -> str:
     return "individual"
 
 
-def get_top_holders(code: str) -> dict:
+def get_top_holders(code: str, report_date: str = None) -> dict:
     """
     通过 AKShare 获取某只股票的十大流通股东。
 
@@ -201,7 +211,7 @@ def get_top_holders(code: str) -> dict:
     # ── 主数据源: 东财个股页 ──
     try:
         sym = _ak_symbol(code)
-        date_str = _quarter_date_str()
+        date_str = _quarter_date_str(report_date)
         try:
             df = ak.stock_gdfx_free_top_10_em(symbol=sym, date=date_str)
         except Exception as fetch_err:
@@ -276,10 +286,18 @@ def get_top_holders(code: str) -> dict:
                    code, list(df.columns))
         return empty_result
 
-    # 取最新一期
+    # 取最新一期 (或调用方指定的 report_date)
     df["截止日期"] = df["截止日期"].astype(str)
-    latest_date = df["截止日期"].max()
-    latest = df[df["截止日期"] == latest_date].copy()
+    if report_date:
+        target = report_date[:10]
+        subset = df[df["截止日期"].str[:10] == target]
+        if subset.empty:
+            return empty_result
+        latest = subset.copy()
+        latest_date = target
+    else:
+        latest_date = df["截止日期"].max()
+        latest = df[df["截止日期"] == latest_date].copy()
     report_date = str(latest_date)[:10]
 
     items = []
@@ -321,9 +339,69 @@ def _db_safe(v):
     return v
 
 
+_QUARTER_ENDS = {"03-31", "06-30", "09-30", "12-31"}
+
+
+def _is_quarter_end(report_date: str) -> bool:
+    """是否合法季末日期 YYYY-(03-31|06-30|09-30|12-31)。"""
+    if not report_date or not isinstance(report_date, str):
+        return False
+    rd = report_date.strip()[:10]
+    if len(rd) != 10 or rd[4] != "-" or rd[7] != "-":
+        return False
+    return rd[5:] in _QUARTER_ENDS
+
+
+def _snap_to_quarter_end(report_date: str) -> str:
+    """把任意日期 snap 到"所属季度的末日"。
+    A 股机构持仓按法定只在季末披露, 非季末日期的数据源通常是非标滚动披露,
+    入库时统一归到所属季末, 防止脏日期混入。
+
+    例:
+      2026-03-23 → 2026-03-31  (Q1)
+      2026-04-05 → 2026-06-30  (Q2)
+      2026-07-15 → 2026-09-30  (Q3)
+    """
+    try:
+        rd = report_date.strip()[:10]
+        y = int(rd[:4])
+        m = int(rd[5:7])
+        if m <= 3:  return f"{y}-03-31"
+        if m <= 6:  return f"{y}-06-30"
+        if m <= 9:  return f"{y}-09-30"
+        return f"{y}-12-31"
+    except Exception:
+        return ""
+
+
+def _validate_report_date(report_date: str, table: str, code: str) -> str:
+    """规范化 report_date:
+       - 合法季末 → 原样返回
+       - 非季末但可解析 → snap 到所属季末, 记 warning
+       - 无法解析 → 返回 "", 调用方应跳过入库
+    """
+    if _is_quarter_end(report_date):
+        return report_date.strip()[:10]
+    snapped = _snap_to_quarter_end(report_date)
+    if snapped and _is_quarter_end(snapped):
+        _log.warning(
+            "[%s] %s: report_date=%r 不是季末, snap 到 %s",
+            table, code, report_date, snapped,
+        )
+        return snapped
+    _log.warning(
+        "[%s] %s: 无法解析 report_date=%r, 拒绝入库", table, code, report_date,
+    )
+    return ""
+
+
 def store_fund_holdings(conn, code: str, holdings: dict) -> int:
     """将基金持仓数据写入 fund_holdings 表。返回入库条数。"""
     report_date = holdings.get("report_date", "")
+    if not report_date:
+        return 0
+    # ── Guard: 非季末拒绝 / snap 到季末 ──
+    report_date = _validate_report_date(report_date, "fund_holdings", code)
     if not report_date:
         return 0
 
@@ -356,6 +434,10 @@ def store_fund_holdings(conn, code: str, holdings: dict) -> int:
 def store_top_holders(conn, code: str, holders: dict) -> int:
     """将十大流通股东数据写入 stock_top_holders 表。返回入库条数。"""
     report_date = holders.get("report_date", "")
+    if not report_date:
+        return 0
+    # ── Guard: 新浪回退路径会返回非季末 (如 2026-03-23),snap 或拒绝 ──
+    report_date = _validate_report_date(report_date, "stock_top_holders", code)
     if not report_date:
         return 0
 
@@ -508,6 +590,124 @@ def fetch_institutional_batch(
             "done": done,
             "errors": errors,
         }
+    finally:
+        if own_conn:
+            conn.close()
+
+
+def fetch_full_quarter(
+    target_quarter: str,
+    *,
+    skip_if_exists: bool = True,
+    batch_size: int = 100,
+    interval: float = 1.0,
+    do_funds: bool = True,
+    do_top_holders: bool = True,
+    conn=None,
+    start_offset: int = 0,
+    limit: int = 0,
+) -> dict:
+    """针对某一个"季末日期", 对全市场 3000 只股票做一次完整机构持仓回填。
+
+    与 fetch_institutional_batch 的区别:
+      - fetch_institutional_batch 是"滚动刷新"逻辑 (7 天过期重抓), 不保证一季度完整
+      - fetch_full_quarter 是"一次性回填某季度", 遍历全部活跃股票, 每只抓一次,
+        确保 stock_top_holders / fund_holdings 在该 quarter 的覆盖率接近 100%
+
+    适用场景: 初始化 DB / 季报披露期结束后补齐 / 修复覆盖率低的历史数据
+
+    Args:
+        target_quarter:  目标季末 YYYY-MM-DD, 必须是 03-31/06-30/09-30/12-31
+        skip_if_exists:  True=该 code 在该 quarter 已有数据则跳过 (断点续传),
+                         False=强制重抓
+        batch_size:      每批报 log 的数量
+        interval:        每只股票之间 sleep 多少秒 (防封)
+        do_funds/do_top_holders: 两种数据可单独开关
+        start_offset:    从第几只开始 (CLI 中分片续跑)
+        limit:           最多处理多少只 (0=不限)
+
+    Returns: dict(total, processed, skipped, funds_stored, top_stored, errors)
+    """
+    if not _is_quarter_end(target_quarter):
+        raise ValueError(f"target_quarter 必须是季末日期, 收到: {target_quarter!r}")
+
+    own_conn = conn is None
+    if own_conn:
+        conn = db.get_conn()
+        db.init_schema(conn)
+
+    stats = {
+        "target_quarter": target_quarter,
+        "total": 0, "processed": 0, "skipped": 0,
+        "funds_stored": 0, "top_stored": 0,
+        "errors": [],
+    }
+    try:
+        all_codes = [r[0] for r in db.fetchall(conn,
+            "SELECT code FROM stocks "
+            "WHERE suspended = 0 AND name NOT LIKE '%ST%' "
+            "AND name NOT LIKE '%退%' "
+            "ORDER BY code")]
+        if start_offset > 0:
+            all_codes = all_codes[start_offset:]
+        if limit > 0:
+            all_codes = all_codes[:limit]
+        stats["total"] = len(all_codes)
+
+        # 断点续传: 已有 target_quarter 数据的 code
+        existing_funds = set()
+        existing_top = set()
+        if skip_if_exists:
+            if do_funds:
+                existing_funds = set(r[0] for r in db.fetchall(conn,
+                    "SELECT DISTINCT code FROM fund_holdings WHERE report_date = ?",
+                    (target_quarter,)))
+            if do_top_holders:
+                existing_top = set(r[0] for r in db.fetchall(conn,
+                    "SELECT DISTINCT code FROM stock_top_holders WHERE report_date = ?",
+                    (target_quarter,)))
+
+        # 按目标季度逐只抓取; target_quarter 通过参数传入 get_*, 不再覆盖全局
+        for i, code in enumerate(all_codes, 1):
+            need_funds = do_funds and code not in existing_funds
+            need_top = do_top_holders and code not in existing_top
+
+            if not need_funds and not need_top:
+                stats["skipped"] += 1
+                continue
+
+            try:
+                if need_funds:
+                    h = get_fund_holdings(code, report_date=target_quarter)
+                    n = store_fund_holdings(conn, code, h)
+                    stats["funds_stored"] += n
+                if need_top:
+                    h = get_top_holders(code, report_date=target_quarter)
+                    n = store_top_holders(conn, code, h)
+                    stats["top_stored"] += n
+            except KeyboardInterrupt:
+                raise  # 让上层处理 Ctrl-C
+            except Exception as e:
+                # 错误列表只保留前 200 条, 避免全市场全崩时爆内存
+                if len(stats["errors"]) < 200:
+                    stats["errors"].append(f"{code}: {type(e).__name__}: {e}")
+                _log.warning("[%s] %s 抓取失败: %s", target_quarter, code, e)
+
+            stats["processed"] += 1
+
+            if stats["processed"] % batch_size == 0:
+                _log.info(
+                    "[%s] 进度 %d/%d processed=%d skipped=%d funds=+%d top=+%d errors=%d",
+                    target_quarter, i, len(all_codes),
+                    stats["processed"], stats["skipped"],
+                    stats["funds_stored"], stats["top_stored"],
+                    len(stats["errors"]),
+                )
+
+            if interval > 0 and i < len(all_codes):
+                time.sleep(interval)
+
+        return stats
     finally:
         if own_conn:
             conn.close()
@@ -670,11 +870,71 @@ def format_institutional_report(code: str, conn=None) -> str:
         name = name_row[0] if name_row else code
 
         score_data = institutional_score(code, conn)
-        target_q = _current_report_quarter()
+
+        # ── 新鲜度元数据 ──
+        # A 股机构持仓法定只在季末披露, 且 fund_holdings (T+15) 与
+        # stock_top_holders (年报/半年报 T+60/90) 披露节奏不同, 所以
+        # 两张表的"最新报告期"可能错开一个季度. 这里分别给出.
+        _ALLOWED_TABLES = ("stock_top_holders", "fund_holdings")
+
+        def _max_rd(table: str) -> tuple:
+            """返回 (max_report_date, lag_days) for a code in given table.
+
+            注意: table 必须是白名单内的表名, f-string 拼接只为兼容 SQLite
+            (不接受 ? 占位符绑定表名). 白名单防御 SQL 注入.
+            """
+            if table not in _ALLOWED_TABLES:
+                raise ValueError(f"table must be one of {_ALLOWED_TABLES}")
+            r = db.fetchone(conn,
+                f"SELECT MAX(report_date) FROM {table} WHERE code = ?", (code,))
+            rd = r[0] if r and r[0] else None
+            if not rd:
+                return (None, None)
+            rd_str = rd if isinstance(rd, str) else str(rd)
+            try:
+                lag = (cn_now().date() - date.fromisoformat(rd_str[:10])).days
+            except Exception:
+                lag = None
+            return (rd_str[:10], lag)
+
+        top_rd, top_lag = _max_rd("stock_top_holders")
+        fund_rd, fund_lag = _max_rd("fund_holdings")
+
+        # 全市场同期覆盖度 (用各表自己的 max 日期)
+        def _full_cov(table: str, rd: str) -> int:
+            if table not in _ALLOWED_TABLES:
+                raise ValueError(f"table must be one of {_ALLOWED_TABLES}")
+            if not rd:
+                return 0
+            r = db.fetchone(conn,
+                f"SELECT COUNT(DISTINCT code) FROM {table} WHERE report_date = ?",
+                (rd,))
+            return r[0] if r else 0
+
+        cov_top = _full_cov("stock_top_holders", top_rd)
+        cov_fund = _full_cov("fund_holdings", fund_rd)
+
+        # "数据多老了" 用两者更大的 lag (即更老的那份数据) 做保守判断,
+        # 这样只要任一表 > 90 天, 就提示调仓风险.
+        max_lag_days = max(
+            (l for l in (top_lag, fund_lag) if l is not None),
+            default=None,
+        )
+
+        def _fmt_one(label: str, rd: str, lag: int, cov: int) -> str:
+            if not rd:
+                return f"{label}: (无数据)"
+            s = f"{label}: {rd}"
+            if lag is not None:
+                s += f" (距今 {lag}d)"
+            if cov:
+                s += f" | 全市场覆盖 {cov}只"
+            return s
 
         lines = [
             f"机构持仓报告: {code} {name}",
-            f"报告期: {score_data['report_date'] or target_q}",
+            _fmt_one("十大股东", top_rd, top_lag, cov_top),
+            _fmt_one("基金持仓", fund_rd, fund_lag, cov_fund),
             "=" * 55,
             "",
             f"机构共识度评分: {score_data['score']}/100",
@@ -684,13 +944,32 @@ def format_institutional_report(code: str, conn=None) -> str:
             "",
         ]
 
+        # ── 新鲜度提示 ──
+        # 1) >90 天: 强警告 (期间可能大幅调仓)
+        # 2) top_holders 覆盖 <1000: 提示跑 bulk-sync
+        if max_lag_days is not None and max_lag_days > 90:
+            lines.append(
+                f"⚠️  数据距今 {max_lag_days} 天. A 股机构持仓按季度披露, "
+                f"期间机构可能已大幅调仓. 要看当前动向请用 "
+                f"institutional_realtime / northbound_flow / moneyflow."
+            )
+            lines.append("")
+        elif top_rd and cov_top < 1000:
+            lines.append(
+                f"ℹ️  数据库中 {top_rd} 的十大股东覆盖仅 {cov_top}只 / ~3000. "
+                f"如数据缺失, 运行: python sync_institutional_full.py --quarter {top_rd}"
+            )
+            lines.append("")
+
         # ── 十大流通股东 ──
+        # 用 top_rd (该只股票该表的实际最新 report_date) 精确匹配,
+        # 避免 target_q 是"预期季度"但该股票数据还在上一季度时查不到.
         holders = db.fetchall(conn,
             "SELECT rank, holder_name, holder_type, hold_pct, "
             "change_shares, change_type "
-            "FROM stock_top_holders WHERE code = ? AND report_date >= ? "
+            "FROM stock_top_holders WHERE code = ? AND report_date = ? "
             "ORDER BY rank",
-            (code, target_q))
+            (code, top_rd)) if top_rd else []
 
         if holders:
             lines.append("十大流通股东:")
@@ -715,9 +994,9 @@ def format_institutional_report(code: str, conn=None) -> str:
         # ── 前10大持仓基金 ──
         funds = db.fetchall(conn,
             "SELECT fund_name, nav_pct, hold_mv "
-            "FROM fund_holdings WHERE code = ? AND report_date >= ? "
+            "FROM fund_holdings WHERE code = ? AND report_date = ? "
             "ORDER BY hold_mv DESC NULLS LAST LIMIT 10",
-            (code, target_q))
+            (code, fund_rd)) if fund_rd else []
 
         if funds:
             lines.append(f"前10大持仓基金 (共{score_data['fund_count']}只):")
