@@ -339,6 +339,12 @@ def _db_safe(v):
     return v
 
 
+def _get_stock_name(conn, code: str) -> str:
+    """从 stocks 表查股票名, 查不到时 fallback 到 code 本身."""
+    r = db.fetchone(conn, "SELECT name FROM stocks WHERE code=?", (code,))
+    return r[0] if r else code
+
+
 _QUARTER_ENDS = {"03-31", "06-30", "09-30", "12-31"}
 
 
@@ -544,9 +550,7 @@ def fetch_institutional_batch(
         errors = []
 
         for i, code in enumerate(batch):
-            name = db.fetchone(conn,
-                "SELECT name FROM stocks WHERE code=?", (code,))
-            name = name[0] if name else code
+            name = _get_stock_name(conn, code)
 
             fund_fresh = code in fresh_fund
             holders_fresh = code in fresh_holders
@@ -865,9 +869,7 @@ def format_institutional_report(code: str, conn=None) -> str:
         conn = db.get_conn()
 
     try:
-        name_row = db.fetchone(conn,
-            "SELECT name FROM stocks WHERE code=?", (code,))
-        name = name_row[0] if name_row else code
+        name = _get_stock_name(conn, code)
 
         score_data = institutional_score(code, conn)
 
@@ -1449,9 +1451,7 @@ def format_realtime_report(code: str, conn=None) -> str:
     if own_conn:
         conn = db.get_conn()
     try:
-        name_row = db.fetchone(conn,
-            "SELECT name FROM stocks WHERE code=?", (code,))
-        name = name_row[0] if name_row else code
+        name = _get_stock_name(conn, code)
 
         s = realtime_institutional_score(code, conn)
         mm = s["main_money"]

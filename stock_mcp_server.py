@@ -11,10 +11,7 @@ Installation:
 Register in Claude Desktop config (see README or setup instructions).
 """
 
-import json
-import re
 import sys
-import os
 from pathlib import Path
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,7 +21,7 @@ _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE))
 
 import db
-from _http_utils import cn_now, cn_today, cn_str, next_trade_day, last_trade_day
+from _http_utils import cn_now, next_trade_day, last_trade_day
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -617,7 +614,6 @@ def full_stock_selection(
         include_northbound=True,
     )
     market_report = env["summary_text"]
-    market_sentiment = env["combined_sentiment"]
     northbound_report = env["northbound_report"]
     northbound_adj = env["northbound_adj"]
     news_report = env.get("news_report", "")
@@ -1987,7 +1983,6 @@ def earnings_analysis(
     kline_df = None
     if earnings_anns:
         try:
-            from datetime import datetime, timedelta
             oldest = earnings_anns[-1]["date"] if earnings_anns else ""
             start_dt = (
                 (datetime.strptime(oldest, "%Y-%m-%d") - timedelta(days=40)).strftime("%Y-%m-%d")
@@ -2081,8 +2076,6 @@ def market_news() -> str:
     注意：本工具需要抓取网络数据，执行时间约 20-30 秒，请耐心等待。
     """
     try:
-        from datetime import datetime
-
         sep = "═" * 56
         now = cn_now()
         lines = [
@@ -2132,7 +2125,7 @@ def market_news() -> str:
             "【综合结论】",
             f"  外围行情评分:     {market_score:+.2f}  ({mq.score_to_label(market_score)})",
             f"  新闻面微调:       {news_delta:+.2f}",
-            f"  ─────────────────────────────",
+            "  ─────────────────────────────",
             f"  综合建议 news_sentiment 参考值: {final:+.2f}",
             "",
             "  ➡  使用方法:",
@@ -2947,8 +2940,7 @@ def institutional_holdings(stock_code: str) -> str:
         from institutional import (
             get_fund_holdings, get_top_holders,
             store_fund_holdings, store_top_holders,
-            format_institutional_report, institutional_score,
-            _classify_holder_type,
+            format_institutional_report,
         )
 
         errors = []

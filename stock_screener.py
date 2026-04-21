@@ -25,7 +25,7 @@ import logging
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Optional
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from _http_utils import cn_now
 from data_fetcher import get_kline
@@ -725,7 +725,7 @@ def _batch_preload_klines(codes: list, analysis_days: int = 120):
     一次性从 PostgreSQL 批量加载多只股票的 K 线数据到内存缓存。
     将 N 次逐股查询合并为 1 次 SQL IN 查询，大幅减少网络往返。
     """
-    global _KLINE_BATCH_CACHE
+    # 模块级 dict, .clear() 原地修改无需 global 声明
     _KLINE_BATCH_CACHE.clear()
 
     if not codes:
@@ -1266,7 +1266,7 @@ def _format_summary(strategy, total_market, stage1_count,
             market_regime = None
 
     lines = [
-        f"Stock Screener Report",
+        "Stock Screener Report",
         f"Strategy: {strategy.upper()}",
         f"Market: {total_market} total A-share stocks scanned",
         f"Stage 0 (historical profile): {history_profile_count} stocks scored from stock_history",
