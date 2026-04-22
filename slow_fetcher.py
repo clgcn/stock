@@ -844,8 +844,13 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
     except ValueError as e:
         # data_fetcher 对"空数据"抛 ValueError → 视为停牌候选
         raise _KlineEmpty(f"{code}: {e}")
+    except ConnectionError as e:
+        # "empty response" = 退市/停牌股，数据源确认无数据 → 视为停牌，不算网络故障
+        if "empty response" in str(e):
+            raise _KlineEmpty(f"{code}: {e}")
+        raise _KlineNetError(f"{code}: {e}")
     except Exception as e:
-        # 其他异常（ConnectionError、超时等）→ 视为网络故障，不标停牌
+        # 其他异常（超时等）→ 视为网络故障，不标停牌
         raise _KlineNetError(f"{code}: {e}")
 
     if df is None or df.empty:
@@ -874,6 +879,26 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
                 parts.append(str(v))
         raw_lines.append(",".join(parts))
     return raw_lines
+
+
+def _kline_fetch_worker(code: str, beg, days: int, interval: float) -> tuple:
+    """Thread worker: fetch K-line for one stock, sleep interval, return result tuple.
+
+    Returns: ('ok', raw_lines) | ('empty', exc) | ('net_err', exc) | ('error', exc)
+    """
+    import time as _t
+    try:
+        raw = _fetch_kline_raw(code, days=days, beg=beg)
+        _t.sleep(interval)
+        return ('ok', raw)
+    except _KlineEmpty as e:
+        _t.sleep(interval)
+        return ('empty', e)
+    except _KlineNetError as e:
+        _t.sleep(interval)
+        return ('net_err', e)
+    except Exception as e:
+        return ('error', e)
 
 
 def _store_kline(conn,code: str, raw_lines: list) -> int:
@@ -1194,6 +1219,7 @@ def fetch_history_batch(
     interval: float = 2,
     target_trade_date: str = None,
     conn = None,
+    workers: int = 3,
 ) -> dict:
     """
     从 stocks 表读取下一批股票，拉取它们的日 K 线历史。
@@ -1266,29 +1292,45 @@ def fetch_history_batch(
         fetched = 0
         errors = []
 
-        for i, code in enumerate(batch):
-            name = db.fetchone(conn,
-                "SELECT name FROM stocks WHERE code=?", (code,))
-            name = name[0] if name else code
+        # 批量预取股票名称
+        name_map = {r[0]: r[1] for r in db.fetchall(conn,
+            "SELECT code, name FROM stocks WHERE code IN ({})".format(
+                ",".join("?" * len(batch))), tuple(batch))}
 
-            # 确定增量起点：有历史则从最新日期拉，否则全量拉 days 天
+        # ── 预计算每只股票的增量起点 ──
+        code_params = []  # (code, name, beg, last_date, mode_str)
+        for code in batch:
+            name = name_map.get(code, code)
             last_date = latest_date_map.get(code)
             if last_date:
-                # 从该股最新日期的下一天开始，避免重复拉已有数据
                 next_day = (datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y%m%d")
                 beg = next_day
                 mode_str = f"增量 from {last_date}"
             else:
                 beg = None
                 mode_str = f"全量 {days}天"
+            code_params.append((code, name, beg, last_date, mode_str))
 
-            try:
-                raw = _fetch_kline_raw(code, days=days, beg=beg)
+        # ── Phase 1: 并发拉取（网络 I/O，每线程各自 sleep interval）──
+        from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _asc
+        fetch_results = {}  # code -> ('ok'|'empty'|'net_err'|'error', data)
+        _wk = max(1, min(workers, len(batch)))
+        with _TPE(max_workers=_wk) as executor:
+            future_map = {
+                executor.submit(_kline_fetch_worker, code, beg, days, interval): code
+                for code, _, beg, _, _ in code_params
+            }
+            for future in _asc(future_map):
+                code = future_map[future]
+                fetch_results[code] = future.result()
 
-                # ── 除权 / HFQ 重算检测 ──
-                # 增量拉取时：比较 DB 最后收盘价与新数据第一条收盘价。
-                # 若价格跳变超过该股涨跌停限制，说明 API 重算了全历史 HFQ，
-                # 需要清库后全量重刷，否则 DB 旧值与 API 新值永久不一致。
+        # ── Phase 2: 串行 DB 写入（HFQ 检测 + store）──
+        for i, (code, name, beg, last_date, mode_str) in enumerate(code_params):
+            status, data = fetch_results.get(code, ('error', Exception('not fetched')))
+
+            if status == 'ok':
+                raw = data
+                # 除权 / HFQ 重算检测
                 if raw and last_date and beg is not None:
                     try:
                         last_close_row = db.fetchone(conn,
@@ -1323,11 +1365,8 @@ def fetch_history_batch(
                     i + 1, len(batch), code, name,
                     stored, mode_str, len(remaining) - i - 1,
                 )
-            except _KlineEmpty:
-                # 服务端返回空数据 —— 需要区分「真正停牌」和「数据未就绪」
-                #
-                # 增量拉取时 beg >= 今天，东财数据可能还没更新，返回空是正常的
-                # 只有 **全量拉取**（beg=None, 拉1年）还拿不到数据，才能确认停牌
+
+            elif status == 'empty':
                 is_incremental = beg is not None
                 if is_incremental:
                     log.info("  [%d/%d] %s %s  增量区间无新数据，跳过（不标记停牌）",
@@ -1335,21 +1374,14 @@ def fetch_history_batch(
                 elif is_trade_day(cn_today()):
                     log.warning("  [%d/%d] %s %s  全量拉取无数据，标记为停牌",
                                i + 1, len(batch), code, name)
-                    db.execute(conn,
-                        "UPDATE stocks SET suspended = 1 WHERE code = ?",
-                        (code,),
-                    )
+                    db.execute(conn, "UPDATE stocks SET suspended = 1 WHERE code = ?", (code,))
                     conn.commit()
                 else:
                     log.info("  [%d/%d] %s %s  非交易日无数据，跳过（不标记停牌）",
                             i + 1, len(batch), code, name)
-            except _KlineNetError as e:
-                # 网络故障判定:
-                #   真网络抖动 → 全批次很多只一起挂, 下次重试即可
-                #   单只退市/停牌 → 服务端对特定代码 TCP reset (curl 56), 但同批其他只正常
-                #
-                # 启发式: 该股 stale 超过 7 天 (数据早过时) + 错误是 connection-close 类型
-                #        → 判定退市, 主动标记停牌, 避免反复浪费重试
+
+            elif status == 'net_err':
+                e = data
                 err_msg = str(e).lower()
                 is_conn_close = any(k in err_msg for k in (
                     "curl: (56)", "connection closed", "connection reset",
@@ -1363,22 +1395,20 @@ def fetch_history_batch(
                         is_stale = stale_days > 7
                     except Exception:
                         pass
-
                 if is_conn_close and is_stale and is_trade_day(cn_today()):
                     log.warning(
                         "  [%d/%d] %s %s  数据已 stale %s~%s + 两源 TCP reset, 判定退市标记停牌",
                         i + 1, len(batch), code, name, last_date, latest_trading_day,
                     )
-                    db.execute(conn,
-                        "UPDATE stocks SET suspended = 1 WHERE code = ?",
-                        (code,),
-                    )
+                    db.execute(conn, "UPDATE stocks SET suspended = 1 WHERE code = ?", (code,))
                     conn.commit()
                 else:
                     log.warning("  [%d/%d] %s %s  网络失败，跳过（不标记停牌）: %s",
                                i + 1, len(batch), code, name, e)
                     errors.append(f"{code}: 网络失败 {e}")
-            except Exception as e:
+
+            else:
+                e = data
                 log.error("  [%d/%d] %s %s  未知错误: %s",
                          i + 1, len(batch), code, name, e)
                 errors.append(f"{code}: {e}")
@@ -1476,7 +1506,14 @@ def repair_null_kline(codes: list = None, interval: float = 2.0) -> dict:
                 log.info("  %s  修复 %d 行 (从 %s 起)", code, stored, min_date)
                 repaired += 1
             except _KlineEmpty:
-                log.info("  %s  数据源无数据，跳过", code)
+                # 退市/永久停牌股 — 数据源确认无数据，清理库中 NULL 行
+                deleted = db.execute(conn,
+                    "DELETE FROM stock_history "
+                    "WHERE code=? AND (amplitude IS NULL OR pct_chg IS NULL OR change IS NULL)",
+                    (code,))
+                conn.commit()
+                log.info("  %s  数据源无数据（退市/停牌），已删除 %d 条 NULL 行",
+                         code, deleted.rowcount if deleted else 0)
                 skipped += 1
             except _KlineNetError as e:
                 log.warning("  %s  网络故障: %s", code, e)
@@ -1666,7 +1703,8 @@ def daily_close_update(batch_size: int = 50,
                        snapshot_interval: float = 10.0,
                        target_trade_date: str = None,
                        max_rounds: int = 500,
-                       max_minutes: float = 0) -> dict:
+                       max_minutes: float = 0,
+                       workers: int = 3) -> dict:
     """
     收盘后统一更新入口（逐只 kline API 模式）:
 
@@ -1752,6 +1790,7 @@ def daily_close_update(batch_size: int = 50,
                 interval=interval,
                 target_trade_date=target_trade_date,
                 conn=conn,
+                workers=workers,
             )
             total_fetched += result.get("fetched", 0)
             total_errors.extend(result.get("errors", []))
@@ -1802,7 +1841,8 @@ def full_daily_update(batch_size: int = 50,
                       moneyflow_days: int = 60,
                       moneyflow_interval: float = 10.0,
                       moneyflow_auto: bool = True,
-                      max_minutes: float = 0) -> dict:
+                      max_minutes: float = 0,
+                      workers: int = 3) -> dict:
     """
     一键全量收盘更新 = daily_close_update + moneyflow + institutional。
 
@@ -1862,6 +1902,7 @@ def full_daily_update(batch_size: int = 50,
         target_trade_date=target_trade_date,
         max_rounds=max_rounds,
         max_minutes=_remaining_min if _deadline else 0,
+        workers=workers,
     )
 
     # 如果 Phase 1 因非交易日被跳过，直接返回
@@ -3054,6 +3095,8 @@ def main():
                         help="拉取 K 线历史 (而非股票列表)")
     parser.add_argument("--batch", type=int, default=5,
                         help="每次拉几只股票的 K 线 (默认5)")
+    parser.add_argument("--workers", type=int, default=3,
+                        help="K线并发线程数 (默认3，建议不超过5)")
     parser.add_argument("--days", type=int, default=365,
                         help="拉取多少天的历史 (默认365)")
     parser.add_argument("--reset-history", action="store_true",
@@ -3305,6 +3348,7 @@ def main():
             target_trade_date=args.trade_date,
             moneyflow_interval=max(float(args.interval), 5.0),
             max_minutes=args.max_minutes,
+            workers=args.workers,
         )
         snap = result.get("snapshot", {})
         hist = result.get("history", {})
@@ -3359,6 +3403,7 @@ def main():
             snapshot_interval=max(float(args.interval), 10.0),
             target_trade_date=args.trade_date,
             max_minutes=args.max_minutes,
+            workers=args.workers,
         )
         snap = result["snapshot"]
         hist = result["history"]
@@ -3421,6 +3466,7 @@ def main():
                         days=args.days,
                         interval=args.interval,
                         conn=conn,
+                        workers=args.workers,
                     )
                     rounds += 1
                     if result["done"]:
