@@ -86,6 +86,9 @@ class TechnicalSignals:
     mc_up_prob: Optional[float] = None
     mc_expected_range: Optional[tuple] = None
 
+    # Hurst指数
+    hurst: Optional[float] = None          # ≥0.55趋势持续+15分; ≤0.45均值回归-10分
+
     # 各维度原始得分
     trend_score: Optional[float] = None
     momentum_score: Optional[float] = None
@@ -363,10 +366,12 @@ class TechnicalFace:
 
     @staticmethod
     def _extract_diagnosis(signals: TechnicalSignals, result: dict):
-        """从 quant_engine.comprehensive_diagnosis 结果提取诊断分 + 蒙特卡洛。"""
+        """从 quant_engine.comprehensive_diagnosis 结果提取诊断分 + 蒙特卡洛 + Hurst。"""
         signals.diagnosis_total_score = result.get("total_score")
         sig = result.get("signal", "hold")
         signals.diagnosis_signal = sig if sig in ("buy", "sell", "hold") else "hold"
+        # Hurst指数 (comprehensive_diagnosis直接返回)
+        signals.hurst = result.get("hurst")
         # 蒙特卡洛
         mc = result.get("monte_carlo", {})
         if mc:

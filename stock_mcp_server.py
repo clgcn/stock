@@ -285,7 +285,7 @@ def full_stock_analysis(
     run_long = analysis_mode in ("full", "long")
 
     # ── ST/退市 前置拦截 ──────────────────────────────────────────────────
-    is_st = any(tag in stock_name for tag in ("ST", "*ST", "退"))
+    is_st = any(tag in stock_name for tag in ("ST", "*ST", "△", "退"))
     if is_st:
         return (
             f"⚠️ ST/退市风险警示  {stock_name} ({stock_code})\n\n"
@@ -293,7 +293,7 @@ def full_stock_analysis(
             "· 涨跌幅限制 ±5%，日内波动受限\n"
             "· 退市风险高，基本面因子模型不适用\n"
             "· 不建议建立中长线仓位\n\n"
-            "如确认为壳资源重组行情，请在问题中注明"壳资源炒作"以获取专项分析。\n"
+            "如确认为壳资源重组行情，请在问题中注明'壳资源炒作'以获取专项分析。\n"
             "否则建议转换分析标的。"
         )
     # ────────────────────────────────────────────────────────────────────
@@ -1231,13 +1231,22 @@ def kline_data(
         start_date = (cn_now() - timedelta(days=recent_days)).strftime("%Y-%m-%d")
 
     try:
-        df = df_mod.get_kline(
-            stock_code,
-            period=period,
-            start=start_date or None,
-            end=end_date or None,
-            adjust=adjust,
-        )
+        if period == "daily":
+            df = df_mod.get_kline_prefer_db(
+                stock_code,
+                start=start_date or None,
+                adjust=adjust,
+            )
+            if df is None or df.empty:
+                return f"ERROR: No K-line data found for {stock_code}"
+        else:
+            df = df_mod.get_kline(
+                stock_code,
+                period=period,
+                start=start_date or None,
+                end=end_date or None,
+                adjust=adjust,
+            )
     except Exception as e:
         return f"ERROR: Failed to fetch K-line: {e}"
 
@@ -1448,19 +1457,13 @@ def stock_diagnosis(
     """
     start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
-    data_source = "online"
+    data_source = "db_prefer"
     try:
-        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="hfq")
+        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="hfq")
+        if df is None or df.empty:
+            return f"ERROR: Failed to fetch K-line data for {stock_code}"
     except Exception as e:
-        try:
-            df = sf.load_stock_history(stock_code)
-            if not df.empty and "date" in df.columns:
-                df = df[df["date"] >= start].copy()
-            if df.empty or len(df) < 30:
-                return f"ERROR: Failed to fetch K-line data: {e}"
-            data_source = "local_db"
-        except Exception:
-            return f"ERROR: Failed to fetch K-line data: {e}"
+        return f"ERROR: Failed to fetch K-line data: {e}"
 
     if len(df) < 30:
         return f"ERROR: Insufficient data: only {len(df)} bars, at least 30 required"
@@ -1652,7 +1655,9 @@ def strategy_backtest(
     start = (cn_now() - timedelta(days=backtest_days)).strftime("%Y-%m-%d")
 
     try:
-        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="hfq")
+        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="hfq")
+        if df is None or df.empty:
+            return f"ERROR: Failed to fetch K-line data for {stock_code}"
     except Exception as e:
         return f"ERROR: Failed to fetch K-line data: {e}"
 
@@ -1727,7 +1732,9 @@ def risk_assessment(
     start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
     try:
-        df = df_mod.get_kline(stock_code, period="daily", start=start, adjust="hfq")
+        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="hfq")
+        if df is None or df.empty:
+            return f"ERROR: Failed to fetch K-line data for {stock_code}"
     except Exception as e:
         return f"ERROR: Failed to fetch K-line data: {e}"
 
@@ -3085,50 +3092,55 @@ def institutional_holdings(stock_code: str) -> str:
         if db_fund_cnt > 0 or db_holder_cnt > 0:
             try:
                 lines = [f"机构持仓报告 (历史数据, 当季未披露): {code}", "=" * 55, ""]
+                # Open a fresh connection — _db_conn was already closed in the count query above
+                _db_conn2 = sf._get_db()
                 try:
-                    name_row = db.fetchone(_db_conn,
-                        "SELECT name FROM stocks WHERE code=?", (code,))
-                    if name_row:
-                        lines[0] = f"机构持仓报告 (历史数据, 当季未披露): {code} {name_row[0]}"
-                except Exception:
-                    pass
+                    try:
+                        name_row = db.fetchone(_db_conn2,
+                            "SELECT name FROM stocks WHERE code=?", (code,))
+                        if name_row:
+                            lines[0] = f"机构持仓报告 (历史数据, 当季未披露): {code} {name_row[0]}"
+                    except Exception:
+                        pass
 
-                if db_holder_cnt > 0:
-                    hrows = db.fetchall(_db_conn,
-                        "SELECT rank, holder_name, holder_type, hold_pct, change_type, report_date "
-                        "FROM stock_top_holders WHERE code = ? "
-                        "ORDER BY report_date DESC, rank ASC LIMIT 10", (code,))
-                    if hrows:
-                        rdate = hrows[0][5] if len(hrows[0]) > 5 else "?"
-                        lines.append(f"十大流通股东 (报告期 {rdate}):")
-                        type_names = {
-                            "fund": "基金", "social_security": "社保", "qfii": "QFII",
-                            "insurance": "险资", "broker": "券商", "private": "私募",
-                            "connect": "港股通", "individual": "个人", "unknown": "-",
-                        }
-                        for rnk, hname, htype, pct, ct, _rd in hrows:
-                            pct_str = f"{pct:.2f}%" if pct else "-"
-                            type_str = type_names.get(htype or "", htype or "-")
-                            lines.append(
-                                f"  {rnk:<4} {(hname or '')[:22]:<24} {type_str:<8} "
-                                f"{pct_str:>6} {(ct or '-'):>8}"
-                            )
-                        lines.append("")
+                    if db_holder_cnt > 0:
+                        hrows = db.fetchall(_db_conn2,
+                            "SELECT rank, holder_name, holder_type, hold_pct, change_type, report_date "
+                            "FROM stock_top_holders WHERE code = ? "
+                            "ORDER BY report_date DESC, rank ASC LIMIT 10", (code,))
+                        if hrows:
+                            rdate = hrows[0][5] if len(hrows[0]) > 5 else "?"
+                            lines.append(f"十大流通股东 (报告期 {rdate}):")
+                            type_names = {
+                                "fund": "基金", "social_security": "社保", "qfii": "QFII",
+                                "insurance": "险资", "broker": "券商", "private": "私募",
+                                "connect": "港股通", "individual": "个人", "unknown": "-",
+                            }
+                            for rnk, hname, htype, pct, ct, _rd in hrows:
+                                pct_str = f"{pct:.2f}%" if pct else "-"
+                                type_str = type_names.get(htype or "", htype or "-")
+                                lines.append(
+                                    f"  {rnk:<4} {(hname or '')[:22]:<24} {type_str:<8} "
+                                    f"{pct_str:>6} {(ct or '-'):>8}"
+                                )
+                            lines.append("")
 
-                if db_fund_cnt > 0:
-                    frows = db.fetchall(_db_conn,
-                        "SELECT fund_name, nav_pct, hold_mv, report_date "
-                        "FROM fund_holdings WHERE code = ? "
-                        "ORDER BY report_date DESC, hold_mv DESC NULLS LAST LIMIT 10",
-                        (code,))
-                    if frows:
-                        rdate = frows[0][3] if len(frows[0]) > 3 else "?"
-                        lines.append(f"前10大持仓基金 (共{db_fund_cnt}只历史记录, 最新报告期 {rdate}):")
-                        for fname, nav_pct, hold_mv, _rd in frows:
-                            nav_str = f"{nav_pct:.2f}%" if nav_pct else "-"
-                            mv_str = f"{hold_mv/1e8:.2f}亿" if hold_mv else "-"
-                            lines.append(f"  {(fname or '')[:26]:<28} {nav_str:>6} {mv_str:>12}")
-                        lines.append("")
+                    if db_fund_cnt > 0:
+                        frows = db.fetchall(_db_conn2,
+                            "SELECT fund_name, nav_pct, hold_mv, report_date "
+                            "FROM fund_holdings WHERE code = ? "
+                            "ORDER BY report_date DESC, hold_mv DESC NULLS LAST LIMIT 10",
+                            (code,))
+                        if frows:
+                            rdate = frows[0][3] if len(frows[0]) > 3 else "?"
+                            lines.append(f"前10大持仓基金 (共{db_fund_cnt}只历史记录, 最新报告期 {rdate}):")
+                            for fname, nav_pct, hold_mv, _rd in frows:
+                                nav_str = f"{nav_pct:.2f}%" if nav_pct else "-"
+                                mv_str = f"{hold_mv/1e8:.2f}亿" if hold_mv else "-"
+                                lines.append(f"  {(fname or '')[:26]:<28} {nav_str:>6} {mv_str:>12}")
+                            lines.append("")
+                finally:
+                    _db_conn2.close()
 
                 if errors:
                     lines.extend(["", f"⚠️ 部分环节有警告: {'; '.join(errors)}"])

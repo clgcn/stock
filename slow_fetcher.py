@@ -828,8 +828,14 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
     from data_fetcher import get_kline
 
     # YYYYMMDD → YYYY-MM-DD
+    orig_start = None
     if beg:
-        start = f"{beg[:4]}-{beg[4:6]}-{beg[6:8]}"
+        orig_start = f"{beg[:4]}-{beg[4:6]}-{beg[6:8]}"
+        # Extend back 14 calendar days so diff() always has a prior row.
+        # 7 calendar days can be all holidays (e.g., CNY/Golden Week); 14 guarantees ≥1 trading day.
+        # The extra "warm-up" rows are filtered out before returning.
+        extended = (_pd.Timestamp(orig_start) - _pd.Timedelta(days=14)).strftime("%Y-%m-%d")
+        start = extended
     else:
         start = (cn_now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
@@ -856,6 +862,9 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
             date_str = date_v.strftime("%Y-%m-%d")
         else:
             date_str = str(date_v)[:10]
+        # Skip warm-up rows fetched only to provide diff() a prior row
+        if orig_start and date_str < orig_start:
+            continue
         parts = [date_str]
         for c in cols[1:]:
             v = row.get(c)
@@ -1275,6 +1284,38 @@ def fetch_history_batch(
 
             try:
                 raw = _fetch_kline_raw(code, days=days, beg=beg)
+
+                # ── 除权 / HFQ 重算检测 ──
+                # 增量拉取时：比较 DB 最后收盘价与新数据第一条收盘价。
+                # 若价格跳变超过该股涨跌停限制，说明 API 重算了全历史 HFQ，
+                # 需要清库后全量重刷，否则 DB 旧值与 API 新值永久不一致。
+                if raw and last_date and beg is not None:
+                    try:
+                        last_close_row = db.fetchone(conn,
+                            "SELECT close FROM stock_history WHERE code=? AND date=? AND close IS NOT NULL",
+                            (code, last_date))
+                        if last_close_row and last_close_row[0]:
+                            first_parts = raw[0].split(",")
+                            first_close = float(first_parts[2]) if len(first_parts) > 2 and first_parts[2] else None
+                            if first_close:
+                                prev_close = float(last_close_row[0])
+                                limit = 0.30 if code.startswith("8") else (
+                                    0.205 if code.startswith(("30", "688")) else 0.105)
+                                chg = abs(first_close - prev_close) / prev_close if prev_close > 0 else 0
+                                if chg > limit:
+                                    log.warning(
+                                        "  [%d/%d] %s %s  HFQ除权重算: %s=%.2f→%.2f(%.1f%%)超涨跌停, 全量重刷",
+                                        i + 1, len(batch), code, name,
+                                        last_date, prev_close, first_close, chg * 100,
+                                    )
+                                    raw_full = _fetch_kline_raw(code, days=days)
+                                    db.execute(conn, "DELETE FROM stock_history WHERE code=?", (code,))
+                                    conn.commit()
+                                    raw = raw_full
+                                    mode_str = f"全量重刷(除权修复) {days}天"
+                    except Exception as _exc:
+                        log.debug("除权检测异常 %s: %s", code, _exc)
+
                 stored = _store_kline(conn, code, raw)
                 fetched += 1
                 log.info(
@@ -1377,6 +1418,80 @@ def reset_history_progress():
         log.info("K 线历史进度已重置")
     finally:
         conn.close()
+
+
+def repair_null_kline(codes: list = None, interval: float = 2.0) -> dict:
+    """修复 stock_history 表中 amplitude/pct_chg/change 为 NULL 的行。
+
+    根本原因：增量拉取时 diff() 缺少前置行，首行计算为 NaN 写入 NULL。
+    修复方式：重新拉取受影响区间（_fetch_kline_raw 已内置14日预热），upsert 覆盖旧 NULL。
+
+    Args:
+        codes: 指定股票代码列表；None = 自动扫描全库受影响股票。
+        interval: 每只之间的间隔秒数（默认2s）。
+
+    Returns:
+        {"repaired": int, "skipped": int, "errors": list}
+    """
+    import time as _time
+    conn = _get_db()
+    repaired = 0
+    skipped = 0
+    errors = []
+    try:
+        if codes:
+            affected = [(c,) for c in codes]
+            # For user-specified codes, find the earliest NULL date from DB
+            affected_with_dates = []
+            for (code,) in affected:
+                row = db.fetchone(conn,
+                    "SELECT MIN(date) FROM stock_history "
+                    "WHERE code=? AND (amplitude IS NULL OR pct_chg IS NULL OR change IS NULL)",
+                    (code,))
+                min_date = row[0] if row and row[0] else None
+                if min_date:
+                    affected_with_dates.append((code, min_date))
+                else:
+                    log.info("repair_null_kline: %s 无 NULL 行，跳过", code)
+                    skipped += 1
+        else:
+            rows = db.fetchall(conn,
+                "SELECT code, MIN(date) FROM stock_history "
+                "WHERE amplitude IS NULL OR pct_chg IS NULL OR change IS NULL "
+                "GROUP BY code ORDER BY code")
+            affected_with_dates = [(r[0], r[1]) for r in rows] if rows else []
+
+        log.info("repair_null_kline: 发现 %d 只股票有 NULL K 线字段", len(affected_with_dates))
+
+        for code, min_date in affected_with_dates:
+            try:
+                beg_yyyymmdd = min_date.replace("-", "")
+                raw = _fetch_kline_raw(code, beg=beg_yyyymmdd)
+                if not raw:
+                    log.info("  %s  无新数据", code)
+                    skipped += 1
+                    continue
+                stored = _store_kline(conn, code, raw)
+                conn.commit()
+                log.info("  %s  修复 %d 行 (从 %s 起)", code, stored, min_date)
+                repaired += 1
+            except _KlineEmpty:
+                log.info("  %s  数据源无数据，跳过", code)
+                skipped += 1
+            except _KlineNetError as e:
+                log.warning("  %s  网络故障: %s", code, e)
+                errors.append(str(e))
+            except Exception as e:
+                log.warning("  %s  修复失败: %s", code, e)
+                errors.append(f"{code}: {e}")
+            _time.sleep(interval)
+
+    finally:
+        conn.close()
+
+    log.info("repair_null_kline 完成: 修复 %d 只, 跳过 %d 只, 错误 %d 只",
+             repaired, skipped, len(errors))
+    return {"repaired": repaired, "skipped": skipped, "errors": errors}
 
 
 # ── 资金流向增量拉取 ─────────────────────────────────────
@@ -2943,6 +3058,12 @@ def main():
                         help="拉取多少天的历史 (默认365)")
     parser.add_argument("--reset-history", action="store_true",
                         help="重置 K 线拉取进度")
+    parser.add_argument("--refresh-hfq", type=str, metavar="CODE",
+                        help="强制全量重刷单只股票的 HFQ K线（除权后修复数据库）")
+    parser.add_argument("--repair-nulls", action="store_true",
+                        help="修复 stock_history 表中 amplitude/pct_chg/change 为 NULL 的行")
+    parser.add_argument("--repair-codes", type=str, metavar="CODES",
+                        help="配合 --repair-nulls: 逗号分隔的股票代码 (不指定则扫描全库)")
 
     # 资金流向模式
     parser.add_argument("--max-minutes", type=float, default=0,
@@ -2978,6 +3099,21 @@ def main():
 
     args = parser.parse_args()
 
+    if getattr(args, "refresh_hfq", None):
+        code = args.refresh_hfq.strip()
+        conn = _get_db()
+        try:
+            print(f"[refresh-hfq] 全量重刷 {code} 的 HFQ K线（365天）...")
+            raw_full = _fetch_kline_raw(code, days=365)
+            old_count = db.fetchone(conn, "SELECT COUNT(*) FROM stock_history WHERE code=?", (code,))[0]
+            db.execute(conn, "DELETE FROM stock_history WHERE code=?", (code,))
+            conn.commit()
+            stored = _store_kline(conn, code, raw_full)
+            print(f"[refresh-hfq] {code}: 删除 {old_count} 条旧记录，重新入库 {stored} 条。完成。")
+        finally:
+            conn.close()
+        return
+
     if args.status:
         _print_status()
         return
@@ -3001,6 +3137,15 @@ def main():
 
     if args.reset_history:
         reset_history_progress()
+        return
+
+    if getattr(args, "repair_nulls", False):
+        codes = [c.strip() for c in args.repair_codes.split(",")] if getattr(args, "repair_codes", None) else None
+        result = repair_null_kline(codes=codes, interval=args.interval)
+        print(f"[repair-nulls] 修复 {result['repaired']} 只, 跳过 {result['skipped']} 只, 错误 {len(result['errors'])} 只")
+        if result["errors"]:
+            for e in result["errors"]:
+                print(f"  ERROR: {e}")
         return
 
     if args.reset_moneyflow:

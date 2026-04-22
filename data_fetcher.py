@@ -60,11 +60,11 @@ _TENCENT_PERIOD_MAP = {
     # 分钟级腾讯也支持，但走另一个 endpoint，暂不映射，分钟级回退东财
 }
 
-# 腾讯 adjust 映射
+# 腾讯 adjust 映射 — API 要求 fqt 为数值字符串: 0=不复权, 1=前复权, 2=后复权
 _TENCENT_FQT_MAP = {
-    "qfq": "qfq",
-    "hfq": "hfq",
-    "none": "",
+    "qfq": "1",
+    "hfq": "2",
+    "none": "0",
 }
 
 
@@ -160,7 +160,7 @@ def _get_kline_tencent(
     if tperiod is None:
         raise ValueError(f"Tencent kline does not support period={period}")
 
-    fqt = _TENCENT_FQT_MAP.get(adjust, "hfq")
+    fqt = _TENCENT_FQT_MAP.get(adjust, "2")  # default to hfq (backward-adjusted)
     sym = _tencent_prefix(code)
 
     # 腾讯 param 格式: code,period,start,end,limit,fq

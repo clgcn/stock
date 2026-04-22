@@ -106,7 +106,8 @@ def assess_environment(
 
             # 基于成交额趋势计算情绪修正
             if flow:
-                amts = [d.get("total_deal_amt", 0) for d in flow]
+                # 过滤零成交日（港股假期 HK holidays — capital_flow.py 同款逻辑）
+                amts = [d.get("total_deal_amt", 0) for d in flow if d.get("total_deal_amt", 0) > 0]
                 recent5 = amts[:5]
                 early5 = amts[-5:] if len(amts) >= 10 else amts[:5]
                 avg_recent = sum(recent5) / len(recent5) if recent5 else 0

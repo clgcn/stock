@@ -232,6 +232,10 @@ class RiskFace:
             vetos.append((True, "Kelly仓位建议为0（负期望策略）", None, None))
         if signals.var_95_pct is not None and signals.var_95_pct > 8:
             vetos.append((True, f"VaR(95%)={signals.var_95_pct:.1f}%>8% 极端波动", None, None))
+        if (signals.cvar_95_pct is not None and signals.var_95_pct is not None
+                and signals.var_95_pct > 0
+                and signals.cvar_95_pct > signals.var_95_pct * 1.5):
+            vetos.append((False, f"CVaR={signals.cvar_95_pct:.1f}%>VaR×1.5 厚尾风险警告（尾部损失异常集中）", None, None))
         if signals.risk_level == "extreme":
             vetos.append((True, "综合风险等级: 极端", None, None))
         return vetos
@@ -253,7 +257,13 @@ class RiskFace:
             "rationale": "",
         }
 
-        kelly_cap = signals.kelly_position_pct if signals.kelly_position_pct and signals.kelly_position_pct > 0 else 30
+        # Kelly≤0 = 负期望策略，强制空仓（与 check_veto/prompt 规则一致）
+        if signals.kelly_position_pct is not None and signals.kelly_position_pct <= 0:
+            advice["rationale"] = "Kelly仓位≤0（负期望策略），建议空仓"
+            advice["position_pct"] = 0
+            return advice
+
+        kelly_cap = signals.kelly_position_pct if signals.kelly_position_pct else 30
 
         if total_score >= 80:
             base = 30
@@ -397,6 +407,12 @@ class RiskFace:
             elif kelly < 10:
                 risk_points += 1
         if signals.max_daily_drop_pct is not None and abs(signals.max_daily_drop_pct) > 10:
+            risk_points += 2
+
+        # CVaR > VaR×1.5 → 厚尾风险，超额尾部损失显著
+        if (signals.cvar_95_pct is not None and signals.var_95_pct is not None
+                and signals.var_95_pct > 0
+                and signals.cvar_95_pct > signals.var_95_pct * 1.5):
             risk_points += 2
 
         if risk_points >= 6:

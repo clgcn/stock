@@ -80,6 +80,14 @@ def compute_scorecard(
     short_total = sum(d["weighted"] for d in short_dims)
     # L环境自动降权
     short_total *= short_weight
+    # Hurst指数技术面调整（prompt规则落地）:
+    #   ≥0.55 趋势持续，技术面+15；≤0.45 均值回归，技术面-10
+    hurst = shortterm_signals.get("hurst")
+    if hurst is not None:
+        if hurst >= 0.55:
+            short_total = min(100, short_total + 15)
+        elif hurst <= 0.45:
+            short_total = max(0, short_total - 10)
     short_vetoed, short_veto_reason = _check_short_veto(shortterm_signals, short_dims)
     if short_vetoed:
         short_total = min(short_total, 30)  # 一票否决: 强制得分上限30

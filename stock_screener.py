@@ -457,7 +457,8 @@ def _base_filter(df: pd.DataFrame, exclude_st: bool = True,
     # Exclude ST / *ST stocks (special treatment, high delisting risk)
     # Match names starting with "ST" or "*ST" (A-share naming convention)
     if exclude_st:
-        mask &= ~df["name"].str.match(r"^\*?ST\b", case=False, na=False)
+        mask &= ~df["name"].str.match(r"^\*?ST\b|^△", case=False, na=False)
+        mask &= ~df["name"].str.contains("退市", na=False)
 
     # Limit-down check. IMPORTANT: NaN pct_chg must be treated as "unknown",
     # not as "excluded" — on a stale snapshot (e.g. pre-market, post-holiday,
@@ -471,7 +472,10 @@ def _base_filter(df: pd.DataFrame, exclude_st: bool = True,
     if not allow_limit_up:
         mask &= (pct.isna() | (pct < 9.5))
 
-    # Exclude suspended / zero-volume stocks
+    # Exclude suspended stocks — check explicit suspended field first,
+    # then fall back to volume/price proxy for snapshots where field is missing
+    if "suspended" in df.columns:
+        mask &= df["suspended"].fillna(0) == 0
     mask &= df["volume"].notna() & (df["volume"] > 0)
     mask &= df["current"].notna() & (df["current"] > 0)
 

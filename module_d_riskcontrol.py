@@ -128,9 +128,15 @@ def _compute_position_advice(
         base_pct = min(base_pct, 5)
         env_note += "，存在一票否决项"
 
+    # VaR(95%)>8% 极端波动 → 仓位上限×0.7（prompt 规则落地）
+    var_note = ""
+    if var95 is not None and var95 > 8:
+        base_pct *= 0.7
+        var_note = "，VaR>8%极端波动×0.7"
+
     base_pct = min(30, max(0, base_pct))
 
-    parts = [f"建议仓位上限: {base_pct:.1f}%{env_note}"]
+    parts = [f"建议仓位上限: {base_pct:.1f}%{env_note}{var_note}"]
 
     if short_score >= 70 and long_score >= 70:
         parts.append("短线+长线均偏强，可考虑分批建仓")

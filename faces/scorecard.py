@@ -123,6 +123,15 @@ class Scorecard:
 
         # ── 3. 加权总分 (0~100) ──
         raw = _weighted_sum(dims)
+
+        # ── 3b. Hurst指数调整 (在环境修正前, 与 module_c_scorecard 行为一致) ──
+        hurst = tech_signals.hurst
+        if hurst is not None:
+            if hurst >= 0.55:
+                raw = min(100.0, raw + 15.0)
+            elif hurst <= 0.45:
+                raw = max(0.0, raw - 10.0)
+
         result.raw_total = round(raw, 1)
 
         # ── 4. 环境修正 ──
@@ -514,7 +523,8 @@ def compute_combined_decision(
     cd.kelly_raw_pct = kelly_raw
 
     cd.tier_multiplier = _TIER_KELLY_MULT.get(cd.long_tier, 0.3)
-    cd.position_pct = round(max(0, kelly_raw * cd.tier_multiplier), 1)
+    # 30% single-stock cap (prompt rule: no position > 30% of portfolio)
+    cd.position_pct = round(min(max(0, kelly_raw * cd.tier_multiplier), 30.0), 1)
 
     # 极端风险硬覆盖
     if risk_signals and risk_signals.risk_level == "extreme":

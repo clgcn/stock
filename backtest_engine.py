@@ -33,6 +33,8 @@ def _get_price_limit(code: str, name: str = "") -> float:
         return 0.05
     if code.startswith("30") or code.startswith("688"):
         return 0.20
+    if code.startswith("8"):   # 北交所 (北证A股): ±30%
+        return 0.30
     return 0.10
 
 
@@ -354,7 +356,7 @@ def backtest(
                     "shares": shares,
                     "revenue": round(revenue, 2),
                     "pnl": round(pnl, 2),
-                    "pnl_pct": round(pnl / (shares * entry_price) * 100, 2),
+                    "pnl_pct": round(pnl / (shares * entry_price * (1 + commission)) * 100, 2),
                 })
                 trades.append(pnl)
                 shares = 0

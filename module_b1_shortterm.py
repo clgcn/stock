@@ -43,6 +43,7 @@ class ShortTermSignals(TypedDict):
     diagnosis_score: Optional[float]    # 0-100 综合评分
     monte_carlo_up_prob: Optional[float]
     quant_share_pct: Optional[float]    # 量化资金占比
+    hurst: Optional[float]              # Hurst指数 (≥0.55趋势市 / ≤0.45均值回归)
 
     # 融资融券情绪 (权重10%)
     margin_balance_change_pct: Optional[float]  # 融资余额周环比变化
@@ -283,6 +284,11 @@ def _extract_signals(
 
     quant_pct = _extract_float(quant_report, r"量化资金占比[：:]\s*(\d+(?:\.\d+)?)%")
 
+    # Hurst指数从诊断报告中提取，格式: "H=0.600" 或 "Hurst Exponent: 0.600"
+    hurst_val = _extract_float(diagnosis_report, r"H=(\d+\.\d+)")
+    if hurst_val is None:
+        hurst_val = _extract_float(diagnosis_report, r"[Hh]urst[^:：]*[：:]\s*(\d+\.\d+)")
+
     # ── 融资融券情绪 ──
     margin_change = None
     if margin_report:
@@ -306,6 +312,7 @@ def _extract_signals(
         quant_share_pct=quant_pct,
         margin_balance_change_pct=margin_change,
         northbound_same_direction=nb_same_dir,
+        hurst=hurst_val,
     )
 
 

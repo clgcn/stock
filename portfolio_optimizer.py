@@ -28,7 +28,7 @@ import pandas as pd
 
 # A-Share Constants
 STAMP_TAX_RATE = 0.001  # 0.1% on sales
-COMMISSION_RATE = 0.00025  # 0.025%
+COMMISSION_RATE = 0.0003   # 万3, consistent with backtest_engine.py
 MIN_COMMISSION = 5  # CNY
 LOT_SIZE = 100  # minimum trading unit
 RISK_FREE_RATE = 0.025  # default annual risk-free rate (unified across system)
@@ -1210,7 +1210,9 @@ def apply_turnover_constraint(
         w_cur = current_weights.get(code, 0.0)
         blended[code] = alpha * w_new + (1.0 - alpha) * w_cur
 
-    # Drop dust positions (< 0.1%) and renormalize
+    # Drop dust positions (< 0.1%). After renormalization the actual turnover
+    # may slightly exceed turnover_limit because we removed small weights
+    # from both new and current; this is negligible (<0.1%) and acceptable.
     blended = {c: w for c, w in blended.items() if w > 0.001}
     total = sum(blended.values())
     if total > 0:

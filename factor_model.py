@@ -18,7 +18,10 @@ import pandas as pd
 DEFAULT_WEIGHTS = {
     # Value factors (25%) — strong A-share premium post-2019
     "ep": 0.17, "bp": 0.08,
-    # Quality factors (30%) — most predictive in A-share 2020-2025 research
+    # Quality factors (30%) — NOTE: roe_stability+gm_stability (23%) currently always NaN
+    # because stock_fundamentals DB table lacks roe_history/gross_margin columns.
+    # composite_alpha_score() correctly redistributes their weight to other factors,
+    # but this silently over-weights momentum. Populate DB columns to activate.
     "roe_stability": 0.18, "gm_stability": 0.05, "accrual": 0.05, "downside_dev": 0.02,
     # Risk/leverage (3%)
     "debt_equity": 0.03,
@@ -257,9 +260,10 @@ def compute_single_stock_factors(
     else:
         factors['mom_6m'] = np.nan
 
-    # 12-1 month return (skip recent month)
-    if len(close) >= 260:
-        ret_12_1m = (close[-25] / close[-260] - 1.0) if close[-260] > 0 else np.nan
+    # 12-1 month return: 252-day lookback, skip most recent 21 days (1-month reversal window)
+    # Standard: return from T-252 to T-21, NOT including the last month
+    if len(close) >= 273:
+        ret_12_1m = (close[-21] / close[-273] - 1.0) if close[-273] > 0 else np.nan
         factors['mom_12_1m'] = ret_12_1m
     else:
         factors['mom_12_1m'] = np.nan
