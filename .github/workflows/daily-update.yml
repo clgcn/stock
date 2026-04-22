@@ -47,6 +47,10 @@ on:
         description: '最长运行分钟数 (0=无限制)'
         required: false
         default: '300'
+      workers:
+        description: 'K线并发线程数 (默认3)'
+        required: false
+        default: '3'
       force_run:
         description: '强制运行 (忽略交易日判断)'
         type: boolean
@@ -125,6 +129,7 @@ jobs:
           BATCH: ${{ github.event.inputs.batch_size || '100' }}
           INTERVAL: ${{ github.event.inputs.interval || '10' }}
           MAX_MIN: ${{ github.event.inputs.max_minutes || '300' }}
+          WORKERS: ${{ github.event.inputs.workers || '3' }}
         run: |
           echo "═══════════════════════════════════════"
           echo "  模式: $MODE"
@@ -137,7 +142,8 @@ jobs:
               --daily-close-update \
               --batch "$BATCH" \
               --interval "$INTERVAL" \
-              --max-minutes "$MAX_MIN"
+              --max-minutes "$MAX_MIN" \
+              --workers "$WORKERS"
           elif [ "$MODE" = "moneyflow" ]; then
             python slow_fetcher.py \
               --moneyflow --moneyflow-auto \
@@ -159,7 +165,8 @@ jobs:
               --full-update \
               --batch "$BATCH" \
               --interval "$INTERVAL" \
-              --max-minutes "$MAX_MIN"
+              --max-minutes "$MAX_MIN" \
+              --workers "$WORKERS"
           fi
 
       # ── 6. 打印状态 ──
