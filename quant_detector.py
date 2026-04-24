@@ -136,8 +136,9 @@ def get_minute_kline(code: str, period: str = "1m") -> pd.DataFrame:
     获取当日或近期分钟K线，用于分析成交量时间分布。
     """
     # 复用 data_fetcher 的接口，避免重复代码
+    # 分钟K线用于成交分布分析, 不涉及跨除权日比价, 用未复权即可
     from data_fetcher import get_kline
-    df = get_kline(code, period=period, limit=250)
+    df = get_kline(code, period=period, limit=250, adjust="none")
     return df
 
 

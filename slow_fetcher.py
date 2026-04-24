@@ -840,7 +840,9 @@ def _fetch_kline_raw(code: str, days: int = 365, beg: str = None) -> list:
         start = (cn_now() - timedelta(days=days)).strftime("%Y-%m-%d")
 
     try:
-        df = get_kline(code, period="daily", start=start, adjust="hfq", limit=500)
+        # adjust="qfq": 与 bulk_daily_kline_from_clist 的 f2 字段口径一致,
+        # stock_history 表统一存前复权价 (以最新日为锚点)
+        df = get_kline(code, period="daily", start=start, adjust="qfq", limit=500)
     except ValueError as e:
         # data_fetcher 对"空数据"抛 ValueError → 视为停牌候选
         raise _KlineEmpty(f"{code}: {e}")
@@ -1324,13 +1326,14 @@ def fetch_history_batch(
                 code = future_map[future]
                 fetch_results[code] = future.result()
 
-        # ── Phase 2: 串行 DB 写入（HFQ 检测 + store）──
+        # ── Phase 2: 串行 DB 写入（QFQ 除权重算检测 + store）──
+        # QFQ 每次除权后锚点移动, 所有历史价按新因子重调, 必须全量重刷
         for i, (code, name, beg, last_date, mode_str) in enumerate(code_params):
             status, data = fetch_results.get(code, ('error', Exception('not fetched')))
 
             if status == 'ok':
                 raw = data
-                # 除权 / HFQ 重算检测
+                # 除权 / QFQ 重算检测
                 if raw and last_date and beg is not None:
                     try:
                         last_close_row = db.fetchone(conn,
@@ -1346,7 +1349,7 @@ def fetch_history_batch(
                                 chg = abs(first_close - prev_close) / prev_close if prev_close > 0 else 0
                                 if chg > limit:
                                     log.warning(
-                                        "  [%d/%d] %s %s  HFQ除权重算: %s=%.2f→%.2f(%.1f%%)超涨跌停, 全量重刷",
+                                        "  [%d/%d] %s %s  QFQ除权重算: %s=%.2f→%.2f(%.1f%%)超涨跌停, 全量重刷",
                                         i + 1, len(batch), code, name,
                                         last_date, prev_close, first_close, chg * 100,
                                     )
@@ -3102,7 +3105,9 @@ def main():
     parser.add_argument("--reset-history", action="store_true",
                         help="重置 K 线拉取进度")
     parser.add_argument("--refresh-hfq", type=str, metavar="CODE",
-                        help="强制全量重刷单只股票的 HFQ K线（除权后修复数据库）")
+                        help="强制全量重刷单只股票的 K 线（除权后修复数据库）。"
+                             "参数名沿用历史, 实际拉取的是 QFQ 前复权数据,"
+                             "与 stock_history 表口径一致")
     parser.add_argument("--repair-nulls", action="store_true",
                         help="修复 stock_history 表中 amplitude/pct_chg/change 为 NULL 的行")
     parser.add_argument("--repair-codes", type=str, metavar="CODES",
@@ -3146,7 +3151,7 @@ def main():
         code = args.refresh_hfq.strip()
         conn = _get_db()
         try:
-            print(f"[refresh-hfq] 全量重刷 {code} 的 HFQ K线（365天）...")
+            print(f"[refresh-hfq] 全量重刷 {code} 的 K线（QFQ, 365天）...")
             raw_full = _fetch_kline_raw(code, days=365)
             old_count = db.fetchone(conn, "SELECT COUNT(*) FROM stock_history WHERE code=?", (code,))[0]
             db.execute(conn, "DELETE FROM stock_history WHERE code=?", (code,))

@@ -1206,7 +1206,7 @@ def kline_data(
     start_date: str = "",
     end_date: str = "",
     recent_days: int = 60,
-    adjust: str = "hfq",
+    adjust: str = "none",
     with_indicators: bool = True,
 ) -> str:
     """
@@ -1220,7 +1220,9 @@ def kline_data(
     start_date      : str   Start date "YYYY-MM-DD", if empty uses recent_days
     end_date        : str   End date "YYYY-MM-DD", if empty uses today
     recent_days     : int   Effective when start_date is empty, fetch recent N days, default 60
-    adjust          : str   Adjustment: hfq (backward, default) / qfq (forward) / none
+    adjust          : str   Adjustment: none (unadjusted, default, matches quote software) /
+                            qfq (forward, anchored to latest price, for indicators across splits) /
+                            hfq (backward, rarely needed — upstream API currently behaves like none)
     with_indicators : bool  Whether to compute MA/MACD/RSI/BOLL/KDJ, default True
 
     Returns
@@ -1459,7 +1461,7 @@ def stock_diagnosis(
 
     data_source = "db_prefer"
     try:
-        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="hfq")
+        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="qfq")
         if df is None or df.empty:
             return f"ERROR: Failed to fetch K-line data for {stock_code}"
     except Exception as e:
@@ -1655,7 +1657,7 @@ def strategy_backtest(
     start = (cn_now() - timedelta(days=backtest_days)).strftime("%Y-%m-%d")
 
     try:
-        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="hfq")
+        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="qfq")
         if df is None or df.empty:
             return f"ERROR: Failed to fetch K-line data for {stock_code}"
     except Exception as e:
@@ -1732,7 +1734,7 @@ def risk_assessment(
     start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
 
     try:
-        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="hfq")
+        df = df_mod.get_kline_prefer_db(stock_code, start=start, adjust="qfq")
         if df is None or df.empty:
             return f"ERROR: Failed to fetch K-line data for {stock_code}"
     except Exception as e:

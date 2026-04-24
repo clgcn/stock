@@ -12,7 +12,7 @@
   PERIOD_MAP, ADJUST_MAP
 """
 
-from _http_utils import _get, _get_secid, _sina_prefix, eastmoney_throttle, kline_cache, cn_now, cn_today
+from _http_utils import _get, _get_secid, _sina_prefix, eastmoney_throttle, kline_cache, cn_now
 import logging
 
 _log = logging.getLogger(__name__)
@@ -27,7 +27,7 @@ import re
 import time
 import argparse
 import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -294,7 +294,7 @@ def get_kline(
     period: str = "daily",
     start: str = None,
     end: str = None,
-    adjust: str = "hfq",
+    adjust: str = "none",
     limit: int = 500,
     _skip_cache: bool = False,
 ) -> pd.DataFrame:
@@ -315,7 +315,9 @@ def get_kline(
         period  Period: daily/weekly/monthly/1m/5m/15m/30m/60m
         start   Start date "YYYY-MM-DD"
         end     End date "YYYY-MM-DD"
-        adjust  Adjustment: qfq / hfq / none
+        adjust  Adjustment: qfq / hfq / none. 默认 none (未复权, 与行情软件显示一致);
+                计算技术指标 / 跨除权区间收益时显式传 "qfq" (A 股行情软件默认视角,
+                以最新价为锚点, 与 stock_history 表一致).
         limit   Max number of bars
 
     Returns:
@@ -382,20 +384,27 @@ def get_kline_prefer_db(
     code: str,
     period: str = "daily",
     start: str = None,
-    adjust: str = "hfq",
+    adjust: str = "none",
     min_bars: int = 30,
     local_only: bool = False,
 ) -> pd.DataFrame:
-    """优先从本地 SQLite 读取 K 线，数据不足时可回退到在线 API。
+    """优先从本地 PostgreSQL 读取 K 线，数据不足时可回退到在线 API。
 
     用于 Face 模块等批量分析场景，大幅减少并发 API 请求数。
-    本地数据取自 slow_fetcher 定期拉取的 stock_history 表。
+    本地数据取自 slow_fetcher 定期拉取的 stock_history 表, 存的是
+    **前复权 (QFQ)** 价格 —— 以最新交易日为锚点, 把历史价按分红除权因子
+    向下调整. 经 600519 跨除权日实测确认 (2025-06 除权日前后差值恒定 51.56
+    元 ≈ 2025 年度+中期分红累计), 符合 QFQ 数学特征, 与 HFQ 比例调整不同.
+    clist 批量接口 (bulk_daily_kline_from_clist) 写入的 f2 字段也是 QFQ,
+    所以 DB 口径统一.
 
     Args:
         code        股票代码
         period      仅 "daily" 支持本地，其他自动走 API
         start       起始日期 "YYYY-MM-DD"
-        adjust      复权方式 (本地数据默认前复权)
+        adjust      复权方式 (默认 none 未复权). 注意: stock_history 表只存
+                    QFQ, 所以请求 != "qfq" 时会绕过 DB 直接走在线 API,
+                    避免返回错误复权口径的数据.
         min_bars    最少需要多少条数据才算够用
         local_only  True = 纯本地模式，DB 没数据就返回 None，绝不发 API。
                     用于盘前选股等批量场景，确保零网络请求。
@@ -408,7 +417,13 @@ def get_kline_prefer_db(
     if period != "daily" and local_only:
         return None
 
-    # 先尝试本地 DB
+    # stock_history 表只存 QFQ, 其它复权口径必须走在线 API 保证正确性
+    if adjust != "qfq":
+        if local_only:
+            return None
+        return get_kline(code, period=period, start=start, adjust=adjust)
+
+    # 先尝试本地 DB (adjust == "qfq")
     try:
         from slow_fetcher import load_stock_history
         df = load_stock_history(code)
@@ -648,7 +663,7 @@ def _cli():
     parser.add_argument("--start", type=str, help="Start date YYYY-MM-DD")
     parser.add_argument("--end", type=str, help="End date YYYY-MM-DD")
     parser.add_argument("--days", type=int, default=250, help="Recent N days (default 250)")
-    parser.add_argument("--adjust", type=str, default="hfq", choices=["qfq","hfq","none"])
+    parser.add_argument("--adjust", type=str, default="none", choices=["qfq","hfq","none"])
     parser.add_argument("--realtime", action="store_true", help="Fetch realtime quotes")
     parser.add_argument("--financial", action="store_true", help="Fetch financial data")
     parser.add_argument("--plot", action="store_true", help="Generate K-line chart")

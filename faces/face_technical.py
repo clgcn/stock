@@ -285,7 +285,7 @@ class TechnicalFace:
         start = (cn_now() - timedelta(days=analysis_days)).strftime("%Y-%m-%d")
         try:
             df = get_kline_prefer_db(stock_code, period="daily", start=start,
-                                      adjust="hfq", local_only=local_only)
+                                      adjust="qfq", local_only=local_only)
         except Exception as e:
             return None, None, f"K线数据获取失败: {e}"
         if df is None or len(df) < 30:

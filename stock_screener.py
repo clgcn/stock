@@ -806,8 +806,10 @@ def _load_kline(code: str, analysis_days: int = 120,
         return None
 
     # 单股模式: 回退在线 API
+    # adjust="qfq": 与 stock_history 表本地数据口径一致 (前复权,
+    # 以最新价为锚点), 避免本地 vs 在线数据跨除权日价格断层
     try:
-        return get_kline(code, period="daily", start=start, adjust="hfq")
+        return get_kline(code, period="daily", start=start, adjust="qfq")
     except Exception:
         return None
 
