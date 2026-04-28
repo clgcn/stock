@@ -1201,7 +1201,9 @@ def _lhb_sub_score(conn, code: str, period: str = _LHB_PERIOD_DEFAULT) -> tuple:
         (code, period),
     )
     if not row:
-        return 0.0, {"available": False, "lhb_count": 0}
+        cnt = db.fetchone(conn, "SELECT COUNT(*) FROM stock_lhb_stat", ())
+        table_empty = (cnt is None or cnt[0] == 0)
+        return 0.0, {"available": False, "lhb_count": 0, "table_empty": table_empty}
 
     last_date, lhb_count, inst_buy, inst_sell, inst_net, lhb_net = row
     inst_net_yi = float(inst_net or 0) / 1e8  # 元 → 亿
@@ -1341,7 +1343,9 @@ def _dzjy_sub_score(conn, code: str, period: str = _DZJY_PERIOD_DEFAULT) -> tupl
         (code, period),
     )
     if not row:
-        return 0.0, {"available": False, "total_count": 0}
+        cnt = db.fetchone(conn, "SELECT COUNT(*) FROM stock_dzjy_stat", ())
+        table_empty = (cnt is None or cnt[0] == 0)
+        return 0.0, {"available": False, "total_count": 0, "table_empty": table_empty}
 
     last_date, total, premium, discount, amt, rate, amt2float = row
     total = int(total or 0)
@@ -1506,11 +1510,17 @@ def format_realtime_report(code: str, conn=None) -> str:
                 "",
             ])
         else:
-            lines.extend([
-                "▌ 龙虎榜机构席位: 该股近期未入选龙虎榜",
-                "  (或 stock_lhb_stat 表为空, 请先跑 slow_fetcher --lhb-snapshot)",
-                "",
-            ])
+            if lhb.get("table_empty"):
+                lines.extend([
+                    "▌ 龙虎榜机构席位: 数据未拉取 (stock_lhb_stat 表为空)",
+                    "  请先跑: python slow_fetcher.py --lhb-snapshot",
+                    "",
+                ])
+            else:
+                lines.extend([
+                    "▌ 龙虎榜机构席位: 该股近期未入选龙虎榜",
+                    "",
+                ])
 
         # 大宗交易段
         if dzjy.get("available"):
@@ -1525,11 +1535,17 @@ def format_realtime_report(code: str, conn=None) -> str:
                 "",
             ])
         else:
-            lines.extend([
-                "▌ 大宗交易: 该股近期无大宗交易记录",
-                "  (或 stock_dzjy_stat 表为空, 请先跑 slow_fetcher --dzjy-snapshot)",
-                "",
-            ])
+            if dzjy.get("table_empty"):
+                lines.extend([
+                    "▌ 大宗交易: 数据未拉取 (stock_dzjy_stat 表为空)",
+                    "  请先跑: python slow_fetcher.py --dzjy-snapshot",
+                    "",
+                ])
+            else:
+                lines.extend([
+                    "▌ 大宗交易: 该股近期无大宗交易记录",
+                    "",
+                ])
 
         lines.append(f"一句话: {s['detail']}")
         return "\n".join(lines)

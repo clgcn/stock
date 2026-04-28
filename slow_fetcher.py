@@ -1893,6 +1893,27 @@ def full_daily_update(batch_size: int = 50,
     _start_ts = _time.monotonic()
     _deadline = _start_ts + max_minutes * 60 if max_minutes > 0 else 0
 
+    # ── Phase 0: 龙虎榜 + 大宗交易快照 (全市场单次, ~5秒, 优先保证运行) ──
+    lhb_result = {"fetched": 0, "stored": 0, "err": None}
+    dzjy_result = {"fetched": 0, "stored": 0, "err": None}
+    log.info("═══ Phase 0: 龙虎榜 + 大宗交易快照 ═══")
+    try:
+        from institutional import refresh_lhb_stat
+        lhb_result = refresh_lhb_stat(period="近一月")
+        log.info("  龙虎榜: 抓取 %d 只, 入库 %d 条",
+                 lhb_result.get("fetched", 0), lhb_result.get("stored", 0))
+    except Exception as e:
+        log.warning("  龙虎榜快照失败: %s", e)
+        lhb_result = {"fetched": 0, "stored": 0, "err": str(e)}
+    try:
+        from institutional import refresh_dzjy_stat
+        dzjy_result = refresh_dzjy_stat(period="近一月")
+        log.info("  大宗交易: 抓取 %d 只, 入库 %d 条",
+                 dzjy_result.get("fetched", 0), dzjy_result.get("stored", 0))
+    except Exception as e:
+        log.warning("  大宗交易快照失败: %s", e)
+        dzjy_result = {"fetched": 0, "stored": 0, "err": str(e)}
+
     # ── Phase 1: Fundamentals + K线 ──
     log.info("═══ Phase 1/3: Fundamentals + K线增量 ═══")
     # 给 Phase 1 分配剩余时间
@@ -1920,6 +1941,8 @@ def full_daily_update(batch_size: int = 50,
             "snapshot": daily_result.get("snapshot"),
             "history": daily_result.get("history"),
             "moneyflow": {"fetched": 0, "rounds": 0, "errors": [], "done": False},
+            "lhb_snapshot": lhb_result,
+            "dzjy_snapshot": dzjy_result,
             "institutional": {"fetched": 0, "rounds": 0, "errors": [], "done": False},
             "done": False,
             "time_expired": True,
@@ -1966,28 +1989,6 @@ def full_daily_update(batch_size: int = 50,
         if mf_result.get("fetched", 0) == 0 and remaining == 0:
             mf_done = True
             break
-
-    # ── Phase 2.5: 龙虎榜 + 大宗交易快照 (日频, 一次覆盖全市场, 各 ~5秒) ──
-    lhb_result = {"fetched": 0, "stored": 0, "err": None}
-    dzjy_result = {"fetched": 0, "stored": 0, "err": None}
-    if not (_deadline and _time.monotonic() >= _deadline):
-        log.info("═══ Phase 2.5: 龙虎榜 + 大宗交易快照 ═══")
-        try:
-            from institutional import refresh_lhb_stat
-            lhb_result = refresh_lhb_stat(period="近一月")
-            log.info("  龙虎榜: 抓取 %d 只, 入库 %d 条",
-                     lhb_result.get("fetched", 0), lhb_result.get("stored", 0))
-        except Exception as e:
-            log.warning("  龙虎榜快照失败: %s", e)
-            lhb_result = {"fetched": 0, "stored": 0, "err": str(e)}
-        try:
-            from institutional import refresh_dzjy_stat
-            dzjy_result = refresh_dzjy_stat(period="近一月")
-            log.info("  大宗交易: 抓取 %d 只, 入库 %d 条",
-                     dzjy_result.get("fetched", 0), dzjy_result.get("stored", 0))
-        except Exception as e:
-            log.warning("  大宗交易快照失败: %s", e)
-            dzjy_result = {"fetched": 0, "stored": 0, "err": str(e)}
 
     # ── Phase 3: 机构持仓 (季度级, 已完成则秒过) ──
     inst_result = {"fetched": 0, "rounds": 0, "errors": [], "done": False}
