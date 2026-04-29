@@ -31,27 +31,30 @@ def import_file(conn, path: str) -> tuple[int, int]:
         print(f"  ⚠️  {os.path.basename(path)}: diff 字段为空，跳过")
         return 0, 0
 
-    inserted = 0
-    skipped  = 0
+    rows = []
+    skipped = 0
     for r in diff:
         code = r.get("f12", "")
         if not code:
             skipped += 1
             continue
+        rows.append((code, r.get("f14", "")))
 
-        db.execute(conn,
-            """
+    if rows:
+        sql = """
             INSERT INTO stocks (code, name, suspended)
             VALUES (%s, %s, 0)
             ON CONFLICT(code) DO UPDATE SET
                 name = excluded.name
-            """,
-            (code, r.get("f14", "")),
-        )
-        inserted += 1
+            """
+        cur = conn.cursor()
+        try:
+            cur.executemany(sql, rows)
+            conn.commit()
+        finally:
+            cur.close()
 
-    conn.commit()
-    return inserted, skipped
+    return len(rows), skipped
 
 
 def main():
@@ -67,28 +70,28 @@ def main():
         return
 
     conn = db.get_conn()
-    ensure_tables(conn)
+    try:
+        ensure_tables(conn)
 
-    # 导入前总数
-    before = db.execute(conn, "SELECT COUNT(*) FROM stocks", ()).fetchone()[0]
-    print(f"导入前数据库已有: {before} 条\n")
+        before = db.execute(conn, "SELECT COUNT(*) FROM stocks", ()).fetchone()[0]
+        print(f"导入前数据库已有: {before} 条\n")
 
-    total_inserted = 0
-    total_skipped  = 0
+        total_inserted = 0
+        total_skipped  = 0
 
-    for path in files:
-        inserted, skipped = import_file(conn, path)
-        total_inserted += inserted
-        total_skipped  += skipped
-        print(f"  ✅ {os.path.basename(path):10s}  新增/覆盖: {inserted:3d} 条  跳过: {skipped} 条")
+        for path in files:
+            inserted, skipped = import_file(conn, path)
+            total_inserted += inserted
+            total_skipped  += skipped
+            print(f"  ✅ {os.path.basename(path):10s}  新增/覆盖: {inserted:3d} 条  跳过: {skipped} 条")
 
-    after = db.execute(conn, "SELECT COUNT(*) FROM stocks", ()).fetchone()[0]
-    conn.close()
-
-    print(f"\n导入完成！")
-    print(f"  处理文件: {len(files)} 个")
-    print(f"  本次写入: {total_inserted} 条（含覆盖更新）")
-    print(f"  数据库总计: {before} → {after} 条（净增 {after - before} 条）")
+        after = db.execute(conn, "SELECT COUNT(*) FROM stocks", ()).fetchone()[0]
+        print(f"\n导入完成！")
+        print(f"  处理文件: {len(files)} 个")
+        print(f"  本次写入: {total_inserted} 条（含覆盖更新）")
+        print(f"  数据库总计: {before} → {after} 条（净增 {after - before} 条）")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

@@ -162,6 +162,14 @@ def _sina_prefix(code: str) -> str:
         return f"sz{code}"
 
 
+def tencent_symbol(code: str) -> str:
+    """Return Tencent quote symbol, e.g. sh600519 / sz000858"""
+    code = str(code).strip().upper().replace("SH", "").replace("SZ", "")
+    if code.startswith(("60", "68", "51", "11")):
+        return f"sh{code}"
+    return f"sz{code}"
+
+
 # ─── 中国时区工具 ────────────────────────────────────────
 # A股分析所有日期/时间必须基于 Asia/Shanghai 时区。
 # 所有模块统一使用这里导出的工具函数，不再直接调用
@@ -194,8 +202,7 @@ def cn_str(fmt: str = "%Y-%m-%d") -> str:
 # 每年末需根据官方公告更新下一年度数据。
 
 # 节假日休市（工作日但不开盘）
-_CN_HOLIDAYS: set = {
-    # ── 2025 ──
+_CN_HOLIDAYS_2025: set = {
     _date(2025, 1, 1),                                          # 元旦
     _date(2025, 1, 28), _date(2025, 1, 29), _date(2025, 1, 30),
     _date(2025, 1, 31), _date(2025, 2, 1), _date(2025, 2, 2),
@@ -205,7 +212,9 @@ _CN_HOLIDAYS: set = {
     _date(2025, 5, 31), _date(2025, 6, 1), _date(2025, 6, 2),  # 端午
     _date(2025, 10, 1), _date(2025, 10, 2), _date(2025, 10, 3),
     _date(2025, 10, 6), _date(2025, 10, 7), _date(2025, 10, 8), # 国庆
-    # ── 2026 ──
+}
+
+_CN_HOLIDAYS_2026: set = {
     _date(2026, 1, 1), _date(2026, 1, 2),                      # 元旦
     _date(2026, 2, 16), _date(2026, 2, 17), _date(2026, 2, 18),
     _date(2026, 2, 19), _date(2026, 2, 20), _date(2026, 2, 23),
@@ -215,7 +224,10 @@ _CN_HOLIDAYS: set = {
     _date(2026, 6, 19),                                         # 端午
     _date(2026, 10, 1), _date(2026, 10, 2), _date(2026, 10, 5),
     _date(2026, 10, 6), _date(2026, 10, 7), _date(2026, 10, 8), # 国庆
-    # ── 2027 (预估，需官方确认后更新) ──
+}
+
+# 2027 (预估，需官方确认后更新)
+_CN_HOLIDAYS_2027: set = {
     _date(2027, 1, 1),                                          # 元旦
     _date(2027, 2, 5), _date(2027, 2, 8), _date(2027, 2, 9),
     _date(2027, 2, 10), _date(2027, 2, 11), _date(2027, 2, 12), # 春节
@@ -226,15 +238,18 @@ _CN_HOLIDAYS: set = {
     _date(2027, 10, 6), _date(2027, 10, 7), _date(2027, 10, 8), # 国庆
 }
 
+_CN_HOLIDAYS: set = _CN_HOLIDAYS_2025 | _CN_HOLIDAYS_2026 | _CN_HOLIDAYS_2027
+
 # 周末补班交易日（周六/日但开盘）
-_CN_EXTRA_TRADE_DAYS: set = {
-    # ── 2025 ──
+_CN_EXTRA_TRADE_DAYS_2025: set = {
     _date(2025, 1, 26),   # 春节调休
     _date(2025, 2, 8),    # 春节调休
     _date(2025, 4, 27),   # 劳动节调休
     _date(2025, 9, 28),   # 国庆调休
     _date(2025, 10, 11),  # 国庆调休
-    # ── 2026 ──
+}
+
+_CN_EXTRA_TRADE_DAYS_2026: set = {
     _date(2026, 2, 14),   # 春节调休
     _date(2026, 2, 28),   # 春节调休
     _date(2026, 4, 26),   # 劳动节调休
@@ -242,6 +257,8 @@ _CN_EXTRA_TRADE_DAYS: set = {
     _date(2026, 9, 27),   # 国庆调休
     _date(2026, 10, 10),  # 国庆调休
 }
+
+_CN_EXTRA_TRADE_DAYS: set = _CN_EXTRA_TRADE_DAYS_2025 | _CN_EXTRA_TRADE_DAYS_2026
 
 
 def is_trade_day(d: _date) -> bool:
@@ -272,20 +289,28 @@ def next_trade_day(ref: _date = None) -> _date:
 
 
 def last_trade_day(ref: _date = None) -> _date:
-    """返回最近一个已过去的A股交易日。
+    """返回最近一个已收盘的A股交易日。
 
-    ref 默认为中国当天日期。
-    支持法定节假日和周末补班。
+    ref 默认为中国当天日期。当天交易日收盘时间15:00为界：
+      - 15:00前 → 返回上一个交易日
+      - 15:00后 → 返回当天
+    若传入 ref 为历史日期，直接向前找最近的交易日（不考虑当日收盘状态）。
     """
-    d = ref or cn_today()
-    # 如果当天是交易日且已过15:00，返回当天
-    if is_trade_day(d):
-        now = _dt.now(CN_TZ)
-        if now.hour >= 15 and d == cn_today():
-            return d
-    # 往前找最近的交易日
-    if not is_trade_day(d) or (d == cn_today() and _dt.now(CN_TZ).hour < 15):
-        d -= _timedelta(days=1)
+    today = cn_today()
+    d = ref if ref is not None else today
+
+    if d < today:
+        # 历史日期：向前找最近交易日（不受当日收盘时间约束）
         while not is_trade_day(d):
             d -= _timedelta(days=1)
+        return d
+
+    # d == today
+    if is_trade_day(d) and _dt.now(CN_TZ).hour >= 15:
+        return d
+
+    # 今日未收盘或非交易日，向前找
+    d -= _timedelta(days=1)
+    while not is_trade_day(d):
+        d -= _timedelta(days=1)
     return d

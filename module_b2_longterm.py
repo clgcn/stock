@@ -19,6 +19,7 @@
 
 import re
 from typing import TypedDict, Optional
+from common_utils import _extract_float, _extract_float_warn, _module_header
 
 
 class LongTermSignals(TypedDict):
@@ -159,18 +160,6 @@ def run_longterm_pipeline(
 # 内部辅助函数
 # ══════════════════════════════════════════════════════
 
-def _extract_float(text: str, pattern: str) -> Optional[float]:
-    """从文本中用正则提取浮点数。"""
-    if not text:
-        return None
-    m = re.search(pattern, text)
-    if m:
-        try:
-            return float(m.group(1))
-        except (ValueError, IndexError):
-            pass
-    return None
-
 
 def _extract_signals(
     financial_report: str,
@@ -183,27 +172,36 @@ def _extract_signals(
     """从各工具报告中提取结构化信号。"""
 
     # ── 财务质量 ──
-    roe = _extract_float(financial_report, r"ROE\s*[：:]\s*(\d+(?:\.\d+)?)%?")
-    net_profit_growth = _extract_float(
+    roe = _extract_float_warn(financial_report, r"ROE\s*[：:]\s*(\d+(?:\.\d+)?)%?", "roe")
+    net_profit_growth = _extract_float_warn(
         valuation_report or financial_report,
-        r"净利润增[速长率][：:]\s*([+-]?\d+(?:\.\d+)?)%?"
+        r"净利润增[速长率][：:]\s*([+-]?\d+(?:\.\d+)?)%?",
+        "net_profit_growth",
     )
-    gross_margin = _extract_float(financial_report, r"[毛Gross].*?[率Margin]\s*[：:]\s*(\d+(?:\.\d+)?)%?")
+    gross_margin = _extract_float_warn(
+        financial_report,
+        r"(?:毛|Gross).*?(?:率|Margin)\s*[：:]\s*(\d+(?:\.\d+)?)%?",
+        "gross_margin",
+    )
     gross_margin_stable = "毛利率稳定" in (valuation_report or "") or "波动小" in (valuation_report or "")
-    fcf_ratio = _extract_float(valuation_report or "", r"自由现金流/净利润[：:]\s*(\d+(?:\.\d+)?)%?")
+    fcf_ratio = _extract_float_warn(
+        valuation_report or "", r"自由现金流/净利润[：:]\s*(\d+(?:\.\d+)?)%?", "fcf_ratio"
+    )
 
     # ── 估值安全边际 ──
-    peg = _extract_float(valuation_report, r"PEG\s*[：:=]\s*(\d+(?:\.\d+)?)")
-    pe_ttm = _extract_float(financial_report, r"PE\s*(?:TTM)?\s*[：:]\s*(\d+(?:\.\d+)?)")
-    pb = _extract_float(financial_report, r"PB\s*[：:]\s*(\d+(?:\.\d+)?)")
-    pe_pct = _extract_float(valuation_report, r"PE.*?百分位[：:]\s*(\d+(?:\.\d+)?)%?")
-    pb_vs = _extract_float(valuation_report, r"PB.*?行业.*?(\d+(?:\.\d+)?)倍")
+    peg = _extract_float_warn(valuation_report, r"PEG\s*[：:=]\s*(\d+(?:\.\d+)?)", "peg")
+    pe_ttm = _extract_float_warn(financial_report, r"PE\s*(?:TTM)?\s*[：:]\s*(\d+(?:\.\d+)?)", "pe_ttm")
+    pb = _extract_float_warn(financial_report, r"PB\s*[：:]\s*(\d+(?:\.\d+)?)", "pb")
+    pe_pct = _extract_float_warn(valuation_report, r"PE.*?百分位[：:]\s*(\d+(?:\.\d+)?)%?", "pe_percentile")
+    pb_vs = _extract_float_warn(valuation_report, r"PB.*?行业.*?(\d+(?:\.\d+)?)倍", "pb_vs_industry")
 
     # ── 负债与商誉 ──
-    debt_ratio = _extract_float(balance_report, r"资产负债率[：:]\s*(\d+(?:\.\d+)?)%?")
-    goodwill_ratio = _extract_float(balance_report, r"商誉.*?占.*?净资产\s*(\d+(?:\.\d+)?)%?")
+    debt_ratio = _extract_float_warn(balance_report, r"资产负债率[：:]\s*(\d+(?:\.\d+)?)%?", "debt_ratio")
+    goodwill_ratio = _extract_float_warn(
+        balance_report, r"商誉.*?占.*?净资产\s*(\d+(?:\.\d+)?)%?", "goodwill_ratio"
+    )
     if goodwill_ratio is None:
-        goodwill_ratio = _extract_float(balance_report, r"占净资产\s*(\d+(?:\.\d+)?)%")
+        goodwill_ratio = _extract_float_warn(balance_report, r"占净资产\s*(\d+(?:\.\d+)?)%", "goodwill_ratio")
 
     # ── 成长质量 ──
     revenue_3y = "营收" in (earnings_report or "") and "连续增长" in (earnings_report or "")
@@ -211,19 +209,23 @@ def _extract_signals(
         revenue_3y = "双增" in (earnings_report or "")
     growth_accel = "加速" in (earnings_report or "")
     beat = "超预期" in (earnings_report or "") or "超出预期" in (earnings_report or "")
-    no_reg = not any(kw in ann_report for kw in ("监管", "问询函", "警示函", "诉讼", "立案"))
+    no_reg = not any(kw in ann_report for kw in ("收到监管", "监管问询", "被监管", "问询函", "警示函", "诉讼", "立案"))
     slowing = "放缓" in (earnings_report or "") and "连续" in (earnings_report or "")
 
     # ── 分红与治理 ──
     div_years = 0
     if dividend_report:
-        m = re.search(r"共\s*(\d+)\s*次现金分红", dividend_report)
-        if m:
-            div_years = int(m.group(1))
-    div_yield = _extract_float(dividend_report or "", r"股息率[：:]\s*(\d+(?:\.\d+)?)%?")
+        # 优先匹配"连续X年分红"（精确），回退到"共X次"（次≠年，按次数/2估算）
+        m_year = re.search(r"连续\s*(\d+)\s*年", dividend_report)
+        m_count = re.search(r"共\s*(\d+)\s*次现金分红", dividend_report)
+        if m_year:
+            div_years = int(m_year.group(1))
+        elif m_count:
+            div_years = max(1, int(m_count.group(1)) // 2)  # 假设平均2次/年
+    div_yield = _extract_float_warn(dividend_report or "", r"股息率[：:]\s*(\d+(?:\.\d+)?)%?", "dividend_yield")
     mgmt_inc = "增持" in (ann_report or "") and "高管" in (ann_report or "")
     no_misuse = not any(kw in ann_report for kw in ("资金占用", "关联交易", "违规担保"))
-    pledge_pct = _extract_float(ann_report, r"质押比例[：:]\s*(\d+(?:\.\d+)?)%?")
+    pledge_pct = _extract_float_warn(ann_report, r"质押比例[：:]\s*(\d+(?:\.\d+)?)%?", "pledge_pct")
 
     return LongTermSignals(
         roe=roe,
@@ -254,11 +256,7 @@ def _extract_signals(
 def format_longterm_report(result: LongTermResult, stock_name: str, stock_code: str) -> str:
     """格式化长线分析报告。"""
     sections = [
-        "",
-        "=" * 60,
-        f"【模块 B2】长线分析 — {stock_name}（{stock_code}）",
-        "=" * 60,
-        "",
+        *_module_header("【模块 B2】长线分析", stock_name, stock_code),
         "▌ 财务数据（PE/PB/ROE/毛利率/净利率）", result["financial_report"],
         "",
         "▌ 估值质量（PEG + 杜邦分析）", result["valuation_report"],

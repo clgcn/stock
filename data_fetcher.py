@@ -12,7 +12,7 @@
   PERIOD_MAP, ADJUST_MAP
 """
 
-from _http_utils import _get, _get_secid, _sina_prefix, eastmoney_throttle, kline_cache, cn_now
+from _http_utils import _get, _get_secid, _sina_prefix, tencent_symbol, eastmoney_throttle, kline_cache, cn_now
 import logging
 
 _log = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import re
 import time
+import threading
 import argparse
 import sys
 from datetime import timedelta
@@ -67,20 +68,26 @@ _TENCENT_FQT_MAP = {
     "none": "0",
 }
 
+# ── 腾讯 qt.gtimg.cn 实时行情字段索引 ──
+_QT_FIELD_PRICE = 3        # 当前价格
+_QT_FIELD_FLOAT_MV = 44    # 流通市值（亿）
+_QT_MIN_FIELDS = 46        # 有效响应最少字段数
 
-def _tencent_prefix(code: str) -> str:
-    """股票代码 → 腾讯前缀 (sh/sz)，与新浪一致"""
-    code = str(code).strip().upper().replace("SH", "").replace("SZ", "")
-    if code.startswith(("60", "68", "51", "11")):
-        return f"sh{code}"
-    return f"sz{code}"
+# ── K线成交额单位自动检测阈值 ──
+# 理论值 amount(元) ≈ volume(手)×100×close。
+# 实际/理论比值落在此区间说明 amount 单位为万元，需乘 10000。
+_AMOUNT_RATIO_MIN = 5_000
+_AMOUNT_RATIO_MAX = 50_000
 
 
 # ── 流通股本缓存（用于换手率反算）──
 # key: code, value: (float_shares, timestamp)
 # 流通股本变化极慢（只有增发/回购才变），缓存 24 小时足够
-_FLOAT_SHARES_CACHE = {}
+_FLOAT_SHARES_CACHE: dict = {}
 _FLOAT_SHARES_TTL = 86400  # 1 day
+_FLOAT_SHARES_LOCK = threading.Lock()
+# 正在拉取中的 code 集合（避免并发 stampede：多线程同时发现缓存失效，同时发起请求）
+_FLOAT_SHARES_FETCHING: set = set()
 
 
 def prime_float_shares(code: str, float_shares: float) -> None:
@@ -94,9 +101,9 @@ def prime_float_shares(code: str, float_shares: float) -> None:
         float_shares: 流通股本（股数, 不是亿股）
     """
     if float_shares and float_shares > 0:
-        # 用 hash 代码标准化, 去掉可能的 sh/sz 前缀
         norm = str(code).strip().upper().replace("SH", "").replace("SZ", "")
-        _FLOAT_SHARES_CACHE[norm] = (float(float_shares), time.time())
+        with _FLOAT_SHARES_LOCK:
+            _FLOAT_SHARES_CACHE[norm] = (float(float_shares), time.time())
 
 
 def _get_float_shares_tencent(code: str) -> float:
@@ -113,36 +120,44 @@ def _get_float_shares_tencent(code: str) -> float:
     Returns:
         float: 流通股本（股），失败返回 None
     """
-    cached = _FLOAT_SHARES_CACHE.get(code)
-    if cached and (time.time() - cached[1]) < _FLOAT_SHARES_TTL:
-        return cached[0]
+    with _FLOAT_SHARES_LOCK:
+        cached = _FLOAT_SHARES_CACHE.get(code)
+        if cached and (time.time() - cached[1]) < _FLOAT_SHARES_TTL:
+            return cached[0]
+        # 已有其他线程在拉取，直接返回旧值（宁可用旧值也不重复请求）
+        if code in _FLOAT_SHARES_FETCHING:
+            return cached[0] if cached else None
+        _FLOAT_SHARES_FETCHING.add(code)
 
-    sym = _tencent_prefix(code)
-    url = f"http://qt.gtimg.cn/q={sym}"
     try:
+        sym = tencent_symbol(code)
+        url = f"http://qt.gtimg.cn/q={sym}"
         resp = _get(url)
         resp.raise_for_status()
-        # 腾讯 qt 返回 GBK 编码
         text = resp.content.decode("gbk", errors="ignore")
 
         m = re.search(r'v_\w+="([^"]+)"', text)
         if not m:
             return None
         fields = m.group(1).split("~")
-        if len(fields) < 46:
+        if len(fields) < _QT_MIN_FIELDS:
             return None
 
-        current_price = float(fields[3] or 0)
-        float_mv_yi = float(fields[44] or 0)  # 流通市值, 亿
+        current_price = float(fields[_QT_FIELD_PRICE] or 0)
+        float_mv_yi = float(fields[_QT_FIELD_FLOAT_MV] or 0)
         if current_price <= 0 or float_mv_yi <= 0:
             return None
 
         float_shares = float_mv_yi * 1e8 / current_price
-        _FLOAT_SHARES_CACHE[code] = (float_shares, time.time())
+        with _FLOAT_SHARES_LOCK:
+            _FLOAT_SHARES_CACHE[code] = (float_shares, time.time())
         return float_shares
     except Exception as e:
         _log.debug("Failed to fetch float_shares for %s: %s", code, e)
         return None
+    finally:
+        with _FLOAT_SHARES_LOCK:
+            _FLOAT_SHARES_FETCHING.discard(code)
 
 
 def _get_kline_tencent(
@@ -161,7 +176,7 @@ def _get_kline_tencent(
         raise ValueError(f"Tencent kline does not support period={period}")
 
     fqt = _TENCENT_FQT_MAP.get(adjust, "2")  # default to hfq (backward-adjusted)
-    sym = _tencent_prefix(code)
+    sym = tencent_symbol(code)
 
     # 腾讯 param 格式: code,period,start,end,limit,fq
     # start/end 用 YYYY-MM-DD; 留空为字符串 ""
@@ -170,8 +185,10 @@ def _get_kline_tencent(
     param = f"{sym},{tperiod},{s},{e},{limit},{fqt}"
 
     # 复权 endpoint: appstock/app/fqkline/get; 不复权: kline/kline
-    # 注意: 不要传 _var 参数, 否则会返回 JSONP 格式无法用 .json() 解析
-    if fqt:
+    # fqt 是字符串 "0"/"1"/"2"，"0" 表示不复权。
+    # 注意: Python 中 bool("0") == True，必须显式判断 != "0"。
+    needs_fq = fqt != "0"
+    if needs_fq:
         url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
     else:
         url = "https://web.ifzq.gtimg.cn/appstock/app/kline/kline"
@@ -185,7 +202,7 @@ def _get_kline_tencent(
 
     block = data.get("data", {}).get(sym, {}) or {}
     # 复权数据 key 形如 qfqday/hfqday, 原始为 day/week/month
-    if fqt:
+    if needs_fq:
         data_key = f"{fqt}{tperiod}"
     else:
         data_key = tperiod
@@ -215,7 +232,7 @@ def _get_kline_tencent(
             actual = sample["amount"]
             if expected > 0 and actual > 0:
                 ratio = expected / actual
-                if 5000 <= ratio <= 50000:
+                if _AMOUNT_RATIO_MIN <= ratio <= _AMOUNT_RATIO_MAX:
                     # amount 是万元，转为元
                     df["amount"] = df["amount"] * 10000
         except Exception:
@@ -527,8 +544,9 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     delta = c.diff()
     for n in [6, 12, 24]:
-        gain = delta.clip(lower=0).rolling(n).mean()
-        loss = (-delta.clip(upper=0)).rolling(n).mean()
+        # Wilder EMA (alpha=1/n) — 与同花顺/东财行情软件一致
+        gain = delta.clip(lower=0).ewm(alpha=1/n, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1/n, adjust=False).mean()
         rs = gain / loss.replace(0, np.nan)
         df[f"rsi{n}"] = (100 - 100 / (1 + rs)).round(2)
 
@@ -540,7 +558,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     low_min = df["low"].rolling(9).min()
     high_max = df["high"].rolling(9).max()
-    rsv = (c - low_min) / (high_max - low_min) * 100
+    # 涨跌停连板时 high_max == low_min，除零后赋50（中性，无法判断方向）
+    rsv = ((c - low_min) / (high_max - low_min).replace(0, np.nan) * 100).fillna(50)
     df["kdj_k"] = rsv.ewm(com=2, adjust=False).mean().round(2)
     df["kdj_d"] = df["kdj_k"].ewm(com=2, adjust=False).mean().round(2)
     df["kdj_j"] = (3 * df["kdj_k"] - 2 * df["kdj_d"]).round(2)

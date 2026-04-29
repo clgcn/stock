@@ -19,6 +19,10 @@
 
 import re
 from typing import TypedDict, Optional
+from common_utils import (
+    _extract_float, _extract_float_warn,
+    _has_keyword_unaffirmed, _module_header,
+)
 
 
 class ShortTermSignals(TypedDict):
@@ -44,6 +48,9 @@ class ShortTermSignals(TypedDict):
     monte_carlo_up_prob: Optional[float]
     quant_share_pct: Optional[float]    # 量化资金占比
     hurst: Optional[float]              # Hurst指数 (≥0.55趋势市 / ≤0.45均值回归)
+
+    # 量价配合
+    volume_breakout: Optional[bool]  # True=放量确认突破, False=缩量警告, None=无信息
 
     # 融资融券情绪 (权重10%)
     margin_balance_change_pct: Optional[float]  # 融资余额周环比变化
@@ -203,11 +210,18 @@ def _check_earnings_trigger(ann_report: str, stock_code: str, earnings_fn) -> tu
     try:
         report = earnings_fn(stock_code)
         sentiment = 0.0
-        if "news_sentiment 建议在技术分析基础上 +0.2 ~ +0.3" in report:
-            sentiment = 0.25
-        elif "news_sentiment 建议在技术分析基础上 -0.2 ~ -0.3" in report:
-            sentiment = -0.25
-        return report, sentiment
+        # 弹性正则：匹配 "+0.2 ~ +0.3" / "+0.2~+0.3" / "+0.20 ～ +0.30" 等变体
+        m_pos = re.search(
+            r'建议[^+\-\d]{0,15}\+\s*(\d+\.\d+)\s*[~～]\s*\+\s*(\d+\.\d+)', report
+        )
+        m_neg = re.search(
+            r'建议[^+\-\d]{0,15}-\s*(\d+\.\d+)\s*[~～]\s*-\s*(\d+\.\d+)', report
+        )
+        if m_pos:
+            sentiment = (float(m_pos.group(1)) + float(m_pos.group(2))) / 2
+        elif m_neg:
+            sentiment = -((float(m_neg.group(1)) + float(m_neg.group(2))) / 2)
+        return report, round(sentiment, 3)
     except Exception:
         return None, 0.0
 
@@ -223,23 +237,28 @@ def _extract_signals(
 ) -> ShortTermSignals:
     """从各工具报告中提取结构化信号，供评分卡使用。"""
 
-    # ── 催化剂强度 ──
+    # ── 催化剂强度（否定语义感知）──
+    # 负面优先：正负混报时保守处理；每个关键词均检查前8字是否有否定词
+    _NEG_WORDS  = ("利空", "负面", "风险提示", "警示", "问询函", "诉讼", "立案调查")
+    _STR_WORDS  = ("涨停", "重大利好", "大幅超预期", "重组", "并购")
+    _MED_WORDS  = ("政策", "行业利好", "预期改善", "受益")
+
     catalyst_type = "weak"
-    catalyst_detail = ""
-    if "涨停" in news_report or "重大利好" in news_report:
-        catalyst_type = "strong"
-        catalyst_detail = "当日公告/涨停催化"
-    elif "政策" in news_report or "行业利好" in news_report:
-        catalyst_type = "medium"
-        catalyst_detail = "行业政策/预期改善"
-    elif "利空" in news_report or "负面" in news_report:
+    catalyst_detail = "无明显催化剂"
+    if _has_keyword_unaffirmed(news_report, _NEG_WORDS):
         catalyst_type = "negative"
         catalyst_detail = "利空公告/负面消息"
-    else:
-        catalyst_detail = "无明显催化剂"
+    elif _has_keyword_unaffirmed(news_report, _STR_WORDS):
+        catalyst_type = "strong"
+        catalyst_detail = "当日公告/涨停催化"
+    elif _has_keyword_unaffirmed(news_report, _MED_WORDS):
+        catalyst_type = "medium"
+        catalyst_detail = "行业政策/预期改善"
 
-    # ── 主力资金信号 ──
-    net_inflow_ratio = _extract_float(mf_report, r"大单净流入比[：:]\s*([+-]?\d+(?:\.\d+)?)%")
+    # ── 主力资金信号（带失败监控）──
+    net_inflow_ratio = _extract_float_warn(
+        mf_report, r"大单净流入比[：:]\s*([+-]?\d+(?:\.\d+)?)%", label="net_inflow_ratio"
+    )
     consec_out = 0
     m_out = re.search(r"连续(\d+)日净流出", mf_report)
     if m_out:
@@ -256,45 +275,70 @@ def _extract_signals(
 
     # ── 技术形态信号 ──
     ma_alignment = "mixed"
-    if "多头排列" in kline_report or "bullish" in kline_report.lower():
+    if _has_keyword_unaffirmed(kline_report, ("多头排列",)) or "bullish" in kline_report.lower():
         ma_alignment = "bullish"
-    elif "空头排列" in kline_report or "bearish" in kline_report.lower():
+    elif _has_keyword_unaffirmed(kline_report, ("空头排列",)) or "bearish" in kline_report.lower():
         ma_alignment = "bearish"
 
+    # MACD 信号：两者同时出现时死叉优先（保守）
     macd_signal = "neutral"
-    if "MACD金叉" in kline_report or "golden cross" in kline_report.lower():
-        macd_signal = "golden_cross"
-    elif "MACD死叉" in kline_report or "death cross" in kline_report.lower():
+    _kr_lower = kline_report.lower()
+    _has_golden = "MACD金叉" in kline_report or "golden cross" in _kr_lower
+    _has_death  = "MACD死叉" in kline_report or "death cross" in _kr_lower
+    if _has_death:
         macd_signal = "death_cross"
+    elif _has_golden:
+        macd_signal = "golden_cross"
 
-    rsi_val = _extract_float(kline_report, r"RSI12?[：:]\s*(\d+(?:\.\d+)?)")
+    # RSI：优先取12日，依次回退到6日，再回退诊断报告
+    # 修复原模式 RSI12?（只匹配 RSI1/RSI12，漏掉 RSI6/RSI24）
+    rsi_val = _extract_float_warn(
+        kline_report, r"RSI\s*1[26]\s*[：:]\s*(\d+(?:\.\d+)?)", label="rsi_kline_12"
+    )
     if rsi_val is None:
-        rsi_val = _extract_float(diagnosis_report, r"RSI[：:]\s*(\d+(?:\.\d+)?)")
+        rsi_val = _extract_float(kline_report, r"RSI\s*\d*\s*[：:]\s*(\d+(?:\.\d+)?)")
+    if rsi_val is None:
+        rsi_val = _extract_float_warn(
+            diagnosis_report, r"RSI\s*\d*\s*[：:]\s*(\d+(?:\.\d+)?)", label="rsi_diagnosis"
+        )
 
-    kdj_j = _extract_float(diagnosis_report, r"J值[：:]\s*(\d+(?:\.\d+)?)")
+    kdj_j    = _extract_float_warn(diagnosis_report, r"J值[：:]\s*(\d+(?:\.\d+)?)", label="kdj_j")
     kdj_cross = "J值上穿50" in diagnosis_report
 
-    # ── 量化诊断信号 ──
-    diag_score = _extract_float(diagnosis_report, r"综合(?:评)?分[：:]\s*([+-]?\d+(?:\.\d+)?)")
-    # 将 -100~+100 映射到 0~100
+    # ── 量价配合信号（从 kline_report 文本提取）──
+    # 放量确认突破时 True，缩量警告时 False，无信息时 None
+    _VOL_UP   = ("放量", "量能配合", "成交量放大", "量增价涨", "有效放量")
+    _VOL_DOWN = ("缩量", "量能萎缩", "成交量萎缩", "无量上涨", "无量突破")
+    if _has_keyword_unaffirmed(kline_report, _VOL_UP):
+        volume_breakout: Optional[bool] = True
+    elif _has_keyword_unaffirmed(kline_report, _VOL_DOWN):
+        volume_breakout = False
+    else:
+        volume_breakout = None
+
+    # ── 量化诊断信号（带失败监控）──
+    diag_score = _extract_float_warn(
+        diagnosis_report, r"综合(?:评)?分[：:]\s*([+-]?\d+(?:\.\d+)?)", label="diag_score"
+    )
     if diag_score is not None:
+        # -100~+100 → 0~100
         diag_score = max(0, min(100, (diag_score + 100) / 2))
 
-    mc_up = _extract_float(diagnosis_report, r"上涨概率[：:]\s*(\d+(?:\.\d+)?)%")
+    mc_up     = _extract_float(diagnosis_report, r"上涨概率[：:]\s*(\d+(?:\.\d+)?)%")
+    quant_pct = _extract_float(quant_report,     r"量化资金占比[：:]\s*(\d+(?:\.\d+)?)%")
 
-    quant_pct = _extract_float(quant_report, r"量化资金占比[：:]\s*(\d+(?:\.\d+)?)%")
-
-    # Hurst指数从诊断报告中提取，格式: "H=0.600" 或 "Hurst Exponent: 0.600"
     hurst_val = _extract_float(diagnosis_report, r"H=(\d+\.\d+)")
     if hurst_val is None:
         hurst_val = _extract_float(diagnosis_report, r"[Hh]urst[^:：]*[：:]\s*(\d+\.\d+)")
 
-    # ── 融资融券情绪 ──
+    # ── 融资融券情绪（带失败监控）──
     margin_change = None
     if margin_report:
-        margin_change = _extract_float(margin_report, r"周环比[：:]\s*([+-]?\d+(?:\.\d+)?)%")
+        margin_change = _extract_float_warn(
+            margin_report, r"周环比[：:]\s*([+-]?\d+(?:\.\d+)?)%", label="margin_change"
+        )
 
-    nb_same_dir = northbound_adj > 0  # 北向当日净买入同向
+    nb_same_dir = northbound_adj > 0
 
     return ShortTermSignals(
         catalyst_type=catalyst_type,
@@ -307,6 +351,7 @@ def _extract_signals(
         rsi_value=rsi_val,
         kdj_j_value=kdj_j,
         kdj_cross_50=kdj_cross,
+        volume_breakout=volume_breakout,
         diagnosis_score=diag_score,
         monte_carlo_up_prob=mc_up,
         quant_share_pct=quant_pct,
@@ -316,25 +361,11 @@ def _extract_signals(
     )
 
 
-def _extract_float(text: str, pattern: str) -> Optional[float]:
-    """从文本中用正则提取浮点数。"""
-    m = re.search(pattern, text)
-    if m:
-        try:
-            return float(m.group(1))
-        except (ValueError, IndexError):
-            pass
-    return None
-
 
 def format_shortterm_report(result: ShortTermResult, stock_name: str, stock_code: str) -> str:
     """格式化短线分析报告。"""
     sections = [
-        "",
-        "=" * 60,
-        f"【模块 B1】短线分析 — {stock_name}（{stock_code}）",
-        "=" * 60,
-        "",
+        *_module_header("【模块 B1】短线分析", stock_name, stock_code),
         "▌ 实时行情", result["realtime_report"],
         "",
         "▌ 催化剂/新闻面", result["stock_news_report"],

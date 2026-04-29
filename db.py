@@ -515,6 +515,8 @@ def migrate_from_sqlite(sqlite_path: str = None):
                     dst.rollback()
                     print(f"    Error inserting batch {i//batch_size}: {e}")
                     raise
+                finally:
+                    cur.close()
 
             print(f"  {table}: {total_inserted} rows migrated")
 

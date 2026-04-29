@@ -21,6 +21,7 @@
 
 import re
 from typing import TypedDict, Optional
+from common_utils import _extract_float, _module_header
 
 
 class RiskControlResult(TypedDict):
@@ -68,13 +69,22 @@ def run_risk_control(
     if stop_loss is not None and stop_loss > 0:
         stop_loss = -stop_loss
 
-    # TODO: 重构 - risk_assessment 应返回结构化 dict 以替代文本解析
-    # 止损安全检查：正则提取失败或值不合理时使用安全默认值
+    # 止损安全检查：提取失败时基于评分卡收紧或放宽默认值
+    # 高分标的（>70）容忍宽止损，低分标的（<40）用窄止损
     if stop_loss is None or stop_loss == 0 or not (-50.0 < stop_loss < 0):
-        stop_loss = -8.0  # 默认8%止损，基于A股平均ATR
-    # 止盈安全检查
+        if scorecard is not None:
+            avg_score = (scorecard.get("short_term_score", 50) + scorecard.get("long_term_score", 50)) / 2
+            if avg_score >= 70:
+                stop_loss = -10.0   # 高质量标的，允许更大波动空间
+            elif avg_score >= 40:
+                stop_loss = -8.0    # 中性，A股平均ATR基准
+            else:
+                stop_loss = -6.0    # 低分标的，收窄止损控制尾部风险
+        else:
+            stop_loss = -8.0
+    # 止盈安全检查：与止损保持至少 1.5:1 风险收益比
     if take_profit is None or take_profit <= 0:
-        take_profit = 15.0  # 默认15%止盈
+        take_profit = round(abs(stop_loss) * 1.5, 1)
 
     # ── 基于评分卡调整仓位建议 ──
     position_advice = _compute_position_advice(scorecard, kelly, var95)
@@ -111,7 +121,11 @@ def _compute_position_advice(
         base_pct = kelly
     else:
         avg_score = (short_score + long_score) / 2
-        base_pct = min(30, max(5, avg_score / 100 * 30))
+        # 低于40分的标的建议空仓，不设5%下限以避免强推弱势股
+        if avg_score < 40:
+            base_pct = 0.0
+        else:
+            base_pct = min(30, (avg_score - 40) / 60 * 25 + 5)
 
     # 环境修正
     if rating == "L":
@@ -130,7 +144,7 @@ def _compute_position_advice(
 
     # VaR(95%)>8% 极端波动 → 仓位上限×0.7（prompt 规则落地）
     var_note = ""
-    if var95 is not None and var95 > 8:
+    if var95 is not None and abs(var95) > 8:
         base_pct *= 0.7
         var_note = "，VaR>8%极端波动×0.7"
 
@@ -150,16 +164,6 @@ def _compute_position_advice(
     return "；".join(parts)
 
 
-def _extract_float(text: str, pattern: str) -> Optional[float]:
-    if not text:
-        return None
-    m = re.search(pattern, text)
-    if m:
-        try:
-            return float(m.group(1))
-        except (ValueError, IndexError):
-            pass
-    return None
 
 
 def format_risk_control(rc: RiskControlResult, stock_name: str = "", stock_code: str = "") -> str:
@@ -169,17 +173,21 @@ def format_risk_control(rc: RiskControlResult, stock_name: str = "", stock_code:
             return default
         return f"{v:.1f}{suffix}"
 
+    # 风险收益比：优先使用工具返回值，回退到止损/止盈倒推
+    rr = rc["risk_reward_ratio"]
+    sl = rc["stop_loss_pct"]
+    tp = rc["take_profit_pct"]
+    if rr is None and sl and tp and sl < 0:
+        rr = round(tp / abs(sl), 2)
+    rr_str = f"1:{rr:.2f}" if rr is not None else "N/A"
+
     lines = [
-        "",
-        "=" * 60,
-        f"【模块 D】风控参数建议" + (f" — {stock_name}（{stock_code}）" if stock_name else ""),
-        "=" * 60,
-        "",
-        f"  止损: {_fmt(rc['stop_loss_pct'])}",
-        f"  止盈目标: +{_fmt(rc['take_profit_pct'])}",
-        f"  Kelly仓位上限: {_fmt(rc['kelly_position_pct'])}",
-        f"  VaR(95%): {_fmt(rc['var_95_pct'])}",
-        f"  风险收益比: 1:{_fmt(rc['risk_reward_ratio'], suffix='', default='N/A')}",
+        *_module_header("【模块 D】风控参数建议", stock_name, stock_code),
+        f"  止损:       {_fmt(rc['stop_loss_pct'])}",
+        f"  止盈目标:   +{_fmt(rc['take_profit_pct'])}",
+        f"  风险收益比: {rr_str}",
+        f"  Kelly仓位:  {_fmt(rc['kelly_position_pct'])}",
+        f"  VaR(95%):   {_fmt(rc['var_95_pct'])}",
         "",
         f"  {rc['position_advice']}",
     ]

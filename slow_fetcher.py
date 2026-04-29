@@ -58,7 +58,7 @@ from pathlib import Path
 import pandas as pd
 
 import db
-from _http_utils import cn_now, cn_today, cn_str, is_trade_day, last_trade_day
+from _http_utils import cn_now, cn_today, cn_str, is_trade_day, last_trade_day, tencent_symbol
 
 logging.basicConfig(
     level=logging.INFO,
@@ -387,7 +387,7 @@ def refresh_fundamentals_snapshot(interval: float = 10.0,
 
         for start in range(resume_offset, len(rows), batch_size):
             batch = rows[start:start + batch_size]
-            symbols = [_to_tencent_symbol(code) for code, _ in batch]
+            symbols = [tencent_symbol(code) for code, _ in batch]
             try:
                 text = _fetch_tencent_batch(symbols)
                 line_count = 0
@@ -699,12 +699,6 @@ def _get_secid(code: str) -> str:
         return f"1.{code}"
     return f"0.{code}"
 
-
-def _to_tencent_symbol(code: str) -> str:
-    code = str(code).strip()
-    if code.startswith(("60", "68", "51", "11")):
-        return f"sh{code}"
-    return f"sz{code}"
 
 
 def _fetch_tencent_batch(symbols: list[str]) -> str:

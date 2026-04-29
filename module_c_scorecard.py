@@ -18,7 +18,7 @@
   量化诊断得分 10%  — stock_diagnosis + quant_activity
   融资融券情绪 10%  — margin_trading + northbound_flow
 
-长线维度评分规则 (6维):
+长线维度评分规则 (5维):
   财务质量     30%  — financial_data + earnings_analysis + valuation_quality
   估值安全边际 25%  — valuation_quality + financial_data
   负债与商誉   20%  — balance_sheet + financial_data
@@ -27,6 +27,7 @@
 """
 
 from typing import TypedDict, Optional
+from common_utils import _module_header
 
 
 class DimensionScore(TypedDict):
@@ -76,21 +77,28 @@ def compute_scorecard(
     short_weight = env_result.get("short_term_weight", 1.0)
 
     # ── 短线评分 ──
-    short_dims = _score_shortterm(shortterm_signals)
+    short_dims = _score_shortterm(shortterm_signals, market_rating)
     short_total = sum(d["weighted"] for d in short_dims)
     # L环境自动降权
     short_total *= short_weight
-    # Hurst指数技术面调整（prompt规则落地）:
-    #   ≥0.55 趋势持续，技术面+15；≤0.45 均值回归，技术面-10
+    # Hurst指数对技术面维度的乘数修正:
+    #   ≥0.55 趋势持续 → 技术面得分×1.2；≤0.45 均值回归 → ×0.8
     hurst = shortterm_signals.get("hurst")
     if hurst is not None:
-        if hurst >= 0.55:
-            short_total = min(100, short_total + 15)
-        elif hurst <= 0.45:
-            short_total = max(0, short_total - 10)
+        tech_dim = next((d for d in short_dims if d["name"] == "技术形态共振"), None)
+        if tech_dim:
+            if hurst >= 0.55:
+                new_raw = min(10, tech_dim["raw_score"] * 1.2)
+            elif hurst <= 0.45:
+                new_raw = max(0, tech_dim["raw_score"] * 0.8)
+            else:
+                new_raw = tech_dim["raw_score"]
+            tech_dim["raw_score"] = round(new_raw, 1)
+            tech_dim["weighted"] = round(new_raw * tech_dim["weight"] * 10, 1)
+        short_total = sum(d["weighted"] for d in short_dims) * short_weight
     short_vetoed, short_veto_reason = _check_short_veto(shortterm_signals, short_dims)
     if short_vetoed:
-        short_total = min(short_total, 30)  # 一票否决: 强制得分上限30
+        short_total = min(short_total, 30)
 
     # ── 长线评分 ──
     long_dims = _score_longterm(longterm_signals)
@@ -138,7 +146,7 @@ def _score_label(score: float) -> str:
 # 短线评分（5维）
 # ══════════════════════════════════════════════════════
 
-def _score_shortterm(s: dict) -> list:
+def _score_shortterm(s: dict, market_rating: str = "M") -> list:
     """短线5维评分，每维0-10分。"""
     dims = []
 
@@ -151,7 +159,7 @@ def _score_shortterm(s: dict) -> list:
     dims.append(_dim("主力资金净入", fund_score, 0.30))
 
     # 3. 技术形态共振 25%
-    tech_score = _score_tech_pattern(s)
+    tech_score = _score_tech_pattern(s, market_rating)
     dims.append(_dim("技术形态共振", tech_score, 0.25))
 
     # 4. 量化诊断得分 10%
@@ -210,14 +218,14 @@ def _score_main_fund(s: dict) -> float:
         return max(0, 1 + (ratio + 5) / 5)
 
 
-def _score_tech_pattern(s: dict) -> float:
+def _score_tech_pattern(s: dict, market_rating: str = "M") -> float:
     """
-    技术形态评分（3个子项各0-10，加权平均）:
+    技术形态评分（满分10，各子项叠加后截断）:
       均线多头排列(5>10>20): +3
       MACD金叉+柱体扩张: +3
-      RSI 40-70(健康区间): +2
+      RSI 健康区间（依市场状态动态调整）: +2
       KDJ J值上穿50: +2
-      缺一项扣对应分
+      量价配合（放量+1 / 缩量-1）: ±1
     """
     score = 0.0
 
@@ -241,20 +249,29 @@ def _score_tech_pattern(s: dict) -> float:
         score += 1.0
     # death_cross = 0
 
-    # RSI (0-2)
+    # RSI 健康区间依市场状态动态调整 (0-2)
+    # H(乐观): [40,80]  M(中性): [40,70]  L(悲观): [40,60]
+    rsi_upper = {"H": 80, "M": 70, "L": 60}.get(market_rating, 70)
     rsi = s.get("rsi_value")
     if rsi is not None:
-        if 40 <= rsi <= 70:
+        if 40 <= rsi <= rsi_upper:
             score += 2.0
-        elif 30 <= rsi < 40 or 70 < rsi <= 80:
+        elif 30 <= rsi < 40 or rsi_upper < rsi <= rsi_upper + 10:
             score += 1.0
-        # < 30 or > 80 = 0
+        # < 30 or > rsi_upper+10 = 0
 
     # KDJ J值上穿50 (0-2)
     if s.get("kdj_cross_50"):
         score += 2.0
     elif s.get("kdj_j_value") is not None and s["kdj_j_value"] > 50:
         score += 1.0
+
+    # 量价配合 (0-1)：放量突破加分，缩量无量减分
+    vol = s.get("volume_breakout")
+    if vol is True:
+        score += 1.0
+    elif vol is False:
+        score -= 1.0
 
     return score
 
@@ -263,18 +280,14 @@ def _score_quant_diagnosis(s: dict) -> float:
     """
     量化诊断评分:
       直接使用诊断工具输出的综合评分（0-100）→ 除以10得0-10分
-      蒙特卡洛上涨概率 >55%: 额外 +1
-      量化资金占比 >30%: 额外 -1
+      量化资金占比 >30%: 额外 -1（量化博弈加剧，反转风险上升）
+    注: 蒙特卡洛概率与 RSI/MACD 同源于历史价格，不单独加分避免双重计数。
     """
     diag = s.get("diagnosis_score")
     if diag is None:
         return 5.0
     score = diag / 10.0
-    # 蒙特卡洛修正
-    mc = s.get("monte_carlo_up_prob")
-    if mc is not None and mc > 55:
-        score += 1.0
-    # 量化资金占比修正
+    # 量化资金占比修正（高量化参与度→波动放大→减分）
     qp = s.get("quant_share_pct")
     if qp is not None and qp > 30:
         score -= 1.0
@@ -284,21 +297,24 @@ def _score_quant_diagnosis(s: dict) -> float:
 def _score_margin_sentiment(s: dict) -> float:
     """
     融资融券情绪评分:
-      融资余额周环比变化:
-        上升 >3%: 7-9
-        持平: 5-6
-        下降 >3%: 2-4
+      融资余额周环比变化（连续分段线性，边界处无跳变）:
+        change >= +3%  → [7, 9]  线性增长
+        -3% ~ +3%      → [4, 7]  线性过渡
+        change <= -3%  → [2, 4]  线性衰减
       北向当日净买入同向: 额外 +1
     """
     change = s.get("margin_balance_change_pct")
     if change is None:
         score = 5.0  # 无数据默认中性
-    elif change > 3:
-        score = min(9, 7 + change / 10)
+    elif change >= 3:
+        # change=3→7, change=17→9
+        score = min(9, 7 + (change - 3) / 7)
     elif change >= -3:
-        score = 5 + change / 6
+        # change=-3→4, change=3→7（连续衔接上下段）
+        score = 4 + (change + 3) / 6 * 3
     else:
-        score = max(2, 4 + change / 10)
+        # change=-3→4, change=-17→2
+        score = max(2, 4 + (change + 3) / 7)
 
     if s.get("northbound_same_direction"):
         score += 1.0
@@ -311,7 +327,7 @@ def _score_margin_sentiment(s: dict) -> float:
 # ══════════════════════════════════════════════════════
 
 def _score_longterm(s: dict) -> list:
-    """长线6维评分，每维0-10分。"""
+    """长线5维评分，每维0-10分。"""
     dims = []
 
     # 1. 财务质量 30%
@@ -443,8 +459,20 @@ def _score_debt_goodwill(s: dict) -> float:
         >30% → -2（减分项）
     """
     dr = s.get("debt_ratio")
+    # 金融行业（银行/保险/证券）高负债为经营常态，使用宽松阈值
+    # 通过 stock_code 判断行业: 600/601/601/603 中 6010xx 系列为银行
+    # 此处保守处理：若 debt_ratio > 75% 视为金融类，使用宽松标准
+    is_financial = dr is not None and dr > 75
     if dr is None:
         score = 5.0
+    elif is_financial:
+        # 金融行业: 负债率 75-92% 为正常经营范围
+        if dr <= 85:
+            score = 7.0
+        elif dr <= 92:
+            score = 5.0
+        else:
+            score = 3.0
     elif dr <= 40:
         score = 9 + (40 - dr) / 40
     elif dr <= 55:
@@ -545,7 +573,7 @@ def _check_short_veto(s: dict, dims: list) -> tuple:
 
     # 1. 利空催化剂
     if s.get("catalyst_type") == "negative":
-        _cap_dim(dims, "催化剂强度", 1.0)
+        _cap_dim(dims, "催化剂强度", 1.0, "利空公告当日，催化剂强制≤1")
         reasons.append("利空公告当日，催化剂强制≤1")
 
     # 2. 主力资金+融资双出
@@ -556,10 +584,10 @@ def _check_short_veto(s: dict, dims: list) -> tuple:
     # 3. RSI 超买 或 均线空头
     rsi = s.get("rsi_value")
     if rsi is not None and rsi > 85:
-        _cap_dim(dims, "技术形态共振", 3.0)
+        _cap_dim(dims, "技术形态共振", 3.0, f"RSI={rsi:.0f}>85 超买，技术分强制≤3")
         reasons.append(f"RSI={rsi:.0f}>85 超买，技术分强制≤3")
     if s.get("ma_alignment") == "bearish":
-        _cap_dim(dims, "技术形态共振", 3.0)
+        _cap_dim(dims, "技术形态共振", 3.0, "均线空头排列，技术分强制≤3")
         reasons.append("均线空头排列，技术分强制≤3")
 
     # 4. 诊断评分过低
@@ -569,7 +597,9 @@ def _check_short_veto(s: dict, dims: list) -> tuple:
 
     if not vetoed and not reasons:
         return False, ""
-    return bool(reasons), "；".join(reasons)
+    # 只有 vetoed=True（规则2：连续流出+融资双出）才触发全局总分上限
+    # 规则1/3/4 仅做维度降权和警告，不触发全局否决
+    return vetoed, "；".join(reasons)
 
 
 def _check_long_veto(s: dict, dims: list) -> tuple:
@@ -587,7 +617,7 @@ def _check_long_veto(s: dict, dims: list) -> tuple:
     # 1. ROE 过低
     roe = s.get("roe")
     if roe is not None and roe < 8:
-        _cap_dim(dims, "财务质量", 3.0)
+        _cap_dim(dims, "财务质量", 3.0, f"ROE={roe:.1f}%<8%，财务质量强制≤3")
         reasons.append(f"ROE={roe:.1f}%<8%，财务质量强制≤3（质量不达标）")
 
     # 2. 高估值警告
@@ -602,30 +632,33 @@ def _check_long_veto(s: dict, dims: list) -> tuple:
     gw = s.get("goodwill_ratio")
     if gw is not None and gw > 50:
         vetoed = True
-        _cap_dim(dims, "负债与商誉", 2.0)
+        _cap_dim(dims, "负债与商誉", 2.0, f"商誉/净资产={gw:.1f}%>50%，一票否决")
         reasons.append(f"商誉/净资产={gw:.1f}%>50%，一票否决，得分强制≤2")
 
     # 4. 监管问询
-    if not s.get("no_regulatory_issue"):
+    if s.get("no_regulatory_issue", True) is False:
         reasons.append("近期收到监管问询函，长线评分整体×0.8")
 
     # 5. 资金占用/实控人变更
-    if not s.get("no_fund_misuse"):
-        _cap_dim(dims, "分红与治理", 0)
+    if s.get("no_fund_misuse", True) is False:
+        _cap_dim(dims, "分红与治理", 0, "曾有资金占用或实控人变更，得分强制0")
         reasons.append("曾有资金占用或实控人变更，分红治理得分强制0")
 
     if not vetoed and not reasons:
         return False, ""
-    return bool(reasons), "；".join(reasons)
+    # 只有规则3（商誉>50%）才触发全局总分上限，其余规则仅做维度降权和警告
+    return vetoed, "；".join(reasons)
 
 
-def _cap_dim(dims: list, name: str, max_score: float):
+def _cap_dim(dims: list, name: str, max_score: float, reason: str = ""):
     """将指定维度的得分强制压到上限。"""
     for d in dims:
         if d["name"] == name and d["raw_score"] > max_score:
             d["raw_score"] = max_score
             d["weighted"] = max_score * d["weight"] * 10
             d["vetoed"] = True
+            if reason:
+                d["veto_reason"] = reason
 
 
 # ══════════════════════════════════════════════════════
@@ -731,11 +764,7 @@ def format_scorecard(sc: ScorecardResult, stock_name: str = "", stock_code: str 
     """格式化评分卡报告。"""
     rating_labels = {"H": "乐观", "M": "中性偏谨慎", "L": "悲观"}
     lines = [
-        "",
-        "=" * 60,
-        f"【模块 C】综合评分卡" + (f" — {stock_name}（{stock_code}）" if stock_name else ""),
-        "=" * 60,
-        "",
+        *_module_header("【模块 C】综合评分卡", stock_name, stock_code),
         f"  ┌─────────────────┬─────────────────┬─────────────────┐",
         f"  │  大盘环境        │  短线得分        │  长线得分        │",
         f"  │  {sc['market_rating']}               │  {sc['short_term_score']:5.1f} / 100     │  {sc['long_term_score']:5.1f} / 100     │",
@@ -743,12 +772,15 @@ def format_scorecard(sc: ScorecardResult, stock_name: str = "", stock_code: str 
         f"  └─────────────────┴─────────────────┴─────────────────┘",
     ]
 
-    if sc.get("short_vetoed") or sc.get("long_vetoed"):
+    # 硬否决（总分上限30）用 🚫，软警告（维度降权）用 ⚠️
+    if sc.get("short_vetoed") or sc.get("long_vetoed") or sc.get("short_veto_reason") or sc.get("long_veto_reason"):
         lines.append("")
         if sc["short_veto_reason"]:
-            lines.append(f"  ⚠️ 短线一票否决: {sc['short_veto_reason']}")
+            prefix = "🚫 短线硬否决" if sc["short_vetoed"] else "⚠️ 短线风险警告"
+            lines.append(f"  {prefix}: {sc['short_veto_reason']}")
         if sc["long_veto_reason"]:
-            lines.append(f"  ⚠️ 长线一票否决: {sc['long_veto_reason']}")
+            prefix = "🚫 长线硬否决" if sc["long_vetoed"] else "⚠️ 长线风险警告"
+            lines.append(f"  {prefix}: {sc['long_veto_reason']}")
 
     # 短线各维度明细
     lines.extend(["", "  短线各维度明细:"])
